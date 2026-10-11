@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "live-counters.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -138,7 +139,9 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// The parser counts every record but stores MaxPageFaults - 1 (fault_buffer_process.comp): past them the area
+		// holds no records of this batch (another batch's, or nothing), and those pages fault again next time.
+		const auto count = std::min<uint32_t>(static_cast<uint32_t>(faults[0]), MaxPageFaults - 1);
 		LiveCounters::Add(LiveCounters::BdaFaultPages, count);
 		for (uint32_t index = 1; index <= count; ++index) {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
