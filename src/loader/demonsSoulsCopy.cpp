@@ -5,22 +5,72 @@
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/memory.h"
+#include "live-counters.h"
 #include "loader/runtimeLinker.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <xxhash.h>
+
+extern "C" {
+// KYTY_GUEST_MOVE_COMPARE (default on; 0 for an A/B): a large move writes only the destination pages whose bytes
+// differ (CompareMove).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_move_compare {1};
+}
 
 namespace Loader::DemonsSoulsCopy {
 namespace {
 uint64_t                site = 0;
 std::array<uint8_t, 13> original {}, patch {};
+
+// A large move into memory the GPU caches, page by page: a page the GPU wrote (its bytes here are stale, and reading them
+// would fault) or whose bytes differ is written (runs prepared as overwritten, Memory::TryPrepareHostOverwrite); a page
+// that already holds the source's bytes is left alone, clean: no upload of it again, no protection change.
+void* CompareMove(uint64_t to, uint64_t from, size_t size) {
+	constexpr uint64_t Page = 4096;
+	// (The images over all of it as before: a GPU-written image's bytes here are stale, equal or not.)
+	(void)Libs::LibKernel::Memory::TryPrepareHostImageWrite(to, size);
+	uint64_t           run = 0, run_end = 0, same = 0, gpu = 0;
+	const auto         write = [&] {
+        if (run_end == run) return;
+        (void)Libs::LibKernel::Memory::TryPrepareHostOverwrite(to + run, run_end - run);
+        std::memmove(reinterpret_cast<void*>(to + run), reinterpret_cast<const void*>(from + run), run_end - run);
+	};
+	for (uint64_t at = 0; at < size;) {
+		const auto next  = std::min<uint64_t>(size, ((to + at) / Page + 1) * Page - to);
+		const auto bytes = next - at;
+		bool       differs = Libs::LibKernel::Memory::ReadFaults(to + at, bytes);
+		if (differs) gpu += bytes;
+		else differs = std::memcmp(reinterpret_cast<const void*>(to + at), reinterpret_cast<const void*>(from + at), bytes) != 0;
+		if (!differs) {
+			same += bytes;
+		} else {
+			if (run_end != at) {
+				write();
+				run = at;
+			}
+			run_end = next;
+		}
+		at = next;
+	}
+	write();
+	LiveCounters::Add(LiveCounters::GuestMoveBytes, size);
+	LiveCounters::Add(LiveCounters::GuestMoveSameBytes, same);
+	LiveCounters::Add(LiveCounters::GuestMoveGpuBytes, gpu);
+	return reinterpret_cast<void*>(to);
+}
+
 void* KYTY_SYSV_ABI     CoherentMove(void* destination, const void* source, size_t size) {
 	// A move within one range reads bytes it then writes: their GPU data is read back first. Else the destination's is
 	// replaced whole and dropped (Memory::InvalidateMemoryForWrite).
 	const auto to = reinterpret_cast<uint64_t>(destination), from = reinterpret_cast<uint64_t>(source);
 	const bool overlap = to < from + size && from < to + size;
+	if (!overlap && size >= 256 * 1024 && kyty_local_move_compare.load(std::memory_order_relaxed) != 0)
+		return CompareMove(to, from, size);
+	if (size >= 256 * 1024) LiveCounters::Add(LiveCounters::GuestMoveBytes, size);
 	return Move(destination, source, size,
 	            overlap ? &Libs::LibKernel::Memory::TryPrepareHostWrite : &Libs::LibKernel::Memory::TryPrepareHostOverwrite);
 }

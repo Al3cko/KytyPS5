@@ -19,6 +19,7 @@ extern "C" {
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_pool_mode;
 extern volatile std::atomic_uint32_t kyty_local_backing_read_mode;
+extern volatile std::atomic<uint32_t> kyty_local_move_compare;
 extern volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
@@ -76,6 +77,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_COPY_FEEDBACK", &kyty_local_copy_feedback_mode},
 	    Switch {"KYTY_ASYNC_LOD_STATS", &kyty_local_async_lod_stats_mode},
 	    Switch {"KYTY_BACKING_READ", &kyty_local_backing_read_mode},
+	    // The game's large memmoves write only the pages whose bytes differ (default on; 0 for an A/B).
+	    Switch {"KYTY_GUEST_MOVE_COMPARE", &kyty_local_move_compare},
 	    Switch {"KYTY_STREAM_UPLOAD", &kyty_local_stream_upload_mode},
 	    Switch {"KYTY_FRAME_PIPELINE", &kyty_local_frame_pipeline_mode},
 	    Switch {"KYTY_WRITE_WINDOW_HANDOFF", &kyty_local_write_window_handoff_mode},

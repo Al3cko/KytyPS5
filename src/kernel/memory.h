@@ -164,6 +164,9 @@ void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 // The same for a write of all of the range that reads none of it (InvalidateMemoryForWrite).
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
+// The images over the range only (a GPU-written image's bytes here are stale: they are rewritten as InvalidateMemory
+// would make them).
+bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 // Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
 [[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);

@@ -1278,6 +1278,10 @@ bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	       g_gpu_resources->InvalidateMemory(vaddr, size);
 }
 
+bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->InvalidateImages(vaddr, size);
+}
+
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
