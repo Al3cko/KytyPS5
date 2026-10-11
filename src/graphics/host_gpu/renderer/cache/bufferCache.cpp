@@ -39,6 +39,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
 #include "common/assert.h"
+#include "common/guardedCopy.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -2007,6 +2008,27 @@ void BufferCache::FlushPrologueCopies(vk::CommandBuffer command) {
 	}
 }
 
+// An upload's source bytes (a CPU-dirty range) into host memory, from inside the memory tracker's upload callback: through
+// the backing view, whatever the guest range's protection, else through the guest view without faulting. A read of the
+// guest view that faulted re-entered the tracker from the callback (another tracker's page protection: the fault
+// handler read GPU data back) and ended the emulator (10-12, Tower of Latria, third visit). Bytes not readable at all (no
+// mapping) are uploaded as zeros, reported.
+static void ReadUploadSource(uint8_t* destination, uint64_t address, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadBackingToHost(address, destination, size)) return;
+#if defined(_WIN32)
+	if (const auto missed = Common::GuardedCopy(destination, reinterpret_cast<const void*>(address), size); missed != 0) {
+		std::memset(destination + (size - missed), 0, missed);
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("BufferCache: an upload's source 0x%llx+0x%llx is unreadable from +0x%llx: zeros uploaded\n",
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+			            static_cast<unsigned long long>(size - missed));
+	}
+#else
+	std::memcpy(destination, reinterpret_cast<const void*>(address), size);
+#endif
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size, const Buffer** ring_used) {
 	if (copies.empty()) {
@@ -2059,7 +2081,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			if (source != nullptr) {
 				AsyncUpload::Get().Push(mapped + copy.srcOffset, source, copy.size, address);
 			} else {
-				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+				ReadUploadSource(mapped + copy.srcOffset, address, copy.size);
 			}
 			copy.srcOffset += base_offset;
 		}
@@ -2072,9 +2094,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
-		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		ReadUploadSource(temporary->Mapped().data() + copy.srcOffset, buffer.CpuAddress() + copy.dstOffset, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();
