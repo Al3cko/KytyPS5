@@ -98,6 +98,15 @@ constexpr std::array<const char*, 2> ChildLoops {"49 83 c4 08 4d 3b ?? 38 74 ?? 
 // It crashed on a null child in a job worker at 1-1 (eboot+0x8da64c 10-11), 4 null children of one parent that the
 // bit-passing loops had skipped just before.
 constexpr const char* GroupLoop = "49 83 c6 08 4d 39 fe 74 ?? 49 8b 3e 8b 47 08";
+// The children loop of the traversal that calls each child's virtual method 0x18, then visits the components
+// (01.007.000 eboot+0x8dacd0, 01.005.000 eboot+0x8bf340): mov rdi, [r14]; mov rax, [rdi]; call [rax + 0x18]; add r14, 8;
+// cmp r14, r15; jne. It crashed on a null child in a job worker at 1-1 (eboot+0x8dad03 10-11, the user's route).
+constexpr const char* VirtualLoop = "49 8b 3e 48 8b 07 ff 50 ?? 49 83 c6 08 4d 39 fe 75 ee";
+// The children loop of the traversal that hands each node's id (+0x58) to a table at +0x40 of its first argument, then
+// recurses into the children (01.007.000 eboot+0x8d8be0, 01.005.000 eboot+0x8bd270): mov rsi, [r15]; mov rdi, r14; call
+// itself; add r15, 8; cmp r15, r12; jne. A null child crashed in the table lookup (eboot+0x8e5448 reading 0x58, 10-11,
+// twice on the user's route).
+constexpr const char* IdLoop = "49 8b 37 4c 89 f7 e8 ?? ?? ?? ?? 49 83 c7 08 4d 39 e7 75 ec";
 struct ChildLoop {
 	uint64_t increment = 0;  // the loop's add ITER, 8: a null child continues there
 	uint64_t load      = 0;  // mov REG, [ITER]
@@ -126,6 +135,10 @@ std::vector<ChildLoop> FindChildLoops(const Program& program) {
 	}
 	const GuestCode::Pattern group(GroupLoop);
 	if (const auto at = GuestCode::FindUnique(program, group)) loops.push_back({*at, *at + 9, 7, 6, 3, 14});
+	const GuestCode::Pattern virtual_loop(VirtualLoop);
+	if (const auto at = GuestCode::FindUnique(program, virtual_loop)) loops.push_back({*at + 9, *at, 7, 6, 3, 14});
+	const GuestCode::Pattern id_loop(IdLoop);
+	if (const auto at = GuestCode::FindUnique(program, id_loop)) loops.push_back({*at + 11, *at, 6, 6, 3, 15});
 	return loops;
 }
 
