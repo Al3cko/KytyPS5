@@ -124,9 +124,25 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	VkBuffer      buffer = VK_NULL_HANDLE;
 	VmaAllocation memory = nullptr;
 	const auto    raw    = static_cast<VkBufferCreateInfo>(create);
-	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
-	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
-	                     "allocate TileManager scratch buffer");
+	auto          result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+	// Out of video memory (a GPU with less of it, or a texture of over a GiB: 10-11 a 1.6 GiB one asked for 2 GiB and the
+	// emulator exited): without the pooled buffers, then in system memory (the GPU reads it slower; the game goes on).
+	if (result != VK_SUCCESS) {
+		std::vector<PooledScratch> pooled;
+		{
+			std::scoped_lock lock(m_scratch_mutex);
+			pooled.swap(m_scratch_pool);
+			m_scratch_pool_bytes = 0;
+		}
+		for (const auto& item: pooled) vmaDestroyBuffer(m_graphics.allocator, item.buffer, item.allocation);
+		result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+	}
+	if (result != VK_SUCCESS) {
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		result         = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+		if (result == VK_SUCCESS) m_graphics.ReportMemoryFallback("a tiling scratch buffer is in system memory", capacity);
+	}
+	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
 	return {buffer, memory, size};
 }
 
