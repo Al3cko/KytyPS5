@@ -891,6 +891,7 @@ void Image::PrepareReuse(const ImageInfo& image_info) {
 	m_dirty_ranges.clear();
 	usage               = {};
 	binding             = {};
+	guest_alias         = false;
 	query_epoch         = 0;
 	track_addr          = 0;
 	track_addr_end      = 0;

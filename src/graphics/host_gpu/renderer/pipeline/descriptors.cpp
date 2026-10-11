@@ -856,6 +856,20 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		            static_cast<uint32_t>(descriptor.MinLod()), static_cast<uint32_t>(descriptor.MinLodWarn5()),
 		            descriptor.MipStatsCntEn() ? 1 : 0);
 	}
+	// (Diagnostics: a view of 1 GiB or more, a few, with its T#: 10-11 a 1649-layer view of the 0x1009000000 pool.)
+	if (size.size >= (uint64_t {1} << 30u)) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("TextureCache: large texture view addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u base_array=%u "
+			            "fmt=%u tile=%u type=%u storage=%d pc=0x%x dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size.size), width, height,
+			            image_layers, levels, static_cast<uint32_t>(descriptor.BaseArray5()), static_cast<uint32_t>(format),
+			            static_cast<uint32_t>(tile), static_cast<uint32_t>(type), storage ? 1 : 0, resource.first_use_pc,
+			            descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			            descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+			std::fflush(stdout);
+		}
+	}
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
@@ -1079,6 +1093,36 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	EXIT_IF(images.size() != program.info.images.size());
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto acquirable    = [&](const TextureBinding& binding) { return AcquirableImage(binding); };
+	// (Diagnostics: the views that take each other's away, once per binding that falls back, for a few bindings.)
+	bool       reported = false;
+	const auto report   = [&] {
+		static std::atomic<uint32_t> bindings {0};
+		if (reported || bindings.fetch_add(1, std::memory_order_relaxed) >= 6) return;
+		reported = true;
+		for (uint32_t j = 0; j < images.size(); j++) {
+			const auto& info  = images[j].desc.info;
+			bool        alias = !acquirable(images[j]);
+			for (uint32_t k = 0; k < images.size() && !alias; k++) {
+				const auto& other = images[k].desc.info;
+				alias = k != j && !acquirable(images[k]) && !info.data.Empty() && !other.data.Empty() &&
+				        info.data.address < other.data.End() && other.data.address < info.data.End();
+			}
+			if (!alias) continue;
+			const auto& w    = snapshot.images[j].dwords;
+			const auto& view = images[j].desc.view_info;
+			std::printf("RebindImages: shader 0x%016" PRIx64 " image %u held=%d addr=0x%llx size=0x%llx fmt=%u %ux%u "
+			            "levels=%u layers=%u tile=%u binding=%u view=%u+%u/%u+%u "
+			            "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			            program.shader_hash, j, acquirable(images[j]) ? 1 : 0,
+			            static_cast<unsigned long long>(info.data.address),
+			            static_cast<unsigned long long>(info.data.size), static_cast<uint32_t>(info.guest_format),
+			            info.extent.width, info.extent.height, info.resources.levels, info.resources.layers,
+			            static_cast<uint32_t>(info.tile_mode), static_cast<uint32_t>(images[j].desc.type),
+			            view.base_level, view.level_count, view.base_layer, view.layer_count, w[0], w[1], w[2], w[3],
+			            w[4], w[5], w[6], w[7]);
+		}
+		std::fflush(stdout);
+	};
 	// Resolving one image (discovery can merge or replace owners) or acquiring one (a refresh) can take
 	// another one's away: both repeat until every image holds (a stale image met only at its acquisition
 	// ended a load at 1-1 with "texture requires rediscovery"). Views of aliased memory that the texture cache
@@ -1094,6 +1138,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 					old_image->binding = {};
 				}
 				if (null) {
+					report();
 					static std::atomic<uint32_t> reports {0};
 					if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
 						std::printf("RebindImages: shader 0x%016" PRIx64 " image %u does not settle, bound as null\n",

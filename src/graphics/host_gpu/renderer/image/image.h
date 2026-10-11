@@ -302,6 +302,7 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	bool             guest_alias    = false; // TextureCache::GuestTexture: another view of its memory is an image too
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

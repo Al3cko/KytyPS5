@@ -204,6 +204,16 @@ private:
 		uint64_t tick = 0;
 	};
 	std::unordered_map<uint64_t, ParkedImage> m_parked;
+	// Views of one allocation in shapes neither holds (a texture pool sampled as 256 layers of 11 levels and as 1649
+	// layers of one: another layer pitch), both only sampled: images of their own side by side (GuestTexture), where an
+	// image for one freed the other's (a draw sampling both re-uploaded GBs per pass, 10-11). Their count: a write
+	// binding at an address with some frees the others there (FreeGuestAliases), which would go stale.
+	uint64_t                  m_guest_aliases = 0;
+	bool                      m_alias_insert  = false;
+	[[nodiscard]] static bool GuestTexture(const Image& image);
+	[[nodiscard]] static bool GuestTextureRequest(BindingType type, const ImageInfo& info);
+	void                      NoteGuestAlias(const ImageInfo& requested, Image& kept);
+	void                      FreeGuestAliases(ImageId written);
 	void                      ParkImage(ImageId id);
 	[[nodiscard]] ImageId     TakeParkedImage(const ImageInfo& info);
 	void                      FreeImage(ImageId id, const char* site = "");
