@@ -46,6 +46,8 @@ public:
 		return true;
 	}
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// The mapped parts of [vaddr, vaddr + size), added to `out`.
+	void               MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	// `releasing`: the caller unmaps or decommits the range right after (munmap, free,
 	// memory pool decommit), not a range about to receive a mapping.

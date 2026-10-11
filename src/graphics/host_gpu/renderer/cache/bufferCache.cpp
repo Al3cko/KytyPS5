@@ -1544,6 +1544,81 @@ void BufferCache::DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size) {
 	LiveCounters::Add(LiveCounters::UnmapBufferDeletes, ids.size());
 }
 
+// A buffer the unmapped range holds in part stays for its mapped rest, and joins of buffers next to it grew it on (stream
+// leaps over memory the game maps and unmaps as it streams): at 1-1, partly unmapped buffers of 3.6 GiB of the 4.9 GiB
+// registered after 9 rounds of the user's route (36 minutes), one of 1.2 GiB, all kept by the collector (GPU-owned
+// bytes, read through BDA); with this, 1.1 of 2.3 GiB after 5 rounds (3.1 of 4.3 before), the route's last points 45 ->
+// 56 fps in the fifth. Once mapped in no more than half of it, it is cut to its mapped runs: new buffers with its
+// bytes copied on the GPU (as a join copies them; the BDA page table points at them), so the bytes copied are at most
+// the bytes freed. Its unmapped bytes are nobody's: their GPU-owned ones were read back when unmapped (InvalidateMemory),
+// and a buffer with some there left is kept as it is.
+void BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size) {
+	if (m_resources == nullptr || size == 0 || UINT64_MAX - vaddr < size) return;
+	const auto            end = vaddr + size;
+	std::vector<BufferId> candidates;
+	auto                  it = m_buffers.lower_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		const auto& buffer = m_slot_buffers[std::prev(it)->second];
+		if (buffer.CpuAddress() + buffer.Size() > vaddr) candidates.push_back(std::prev(it)->second);
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() > end) candidates.push_back(it->second);
+	}
+	// Mapped runs closer than a stream leap stay one buffer (a join would make them one again).
+	constexpr uint64_t Gap = CACHING_PAGESIZE * 128;
+	for (const auto id: candidates) {
+		const auto& old = m_slot_buffers[id];
+		if (old.is_deleted) continue;
+		const auto begin = old.CpuAddress(), stop = begin + old.Size();
+		RangeSet   mapped;
+		m_resources->MappedRanges(begin, stop - begin, mapped);
+		mapped.Subtract(vaddr, size); // (not subtracted yet: UnmapMemory does it after this)
+		std::vector<std::pair<uint64_t, uint64_t>> pieces;
+		mapped.ForEach([&](uint64_t from, uint64_t to) {
+			from = std::max(begin, from & ~(CACHING_PAGESIZE - 1));
+			to   = std::min(stop, (to + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1));
+			if (!pieces.empty() && from <= pieces.back().second + Gap) {
+				pieces.back().second = std::max(pieces.back().second, to);
+			} else if (from < to) {
+				pieces.emplace_back(from, to);
+			}
+		});
+		uint64_t kept = 0;
+		for (const auto& [from, to]: pieces) kept += to - from;
+		if (kept * 2 > stop - begin) continue;
+		// (GPU-owned bytes outside the pieces would be lost with it.)
+		bool owned_outside = false;
+		uint64_t at = begin;
+		for (const auto& [from, to]: pieces) {
+			owned_outside = owned_outside || (from > at && m_gpu_modified_ranges.Intersects(at, from - at));
+			at            = to;
+		}
+		if (owned_outside || (stop > at && m_gpu_modified_ranges.Intersects(at, stop - at))) continue;
+		// New buffers first (inserting can move the slots: the old one is looked up again after), then the copies, the
+		// old one out, the new ones in (CreateBuffer's order).
+		std::vector<BufferId> ids;
+		for (const auto& [from, to]: pieces) {
+			ids.push_back(m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, from,
+			                                    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, to - from));
+		}
+		const auto& source = m_slot_buffers[id];
+		for (size_t i = 0; i < ids.size(); ++i) {
+			auto&      piece        = m_slot_buffers[ids[i]];
+			const auto [from, to]   = pieces[i];
+			piece.bda_read          = source.bda_read;
+			SetVulkanObjectNameF(m_graphics.device, piece.Handle(), "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", from,
+			                     to - from);
+			piece.CopyFrom(m_scheduler.Current(), source, from - begin, 0, to - from);
+			NoteGpuWrite(from, to - from); // (as JoinOverlap)
+		}
+		LiveCounters::Add(LiveCounters::UnmapBufferSplits);
+		LiveCounters::Add(LiveCounters::UnmapSplitFreedBytes, stop - begin - kept);
+		DeleteBuffer(id);
+		for (const auto piece: ids) Register(piece);
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "

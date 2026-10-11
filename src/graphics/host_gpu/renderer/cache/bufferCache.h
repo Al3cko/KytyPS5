@@ -214,6 +214,8 @@ public:
 	void RetireStaleBuffers(uint64_t tick);
 	// The buffers [vaddr, vaddr + size) holds whole go, after the guest unmapped it (GpuResourceManager::UnmapMemory).
 	void DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// Then a buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts.
+	void SplitUnmappedBuffers(uint64_t vaddr, uint64_t size);
 	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
 	void CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
 	                                   std::vector<RangeSet::Range>& ranges) const;
