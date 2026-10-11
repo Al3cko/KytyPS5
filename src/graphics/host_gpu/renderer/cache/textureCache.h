@@ -142,6 +142,8 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).
+	void RetireStaleImages(uint64_t tick);
 	// The latest tick of a GPU-written image's download that will write guest memory overlapping
 	// the range once the GPU completes it (on the priority thread); 0 when none is pending.
 	[[nodiscard]] uint64_t PendingDownloadTick(uint64_t address, uint64_t size);

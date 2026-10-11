@@ -3646,6 +3646,36 @@ void TextureCache::EraseRetired() {
 	});
 }
 
+// Per flip, whatever the memory use (the collector below runs only near the video memory budget, never on a 32 GB GPU):
+// images no draw or dispatch used for RetireTicks flips go, at most MaxRetirements a flip, as stale buffers do
+// (BufferCache::RetireStaleBuffers). Kept, their page watchers took a fault at every write the game made when it gave
+// that memory to other data (the third loop of the user's 1-1 route: partial dirty faults 17 -> 164 a frame, write
+// faults 73 -> 232), and they held their video memory for good. One the game draws again is made again from its bytes.
+// Passed over (to the back of the list): images whose bytes only the GPU has (no download here), depth images with a
+// stencil association (deleting depth deletes it too), unregistered ones.
+void TextureCache::RetireStaleImages(uint64_t tick) {
+	constexpr uint64_t RetireTicks    = 1200;
+	constexpr size_t   MaxRetirements = 16;
+	if (tick <= RetireTicks) return;
+	thread_local std::vector<ImageId> stale, kept;
+	stale.clear();
+	kept.clear();
+	m_lru_cache.ForEachItemBelow(tick - RetireTicks, [&](ImageId id) {
+		const auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered) return false;
+		if (owner->depth_id || owner->IsGpuModified())
+			kept.push_back(id);
+		else
+			stale.push_back(id);
+		return stale.size() == MaxRetirements;
+	});
+	for (const auto id: kept) TouchImage(m_slot_images[id]);
+	for (const auto id: stale) {
+		DeleteImage(id);
+		LiveCounters::Add(LiveCounters::GcImageDeletes);
+	}
+}
+
 void TextureCache::RunGarbageCollector() {
 	EraseRetired();
 	std::scoped_lock lock {m_lock};
@@ -3656,6 +3686,7 @@ void TextureCache::RunGarbageCollector() {
 		RetireImage(item.second.id);
 		return true;
 	});
+	RetireStaleImages(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

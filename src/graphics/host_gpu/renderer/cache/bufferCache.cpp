@@ -2443,7 +2443,8 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size) && (spec == nullptr || !spec->current_set.Contains(vaddr, size));
 }
 
-// Per flip, whatever the memory use: the buffers no binding used for StaleTicks flips go (at most MaxRetirements a flip).
+// Per flip, whatever the memory use: the buffers no binding used for StaleTicks flips go (at most MaxRetirements a flip;
+// 600 flips also retired what a turned camera left behind for ten seconds: re-registered when seen again at Latria).
 // The collector below waits for a frame without BDA shaders, which this game never has, so every buffer it ever
 // registered stayed; those inside the BDA shaders' unbounded read windows had their CPU-written pages uploaded and
 // write-protected again at every BDA preparation (the game reuses that memory every frame). At 1-1, three rounds of the
@@ -2452,7 +2453,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 // collector's) and buffers BDA shaders read with no buffer registered (Buffer::bda_read: those reads touch no LRU
 // entry, and one after the buffer went would read zeros once) - none faulted back over that route (bda_fault_pages ~0).
 void BufferCache::RetireStaleBuffers(uint64_t tick) {
-	constexpr uint64_t StaleTicks     = 600;
+	constexpr uint64_t StaleTicks     = 1800;
 	constexpr size_t   MaxRetirements = 64;
 	if (tick <= StaleTicks) return;
 	thread_local std::vector<BufferId> stale, kept;
