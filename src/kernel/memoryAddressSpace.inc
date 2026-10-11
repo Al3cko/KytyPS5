@@ -197,12 +197,52 @@ public:
 		const auto start = std::chrono::steady_clock::now();
 		lock.lock();
 		if (Graphics::GuestGpu::IsGpuThread()) {
+			const auto us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
 			LiveCounters::Add(write ? LiveCounters::BackingWriteWaits : LiveCounters::BackingLockWaits);
-			LiveCounters::Add(write ? LiveCounters::BackingWriteWaitUs : LiveCounters::BackingLockWaitUs,
-			                  static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			                                            std::chrono::steady_clock::now() - start)
-			                                            .count()));
+			LiveCounters::Add(write ? LiveCounters::BackingWriteWaitUs : LiveCounters::BackingLockWaitUs, us);
+			LogWaitStack(us, std::is_same_v<Lock, std::shared_lock<std::shared_mutex>> ? "map" : write ? "write" : "data");
 		}
+	}
+	// KYTY_BACKING_WAIT_STACK=<us> (diagnostics): the render thread's stack at a backing lock wait of at least <us>
+	// microseconds, once per distinct stack (64 at most), with the wait counted per stack in the summary lines.
+	static void LogWaitStack([[maybe_unused]] uint64_t us, [[maybe_unused]] const char* kind) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		static const uint64_t threshold = [] {
+			const char* value = std::getenv("KYTY_BACKING_WAIT_STACK");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : UINT64_MAX;
+		}();
+		if (us < threshold) return;
+		std::array<void*, 16> frames {};
+		unsigned long         hash  = 0;
+		const auto            count = RtlCaptureStackBackTrace(1, static_cast<unsigned long>(frames.size()), frames.data(), &hash);
+		struct Seen { uint64_t waits = 0, us = 0; };
+		static std::mutex                               mutex;
+		static std::unordered_map<unsigned long, Seen> seen;
+		uint64_t                                        waits = 0, sum = 0;
+		{
+			std::lock_guard guard(mutex);
+			if (seen.size() >= 64 && !seen.contains(hash)) return;
+			auto& entry = seen[hash];
+			waits = ++entry.waits;
+			sum = entry.us += us;
+		}
+		if (waits != 1 && (waits & (waits - 1)) != 0) return;
+		std::string text = "BACKING-WAIT " + std::string(kind) + " " + std::to_string(us) + " us (stack " +
+		                   std::to_string(hash) + ": " + std::to_string(waits) + " waits, " + std::to_string(sum) + " us):";
+		for (unsigned i = 0; i < count; i++) {
+			const auto address = reinterpret_cast<uint64_t>(frames[i]);
+			char       part[40];
+			std::snprintf(part, sizeof(part),
+			              address >= 0x140000000ull && address < 0x150000000ull ? " exe+0x%llx" : " 0x%llx",
+			              static_cast<unsigned long long>(address >= 0x140000000ull && address < 0x150000000ull
+			                                                  ? address - 0x140000000ull
+			                                                  : address));
+			text += part;
+		}
+		std::printf("%s\n", text.c_str());
+		std::fflush(stdout);
+#endif
 	}
 	std::shared_lock<std::shared_mutex> MapReadLock() {
 		std::shared_lock lock(m_mutex, std::defer_lock);
@@ -898,16 +938,36 @@ private:
 		if constexpr (!Write) cpu_lock.lock();
 		if constexpr (Write) {
 			HoldTimer hold {LiveCounters::BackingHoldWriteUs};
-			// The shared map lock keeps the mapping, so its backing bytes, fixed. A range
-			// that spans mappings keeps the fence that excludes every reader.
+			// The shared map lock keeps the mapping, so its backing bytes, fixed.
 			MapEntry entry {};
 			if (FindContainingUnlocked(vaddr, size, &entry)) {
 				const auto      begin = entry.backing_offset + vaddr - entry.vaddr;
 				DataWriteFence fence(*this, begin, begin + size, m_data_write_pages);
 				return TransferBackingUnlocked(vaddr, size, transfer);
 			}
-			BackingWriteFence fence(*this);
-			return TransferBackingUnlocked(vaddr, size, transfer);
+			// A range over several mappings (validated whole first: all or nothing) is written a mapping's piece at a
+			// time, each under the fence of its own pages. The fence that excludes every reader made each lock-free
+			// read of other bytes (the render thread's table copies) fall back to the data mutex and wait there for the
+			// whole copy (~160 us). A reader that spans mappings takes that mutex anyway, so it still sees all or none.
+			LiveCounters::Add(LiveCounters::BackingSpanWrites);
+			const auto end = vaddr + size;
+			for (auto current = vaddr; current < end;) {
+				MapEntry piece {};
+				if (!FindContainingUnlocked(current, 1, &piece) ||
+				    !RangeOk(piece.backing_offset + current - piece.vaddr, std::min(end, piece.vaddr + piece.size) - current))
+					return false;
+				current = std::min(end, piece.vaddr + piece.size);
+			}
+			for (auto current = vaddr; current < end;) {
+				MapEntry piece {};
+				EXIT_IF(!FindContainingUnlocked(current, 1, &piece));
+				const auto     bytes = std::min(end, piece.vaddr + piece.size) - current;
+				const auto     begin = piece.backing_offset + current - piece.vaddr;
+				DataWriteFence fence(*this, begin, begin + bytes, m_data_write_pages);
+				transfer(m_backing_base + begin, current - vaddr, static_cast<size_t>(bytes));
+				current += bytes;
+			}
+			return true;
 		} else {
 			return TransferBackingUnlocked(vaddr, size, transfer);
 		}
