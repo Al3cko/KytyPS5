@@ -725,7 +725,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	LiveCounters::Add(LiveCounters::GpuRangeEntries, m_gpu_modified_ranges.Count());
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
-		for (const auto& part: request->parts) m_gpu_modified_ranges.Subtract(part.address, part.size);
+		m_gpu_modified_ranges.SubtractSorted(request->parts);
 	}
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
@@ -932,7 +932,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 	}
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
-		for (const auto& copy: copies) m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+		m_gpu_modified_ranges.SubtractSorted(copies);
 	}
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
 	// are never published from the snapshot. Any later upload/GPU write invalidates it.
@@ -1229,7 +1229,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	}
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
-		for (const auto& copy: copies) m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+		m_gpu_modified_ranges.SubtractSorted(copies);
 	}
 }
 
@@ -2544,6 +2544,15 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid registered-region query\n");
+	}
+	// A short range asks the page table: buffers cover whole caching pages (CreateBuffer aligns them, a split cuts at
+	// mapping bounds) and registration fills their pages. (The map's search was 0.5% of the GPU thread at the 1-1
+	// ramparts: every guest readback asks.)
+	if (const auto first = vaddr >> PageTable::kPageBits, last = (vaddr + size - 1) >> PageTable::kPageBits;
+	    last - first < 4) {
+		for (auto page = first; page <= last; ++page)
+			if (const auto* owner = m_page_table.Find(page); owner != nullptr && *owner) return true;
+		return false;
 	}
 	// Cached buffers are ordered and non-overlapping. The last buffer beginning before the query
 	// end is therefore the only possible intersection.
