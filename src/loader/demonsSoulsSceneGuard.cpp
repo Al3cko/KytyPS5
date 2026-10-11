@@ -107,6 +107,16 @@ constexpr const char* VirtualLoop = "49 8b 3e 48 8b 07 ff 50 ?? 49 83 c6 08 4d 3
 // itself; add r15, 8; cmp r15, r12; jne. A null child crashed in the table lookup (eboot+0x8e5448 reading 0x58, 10-11,
 // twice on the user's route).
 constexpr const char* IdLoop = "49 8b 37 4c 89 f7 e8 ?? ?? ?? ?? 49 83 c7 08 4d 39 e7 75 ec";
+// The character manager's collection loop (01.007.000 eboot+0x3510e0, called with the manager at 0x9027cf378): for
+// each of a list of slot indices (u16) it loads the character from the manager's array (+0x18), asks whether its id
+// (+8) is still in use and removes it if not: inc r14; cmp r13, r14; je; mov rcx, [rbp - 0x30]; movzx eax, word [rbx +
+// r14 * 2]; mov rdi, [rip + d]; mov rcx, [rcx + 0x18]; mov r12, [rcx + rax * 8]; mov esi, [r12 + 8]; call; test al, al;
+// jne. A null slot crashed it when the Nexus loaded (eboot+0x351140 reading 0x8, 10-11 and 10-12, five times: slot 19
+// of lists of 22-28 indices up to 114, as the world switch tool warps there from another world's save; past the null
+// ones, slot 69 read 0x100000000 beyond the array's count, +0x24). An index at or past the count, or a null slot, has
+// nothing to remove: the next index.
+constexpr const char* CharacterLoop = "49 ff c6 4d 39 f5 74 ?? 48 8b 4d d0 42 0f b7 04 73 48 8b 3d ?? ?? ?? ?? 48 8b 49 18 "
+                                      "4c 8b 24 c1 41 8b 74 24 08 e8 ?? ?? ?? ?? 84 c0 75 d2";
 struct ChildLoop {
 	uint64_t increment = 0;  // the loop's add ITER, 8: a null child continues there
 	uint64_t load      = 0;  // mov REG, [ITER]
@@ -114,6 +124,10 @@ struct ChildLoop {
 	uint32_t moved     = 0;  // the bytes the jump to the stub replaces: the load and the next instruction
 	uint32_t load_size = 4;  // (mov REG, [r12] takes a SIB byte)
 	uint32_t iter      = 12; // ITER: the element's address
+	// Non-zero: ITER is an index, the element is skipped as a null one unless it is under the dword count at
+	// [[rbp + owner_frame] + count_offset] (rdx holds it: the loop's call after the moved bytes clobbers rdx).
+	int32_t  owner_frame  = 0;
+	uint32_t count_offset = 0;
 };
 
 std::vector<ChildLoop> FindChildLoops(const Program& program) {
@@ -139,6 +153,10 @@ std::vector<ChildLoop> FindChildLoops(const Program& program) {
 	if (const auto at = GuestCode::FindUnique(program, virtual_loop)) loops.push_back({*at + 9, *at, 7, 6, 3, 14});
 	const GuestCode::Pattern id_loop(IdLoop);
 	if (const auto at = GuestCode::FindUnique(program, id_loop)) loops.push_back({*at + 11, *at, 6, 6, 3, 15});
+	// (The slot's load and the read of its id move; the slot index, rax, is printed.)
+	const GuestCode::Pattern character_loop(CharacterLoop);
+	if (const auto at = GuestCode::FindUnique(program, character_loop))
+		loops.push_back({*at, *at + 28, 12, 9, 4, 0, -0x30, 0x24});
 	return loops;
 }
 
@@ -344,6 +362,12 @@ void Install(Program* program) {
 		Xbyak::Label       null_child;
 		c.align(16);
 		loop_stubs.push_back(c.getCurr());
+		if (loop.owner_frame != 0) {
+			c.mov(rdx, ptr[rbp + loop.owner_frame]);
+			c.movsxd(rdx, dword[rdx + loop.count_offset]);
+			c.cmp(Xbyak::Reg64(static_cast<int>(loop.iter)), rdx);
+			c.jae(null_child, Xbyak::CodeGenerator::T_NEAR);
+		}
 		c.db(load, loop.load_size); // mov REG, [ITER]
 		c.test(child, child);
 		c.jz(null_child);
