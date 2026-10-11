@@ -17,7 +17,12 @@ namespace {
 uint64_t                site = 0;
 std::array<uint8_t, 13> original {}, patch {};
 void* KYTY_SYSV_ABI     CoherentMove(void* destination, const void* source, size_t size) {
-    return Move(destination, source, size, &Libs::LibKernel::Memory::TryPrepareHostWrite);
+	// A move within one range reads bytes it then writes: their GPU data is read back first. Else the destination's is
+	// replaced whole and dropped (Memory::InvalidateMemoryForWrite).
+	const auto to = reinterpret_cast<uint64_t>(destination), from = reinterpret_cast<uint64_t>(source);
+	const bool overlap = to < from + size && from < to + size;
+	return Move(destination, source, size,
+	            overlap ? &Libs::LibKernel::Memory::TryPrepareHostWrite : &Libs::LibKernel::Memory::TryPrepareHostOverwrite);
 }
 // libc.prx's memmove/bcopy/memcpy body, shared by the three entries, which jump to it after the guest's
 // argument/stack checks with one saved RBP. Hashed whole, not just the prologue, in each build audited; nothing

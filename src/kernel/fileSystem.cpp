@@ -162,7 +162,7 @@ static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 	    file->dents_offset < file->dirents.size() ? file->dirents.size() - file->dents_offset : 0;
 	const auto bytes = std::min(count, remaining);
 	if (bytes != 0) {
-		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), bytes);
+		Memory::InvalidateMemoryForWrite(reinterpret_cast<uint64_t>(buf), bytes);
 		memcpy(buf, file->dirents.data() + file->dents_offset, bytes);
 		file->dents_offset += bytes;
 	}
@@ -607,7 +607,7 @@ static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
 		f.Read(bounce.data(), want, &got);
 		if (got == 0) break;
 		const auto destination = reinterpret_cast<uint64_t>(buf) + total;
-		Memory::InvalidateMemory(destination, got);
+		Memory::InvalidateMemoryForWrite(destination, got);
 		std::memcpy(reinterpret_cast<void*>(destination), bounce.data(), got);
 		total += got;
 		if (got < want) break;

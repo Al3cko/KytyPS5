@@ -1266,9 +1266,21 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+void InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	(void)GetGpuResources().InvalidateMemoryForWrite(vaddr, size);
+}
+
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       g_gpu_resources->InvalidateMemory(vaddr, size);
+}
+
+bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
 }
 
 void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {

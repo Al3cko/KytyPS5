@@ -157,8 +157,13 @@ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t s
 // [vaddr, vaddr + size); false when none does.
 bool                   PrintWriteBacksOverlapping(uint64_t vaddr, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Before a host write of all of [vaddr, vaddr + size) (a file read, a large guest memmove): as InvalidateMemory, but
+// GPU-written bytes the write replaces whole are dropped instead of read back first.
+void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 // Prepare a host write using normal coherent invalidation; false means use guest faults.
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
+// The same for a write of all of the range that reads none of it (InvalidateMemoryForWrite).
+bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 // Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
 [[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);

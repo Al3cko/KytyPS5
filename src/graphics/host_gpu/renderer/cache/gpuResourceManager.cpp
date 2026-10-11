@@ -132,6 +132,15 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool GpuResourceManager::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		return false;
+	}
+	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
 bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
