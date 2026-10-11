@@ -265,6 +265,12 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				break;
 			case SDLK_F9: Loader::DemonsSoulsWarp::Select(-1); break;
 			case SDLK_F10: Loader::DemonsSoulsWarp::Select(1); break;
+			// F6: the player's position appended to a route file (automated tours replay it).
+			case SDLK_F6:
+				if (!key.repeat) {
+					Loader::DemonsSoulsWarp::RecordWaypoint();
+				}
+				break;
 			case SDLK_RETURN:
 			case SDLK_KP_ENTER:
 				if (!key.repeat && (key.mod & KMOD_ALT) != 0) {
@@ -1061,6 +1067,9 @@ void WindowContext::UpdateTitle() {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	if (const auto waypoints = Loader::DemonsSoulsWarp::RecordedWaypoints(); waypoints != 0) {
+		text += fmt::format(", waypoints: {}", waypoints);
+	}
 
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }

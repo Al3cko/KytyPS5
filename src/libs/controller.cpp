@@ -13,6 +13,9 @@
 #include "libs/padData.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -131,6 +134,18 @@ private:
 
 static GameController* g_controller = nullptr;
 
+// SetScriptedInput's values; `until` (steady clock ns, 0: none) is written last.
+struct ScriptedInput {
+	std::atomic<int64_t>                until {0};
+	std::array<std::atomic<int32_t>, 4> axes {};
+	std::atomic<uint32_t>               buttons {0};
+};
+static ScriptedInput g_scripted;
+
+static int64_t SteadyNanoseconds() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
 	EXIT_IF(data == nullptr);
@@ -152,6 +167,15 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			output.y     = touch.y;
 			output.id    = touch.id;
 		}
+	}
+	if (const auto until = g_scripted.until.load(std::memory_order_acquire); until != 0 && SteadyNanoseconds() < until) {
+		uint8_t* axes[] = {&data->left_stick_x, &data->left_stick_y, &data->right_stick_x, &data->right_stick_y};
+		for (size_t i = 0; i < 4; i++) {
+			if (const auto value = g_scripted.axes[i].load(std::memory_order_relaxed); value >= 0) {
+				*axes[i] = static_cast<uint8_t>(std::min(value, 255));
+			}
+		}
+		data->buttons |= g_scripted.buttons.load(std::memory_order_relaxed);
 	}
 	data->connected              = connected;
 	data->timestamp              = state.time;
@@ -578,6 +602,16 @@ void SetRightStick(int id, int x, int y) {
 
 void SetTouchPad(int id, int finger, bool down, float x, float y) {
 	g_controller->TouchPad(id, finger, down, x, y);
+}
+
+void SetScriptedInput(int left_x, int left_y, int right_x, int right_y, uint32_t buttons, double seconds) {
+	g_scripted.until.store(0, std::memory_order_release);
+	const int values[] = {left_x, left_y, right_x, right_y};
+	for (size_t i = 0; i < 4; i++) g_scripted.axes[i].store(values[i], std::memory_order_relaxed);
+	g_scripted.buttons.store(buttons, std::memory_order_relaxed);
+	if (seconds > 0) {
+		g_scripted.until.store(SteadyNanoseconds() + static_cast<int64_t>(seconds * 1e9), std::memory_order_release);
+	}
 }
 
 void ResetInputState() {

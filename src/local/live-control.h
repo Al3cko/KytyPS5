@@ -14,6 +14,8 @@
 // A sample is 16 words: pc, the word at rsp, then up to 14 frame-pointer return addresses
 // (process mode: pc, thread id | 1 << 63, zeros).
 //   timecensus <seconds>          time-related HLE calls per guest caller (time-census.h)
+//   glide <x> <y> <z> <speed>     Demon's Souls 01.007.000: the player walks there (warp requests, no input)
+//   pad <lx> <ly> <rx> <ry> <buttons> <seconds>   scripted pad input (sticks 0..255, -1 the host's; buttons hex)
 //   sleep <seconds>
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
@@ -22,6 +24,7 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-trace.h"
+#include "libs/controller.h"
 #include "loader/demonsSoulsWarp.h"
 #include "local-platform.h"
 #include "slow-log.h"
@@ -569,6 +572,22 @@ inline void Run(uint64_t id, const std::string& line) {
 		                     : n == 3 && Loader::DemonsSoulsWarp::Arm(arg1, arg2);
 		std::printf("LIVE_WARP id=%" PRIu64 " map=%s spawn=%s ok=%d spawns=%zu\n", id, arg1, n == 3 ? arg2 : "-",
 		            ok ? 1 : 0, Loader::DemonsSoulsWarp::Spawns().size());
+	} else if (cmd == "glide") {
+		// glide X Y Z SPEED: the player walked there in a straight line (loader/demonsSoulsWarp.h), at once; seconds = the
+		// time it takes (-1: no player).
+		float      x = 0, y = 0, z = 0, speed = 0;
+		const bool parsed  = std::sscanf(line.c_str(), "%*s %f %f %f %f", &x, &y, &z, &speed) == 4;
+		const auto seconds = parsed ? Loader::DemonsSoulsWarp::Glide(x, y, z, speed) : -1.0;
+		std::printf("LIVE_GLIDE id=%" PRIu64 " seconds=%.2f\n", id, seconds);
+	} else if (cmd == "pad") {
+		// pad LX LY RX RY BUTTONS SECONDS: what the game reads from the pad for SECONDS (libs/controller.h).
+		int          axes[4] {-1, -1, -1, -1};
+		unsigned int buttons = 0;
+		double       seconds = 0;
+		const bool   parsed  = std::sscanf(line.c_str(), "%*s %d %d %d %d %x %lf", &axes[0], &axes[1], &axes[2], &axes[3],
+		                                   &buttons, &seconds) == 6;
+		if (parsed) Libs::Controller::SetScriptedInput(axes[0], axes[1], axes[2], axes[3], buttons, seconds);
+		std::printf("LIVE_PAD id=%" PRIu64 " ok=%d\n", id, parsed ? 1 : 0);
 	} else if (cmd == "fatal") {
 		// fatal: a fatal error on this thread, the path a crash takes (log, then the process ends).
 		EXIT("live fatal: a test of the fatal-error exit\n");

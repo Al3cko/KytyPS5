@@ -26,6 +26,14 @@ struct Spawn {
 // The player spawn points of every map (read from the game's MSB files once).
 const std::vector<Spawn>& Spawns();
 
+// F6 (01.007.000): the player's position appended to _Build/waypoints/route-<start time>.txt as "x y z label" (the
+// format automated tours read); RecordedWaypoints counts them (the window title shows it).
+void     RecordWaypoint();
+uint32_t RecordedWaypoints();
+// Live `glide X Y Z SPEED` (01.007.000, automated tours): the player moved there in a straight line at SPEED m/s by the
+// game's warp request each 16 ms, facing the way it goes; returns the seconds it takes (-1: no player, another build).
+double Glide(float x, float y, float z, float speed);
+
 bool        Arm(std::string_view map, std::string_view spawn);
 void        Disarm();
 void        Select(int step);    // F9/F10: the spawn point an F8 arms

@@ -1,6 +1,7 @@
 #include "loader/demonsSoulsWarp.h"
 
 #include "common/file.h"
+#include "common/guardedCopy.h"
 #include "common/stringUtils.h"
 #include "kernel/fileSystem.h"
 
@@ -9,13 +10,16 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 namespace Loader::DemonsSoulsWarp {
 
@@ -132,6 +136,9 @@ std::filesystem::file_time_type       g_save_time {};
 std::chrono::steady_clock::time_point g_shown_until {}, g_checked {};
 std::string                           g_message;
 bool                                  g_picking = false; // the shown message is the spawn list
+std::filesystem::path                 g_route;           // F6's file (made by the first waypoint)
+std::chrono::steady_clock::time_point g_route_start {};
+std::atomic_uint32_t                  g_waypoints {0};
 
 void Show(std::string message, int seconds) {
 	g_message     = std::move(message);
@@ -244,6 +251,163 @@ void ToggleSelected() {
 		selected = g_selected;
 	}
 	Arm(spawns[selected].map, spawns[selected].name);
+}
+
+#if defined(_WIN32)
+namespace {
+
+// A guest read that stops at a page without access (no player while loading) instead of faulting.
+template <class T>
+bool Peek(uint64_t address, T* out) {
+	return address >= 0x10000 && Common::GuardedCopy(out, reinterpret_cast<const void*>(address), sizeof(T)) == 0;
+}
+
+// 01.007.000's IsLocalPlayer: lea rax, [ChrInsMan pointer]; mov rax, [rax]; cmp [rax + 0x258], rdi; sete al; ret.
+bool IsPlayerBuild() {
+	static constexpr uint8_t IsLocalPlayer[] = {0x48, 0x8d, 0x05, 0xc1, 0x45, 0x4a, 0x02, 0x48, 0x8b, 0x00, 0x48,
+	                                            0x39, 0xb8, 0x58, 0x02, 0x00, 0x00, 0x0f, 0x94, 0xc0, 0xc3};
+	uint8_t code[sizeof(IsLocalPlayer)] {};
+	return Peek(0x90032adb0, &code) && std::memcmp(code, IsLocalPlayer, sizeof(code)) == 0;
+}
+
+// The player's ChrIns +0x38 is its ChrCtrl, that +0x20 its physics body: angles at +0x10, position at +0x20 (y up, the
+// MSB and save coordinates). ChrCtrl +0xfc is a warp request the game applies the next frame (and clears): position
+// at +0x100, angles at +0x110, the request byte written last.
+bool FindPlayer(uint64_t* ctrl, uint64_t* body) {
+	uint64_t man = 0, chr = 0;
+	return Peek(0x9027cf378, &man) && Peek(man + 0x258, &chr) && Peek(chr + 0x38, ctrl) && Peek(*ctrl + 0x20, body);
+}
+
+// Glide: the warp request every 16 ms along a straight line (the game moves the player as if walking, without input).
+struct GlideState {
+	std::mutex                            mutex;
+	std::condition_variable               wake;
+	bool                                  started = false, active = false;
+	float                                 from[3] {}, to[3] {}, yaw = 0;
+	double                                seconds = 0;
+	std::chrono::steady_clock::time_point begin {};
+};
+GlideState g_glide;
+
+void WarpPlayer(const float* at, float yaw) {
+	uint64_t ctrl = 0, body = 0;
+	float    angles[4] {};
+	if (!FindPlayer(&ctrl, &body) || !Peek(body + 0x10, &angles)) return;
+	angles[1]               = yaw;
+	const float position[4] = {at[0], at[1], at[2], 1.0f};
+	auto*       request     = reinterpret_cast<uint8_t*>(ctrl);
+	std::memcpy(request + 0x100, position, sizeof(position)); // (plain stores: a tracked page takes the usual fault)
+	std::memcpy(request + 0x110, angles, sizeof(angles));
+	std::atomic_signal_fence(std::memory_order_seq_cst); // the request last (x86 keeps the stores' order)
+	*reinterpret_cast<volatile uint16_t*>(request + 0xfc) = 1;
+}
+
+void GlideThread() {
+	std::unique_lock lock(g_glide.mutex);
+	for (;;) {
+		g_glide.wake.wait(lock, [] { return g_glide.active; });
+		const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_glide.begin).count();
+		const double part    = g_glide.seconds > 0 ? std::min(1.0, elapsed / g_glide.seconds) : 1.0;
+		float        at[3];
+		for (int i = 0; i < 3; i++) at[i] = g_glide.from[i] + static_cast<float>(part) * (g_glide.to[i] - g_glide.from[i]);
+		const float yaw = g_glide.yaw;
+		if (part >= 1.0) g_glide.active = false;
+		lock.unlock();
+		WarpPlayer(at, yaw);
+		std::this_thread::sleep_for(std::chrono::milliseconds(16));
+		lock.lock();
+	}
+}
+
+} // namespace
+#endif
+
+double Glide(float x, float y, float z, float speed) {
+#if defined(_WIN32)
+	uint64_t ctrl = 0, body = 0;
+	float    from[3] {};
+	if (!(speed > 0) || !IsPlayerBuild() || !FindPlayer(&ctrl, &body) || !Peek(body + 0x20, &from)) return -1;
+	const float dx = x - from[0], dy = y - from[1], dz = z - from[2];
+	std::lock_guard lock(g_glide.mutex);
+	std::copy_n(from, 3, g_glide.from);
+	g_glide.to[0] = x;
+	g_glide.to[1] = y;
+	g_glide.to[2] = z;
+	// Facing the way it moves (the saves' and the body's yaw: atan2(-dx, -dz)); kept when it goes straight up or down.
+	float angles[4] {};
+	g_glide.yaw     = dx * dx + dz * dz > 0.01f ? std::atan2(-dx, -dz) : (Peek(body + 0x10, &angles) ? angles[1] : 0.0f);
+	g_glide.seconds = std::sqrt(dx * dx + dy * dy + dz * dz) / speed;
+	g_glide.begin   = std::chrono::steady_clock::now();
+	g_glide.active  = true;
+	if (!g_glide.started) {
+		g_glide.started = true;
+		std::thread(GlideThread).detach();
+	}
+	g_glide.wake.notify_one();
+	return g_glide.seconds;
+#else
+	(void)x, (void)y, (void)z, (void)speed;
+	return -1;
+#endif
+}
+
+void RecordWaypoint() {
+	float xyz[3] {}, angles[4] {};
+	bool  found = false;
+#if defined(_WIN32)
+	uint64_t ctrl = 0, body = 0;
+	if (!IsPlayerBuild()) {
+		std::lock_guard lock(g_mutex);
+		Show("Waypoint: only for Demon's Souls 01.007.000", 3);
+		return;
+	}
+	found = FindPlayer(&ctrl, &body) && Peek(body + 0x10, &angles) && Peek(body + 0x20, &xyz) && std::isfinite(xyz[0]) &&
+	        std::isfinite(xyz[1]) && std::isfinite(xyz[2]);
+#endif
+	std::lock_guard lock(g_mutex);
+	if (!found) {
+		Show("Waypoint: no player now", 2);
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (g_route.empty()) {
+		const auto time  = std::time(nullptr);
+		std::tm    local {};
+#if defined(_WIN32)
+		localtime_s(&local, &time);
+#else
+		localtime_r(&time, &local);
+#endif
+		char name[64] {};
+		std::strftime(name, sizeof(name), "route-%Y%m%d-%H%M%S.txt", &local);
+		std::error_code error;
+		std::filesystem::create_directories("_Build/waypoints", error);
+		g_route       = std::filesystem::absolute(std::filesystem::path("_Build/waypoints") / name, error);
+		g_route_start = now;
+		std::ofstream(g_route, std::ios::app) << "# Demon's Souls 01.007.000 waypoints (F6): x y z label yaw seconds\n";
+	}
+	// Appended and closed each time: the points so far stay when the game or the emulator crashes later.
+	const auto index   = g_waypoints.load(std::memory_order_relaxed) + 1;
+	const auto seconds = std::chrono::duration<double>(now - g_route_start).count();
+	char       line[160] {};
+	std::snprintf(line, sizeof(line), "%.2f %.2f %.2f user-%u %.3f %.1f\n", xyz[0], xyz[1], xyz[2], index, angles[1], seconds);
+	std::ofstream out(g_route, std::ios::app);
+	out << line;
+	out.close();
+	if (!out) {
+		Show("Waypoint: cannot write " + g_route.string(), 4);
+		return;
+	}
+	g_waypoints.store(index, std::memory_order_relaxed);
+	std::printf("WAYPOINT %u: %.2f %.2f %.2f -> %s\n", index, xyz[0], xyz[1], xyz[2], g_route.string().c_str());
+	std::fflush(stdout);
+	char shown[96] {};
+	std::snprintf(shown, sizeof(shown), "Waypoint %u: %.1f %.1f %.1f", index, xyz[0], xyz[1], xyz[2]);
+	Show(shown, 2);
+}
+
+uint32_t RecordedWaypoints() {
+	return g_waypoints.load(std::memory_order_relaxed);
 }
 
 std::string HudText() {
