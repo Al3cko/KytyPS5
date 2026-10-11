@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "live-counters.h"
 
 #include <bit>
 #include <cinttypes>
@@ -138,6 +139,7 @@ void FaultManager::ProcessFaultBuffer() {
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
+		LiveCounters::Add(LiveCounters::BdaFaultPages, count);
 		for (uint32_t index = 1; index <= count; ++index) {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
@@ -147,7 +149,7 @@ void FaultManager::ProcessFaultBuffer() {
 			// Unmapped since the GPU recorded the access (GpuResourceManager::UnmapMemory no
 			// longer waits for this processing): no buffer over memory that is gone.
 			if (!m_buffer_cache.IsGpuMapped(start, end - start)) return;
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			m_buffer_cache.GetBuffer(m_buffer_cache.FindBuffer(start, end - start)).bda_read = true;
 		});
 		m_fault_areas[area] = 0;
 	});

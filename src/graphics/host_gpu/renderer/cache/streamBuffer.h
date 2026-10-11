@@ -78,6 +78,9 @@ public:
 	std::atomic<bool> is_deleted {false};
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch no
+	// LRU entry, so the stale-buffer retirement passes it over (BufferCache::RunGarbageCollector).
+	bool bda_read = false;
 	// The command buffer (CommandScheduler::CommandSerial) that last recorded a copy or fill into it or an image's
 	// bytes (TextureCache::DownloadImageData): writes that need not synchronize their pages first (a shader's write
 	// does, BufferCache::ObtainBuffer). Uploads into it then stay in order in that buffer (UploadPrologue).

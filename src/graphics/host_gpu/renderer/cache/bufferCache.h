@@ -50,6 +50,8 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// Live "sync" (any thread, racy by design: for a stalled GPU thread).
 	void                   PrintSyncState();
+	// Live "buffers <path>": the cached buffers as a tab-separated table (on the GPU thread).
+	void                   WriteBufferReport(const char* path);
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
@@ -205,6 +207,10 @@ public:
 		TouchBuffer(*buffer);
 		return true;
 	}
+	// The buffers no binding used for a while go (RunGarbageCollector, once a flip).
+	void RetireStaleBuffers(uint64_t tick);
+	// The buffers [vaddr, vaddr + size) holds whole go, after the guest unmapped it (GpuResourceManager::UnmapMemory).
+	void DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
 	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
 	void CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
 	                                   std::vector<RangeSet::Range>& ranges) const;
