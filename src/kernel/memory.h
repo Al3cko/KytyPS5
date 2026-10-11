@@ -160,6 +160,11 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // Before a host write of all of [vaddr, vaddr + size) (a file read, a large guest memmove): as InvalidateMemory, but
 // GPU-written bytes the write replaces whole are dropped instead of read back first.
 void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
+// Before plain stores of the host over all of [vaddr, vaddr + size) (a file read's copy): where the host tells the
+// pages' protection (Windows), the span of those a store would fault on (the trackers' write or read protection) is
+// made the host's at once (InvalidateMemoryForWrite). Nothing when no page would fault: the trackers and their locks are
+// left alone (InvalidateMemoryForWrite takes the texture cache's lock, which the render thread holds for long).
+void PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 // Prepare a host write using normal coherent invalidation; false means use guest faults.
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 // The same for a write of all of the range that reads none of it (InvalidateMemoryForWrite).
