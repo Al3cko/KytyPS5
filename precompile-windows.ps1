@@ -206,6 +206,16 @@ if ($InputsOnly) {
 }
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
+# The plan: every pipeline of the run with the work item that makes it first (a dry run of each seed file on all CPUs,
+# a minute or two). The shards then compile each pipeline once, whichever of them or of the seed files makes it: two
+# fifths of their pipelines were made by another work item too (the same modules and state: a recipe's table and
+# native variants, a recorded specialization the seeds guessed), each compiled again in every shard that had one.
+$plan = "$logs\plan.bin"
+Wait-Precompile (Start-Precompile 'plan-seeds' @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus")) 'plan'
+if ($Recorded -and (Test-Path $Recorded)) {
+	Wait-Precompile (Start-Precompile 'plan-recorded' @('--seeds', "`"$Recorded`"", '--dry-run', '--plan', "`"$plan`"",
+		'--threads', "$cpus")) 'plan'
+}
 $pending = [System.Collections.Generic.Queue[object]]::new()
 for ($i = 0; $i -lt $Shards; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
 if ($Recorded -and (Test-Path $Recorded)) {
@@ -224,7 +234,8 @@ while ($pending.Count -or $running.Count) {
 	while ($pending.Count -and $running.Count -lt $Jobs) {
 		$seedFile, $shard = $pending.Dequeue()
 		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
-		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")))
+		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard,
+			'--threads', "$Threads", '--plan', "`"$plan`"")))
 	}
 	Start-Sleep -Milliseconds 250
 	foreach ($name in @($running.Keys)) {

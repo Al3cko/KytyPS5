@@ -1,7 +1,8 @@
 // The static shader and pipeline precompile, a program of its own (tools/local/static-precompile):
 //
 //   kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] [--threads <n>]
-//                          [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]
+//                          [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines] [--dry-run]
+//                          [--plan <file>] [--native-guesses]
 //   kyty_shader_precompile --game <dir> --merge [--prune]
 //   kyty_shader_precompile --game <dir> --seeds <file> --status
 //   kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>]
@@ -25,7 +26,14 @@
 // shards (2n) instead. --out
 // writes what was compiled as a warmup file, for precompile.py coverage; --static-inputs
 // writes it where the emulator's shader prefetch reads it (_PipelineCache/static/<title>_<version>.shaders);
-// --timings each pipeline's compile time (ms, SPIR-V words, the seeds' hashes). --status prints
+// --timings each pipeline's compile time (ms, SPIR-V words, the seeds' hashes, the kind of module, the pipeline's key:
+// equal for the same pipeline, and the work item: compute seed or graphics recipe); --dry-run creates none, the
+// timings then listing what would be (0 ms). --plan <file> with --dry-run adds every pipeline of the seed file to the
+// run's plan (its key, the work item that makes it first; a key an earlier seed file has stays that one's); with
+// --shard, the shard creates only the pipelines whose first work item is its own: what several work items or seed
+// files make (two fifths of a run) is compiled once. --native-guesses: the native XPR variants of a seed file without
+// recorded specializations as well (the game met none of them in a 1-1 session; a third of such a file's time).
+// --status prints
 // whether those inputs and the static cache are this GPU's and driver's ("inputs current|stale",
 // "static cache current|outdated|stale", outdated: older than the seeds; run-windows.ps1 asks before every launch).
 // Run it from the directory the emulator runs in.
@@ -62,7 +70,8 @@ using Libs::Graphics::PipelineCache;
 
 static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
-	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]\n"
+	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines] "
+	                     "[--dry-run] [--plan <file>] [--native-guesses]\n"
 	                     "       kyty_shader_precompile --game <dir> --merge [--prune]\n"
 	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n"
 	                     "       kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>] "
@@ -100,6 +109,10 @@ int main(int argc, char* argv[]) {
 			status = true;
 		} else if (arg == "--no-pipelines") {
 			options.pipelines = false;
+		} else if (arg == "--dry-run") {
+			options.dry_run = true;
+		} else if (arg == "--native-guesses") {
+			options.native_guesses = true;
 		} else if (arg == "--amd") {
 			// What a GPU running wave64 compute natively with 4-byte robust storage alignment (AMD RDNA) gets:
 			// 64-lane host subgroups and shader-side storage buffer bounds (with --no-pipelines on another GPU).
@@ -119,6 +132,8 @@ int main(int argc, char* argv[]) {
 			options.out = argv[++i];
 		} else if (arg == "--timings") {
 			options.timings = argv[++i];
+		} else if (arg == "--plan") {
+			options.plan = argv[++i];
 		} else if (arg == "--threads") {
 			options.threads = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 		} else if (arg == "--shard") {

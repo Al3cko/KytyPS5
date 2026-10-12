@@ -137,6 +137,13 @@ public:
 		uint32_t              shards  = 1;
 		uint32_t              threads = 1;
 		bool                  pipelines = true;
+		// No pipeline created: the timings list what would be (0 ms), each with its key (what makes two the same).
+		bool                  dry_run = false;
+		// The run's plan: each pipeline key of its seed files with the work item that makes it first. A dry run adds
+		// the seed file's keys to it; a shard creates only the pipelines whose first work item is its own.
+		std::filesystem::path plan;
+		// Native XPR variants of a seed file without recorded specializations too (its guesses; see WarmSeeds).
+		bool                  native_guesses = false;
 		// Compute seeds translated for this host subgroup size instead of the one they were listed or recorded with
 		// (0: as they were): kyty_shader_precompile passes the GPU's (GetComputeProgram's), --amd what a GPU running
 		// wave64 programs natively (AMD RDNA3) gets.
@@ -441,6 +448,16 @@ void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime);
 // hold (the precompile: of each it makes) and its modules' shader and SPIR-V hashes.
 bool PipelineKeyLog();
 void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash);
+// KYTY_PIPELINE_SOURCE_LOG (diagnostic): a PIPESRC line for each pipeline made (its kind, identity, whether the static
+// cache gave it, its build and time): which of the precompile's pipelines a game session meets.
+bool PipelineSourceLog();
+// A pipeline's identity: its modules' SPIR-V, its fixed-function state (as a recipe holds it), its stages' static input
+// keys and native bindings; the same for the same pipeline (the precompile's plan keys it so, the source log too).
+uint64_t GraphicsPipelineIdentity(uint64_t vertex_spirv, uint64_t pixel_spirv, const PipelineRenderingState& rendering,
+                                  const PipelineVertexInputState& vertex_input, const PipelineStaticParameters& state,
+                                  const ShaderVertexInputInfo& vs_input_info, const ShaderPixelInputInfo* ps_input_info,
+                                  bool native_bindings);
+uint64_t ComputePipelineIdentity(uint64_t spirv, const ShaderComputeInputInfo& input_info, bool native_bindings);
 
 } // namespace Libs::Graphics
 

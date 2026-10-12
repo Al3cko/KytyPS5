@@ -704,7 +704,7 @@ struct PipelineCache::ProgramCache {
 		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 		                     "create recompiled shader module");
 		EXIT_IF(module == nullptr);
-		if (PipelineKeyLog()) {
+		if (PipelineKeyLog() || PipelineSourceLog()) {
 			NotePipelineKeyModule(module, options.shader_hash,
 			                      XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)));
 		}
