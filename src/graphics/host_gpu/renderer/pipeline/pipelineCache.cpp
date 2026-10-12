@@ -1539,9 +1539,12 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			}
 		}
 		// The recorded pipelines (15K, most of other areas) cost ~1 GiB of video memory and ~3 GiB of RAM (5 GiB
-		// committed): a GPU that cannot also hold the game's working set (small_video_memory), or a PC with less RAM
-		// than the ~20 GB the game takes while it loads, makes them when they are first used (~0.75 ms each from the
-		// static precompile's binaries). Such a PC records the shaders but translates none at start-up either: their
+		// committed): a GPU that cannot also hold the game's working set (small_video_memory) makes the graphics ones
+		// (almost no video memory) and the compute ones it met most recently up to 1/16 of its video memory (a laptop's
+		// 8 GB RTX 3080: making them when first used, 2-3.6 ms each, held up walks for 150-900 ms at a new view), the
+		// rest when they are first used (WarmPipelines). A PC with less RAM than the ~20 GB the game takes while it
+		// loads makes none at start-up (~0.75 ms each from the static precompile's binaries when first used). Such a
+		// PC records the shaders but translates none at start-up either: their
 		// SPIR-V and modules took 3.1 GiB of RAM, and the shader prefetch translates every shader of the game in the
 		// background anyway (16 GB reported at 1-1: +76 MiB instead of +3181, the HUD 10 s sooner, the same 59-60 fps
 		// and one slow shader translation).
@@ -1556,13 +1559,22 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		const auto video_before = m_graphics.GetDeviceMemoryUsage();
 		m_program_cache->Warm(path, title + device, compile_shaders, adopt_from);
 		const auto memory_shaders = LocalPlatform::ProcessMemory();
-		const bool warm_pipelines = !m_graphics.small_video_memory && !low_ram;
+		// KYTY_PIPELINE_WARMUP: 1 makes them all whatever the memory, 0 none; KYTY_PIPELINE_WARMUP_VIDEO_MIB: the compute
+		// pipelines' video memory cap instead of 1/16 of a small one's.
+		const char*            forced = std::getenv("KYTY_PIPELINE_WARMUP");
+		const std::string_view force  = forced != nullptr ? forced : "";
+		const bool             warm_pipelines = force == "1" || (force != "0" && !low_ram);
+		const char*            cap            = std::getenv("KYTY_PIPELINE_WARMUP_VIDEO_MIB");
+		const uint64_t         compute_video  = cap != nullptr && *cap != 0 ? std::strtoull(cap, nullptr, 10) << 20u
+		                                        : force != "1" && m_graphics.small_video_memory
+		                                            ? m_graphics.GetTotalMemoryBudget() / 16u
+		                                            : UINT64_MAX;
 		if (!warm_pipelines && std::string_view(warmup) == "1")
 			PipelineCacheLog("Pipeline warmup: skipped (video memory budget {} MiB, RAM {} MiB)",
 			                 m_graphics.GetTotalMemoryBudget() >> 20u, ram >> 20u);
 		if (std::string_view(warmup) == "1" && warm_pipelines) {
 			const auto begin = std::chrono::steady_clock::now();
-			WarmPipelines();
+			WarmPipelines(compute_video);
 			// What the driver had to compile is kept at once: the cache is otherwise written only
 			// at a normal exit, so after a crash the next launch compiled it all again (2+ minutes).
 			if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(5)) (void)Save();
@@ -1612,7 +1624,7 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
 }
 
-void PipelineCache::WarmPipelines() {
+void PipelineCache::WarmPipelines(uint64_t compute_video) {
 	auto& programs = *m_program_cache;
 	const auto begin = std::chrono::steady_clock::now();
 	const auto get = [&](uint32_t index) -> ProgramCache::Permutation* {
@@ -1635,7 +1647,10 @@ void PipelineCache::WarmPipelines() {
 	std::vector<Job> jobs;
 	jobs.reserve(programs.warmup.pipelines.size());
 	std::atomic<size_t> skipped {0};
-	for (const auto& words: programs.warmup.pipelines) {
+	// The most recently recorded first (the area played last, likely the one the save is in): what a video memory cap
+	// for compute pipelines leaves out are the oldest.
+	for (auto recorded = programs.warmup.pipelines.rbegin(); recorded != programs.warmup.pipelines.rend(); ++recorded) {
+		const auto& words = *recorded;
 		Job job;
 		LocalShaderWarmup::Reader reader {words};
 		if (!LocalShaderWarmup::VisitPipeline(reader, job.recipe)) { ++skipped; continue; }
@@ -1660,16 +1675,26 @@ void PipelineCache::WarmPipelines() {
 		jobs.push_back(std::move(job));
 	}
 
-	std::atomic<size_t> next {0}, compiled {0};
+	std::atomic<size_t> next {0}, compiled {0}, computes {0}, left {0};
+	// Compute pipelines while the warmup's video memory stays under `compute_video` (checked every 32 of them).
+	m_graphics.RefreshMemoryBudget();
+	const uint64_t    video_start = m_graphics.GetDeviceMemoryUsage();
+	std::atomic<bool> compute_full {false};
 	const auto work = [&] {
 		for (size_t n; (n = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
 			if (std::chrono::steady_clock::now() >= programs.warm_deadline) return;
 			auto& job = jobs[n];
 			if (job.compute) {
+				if (compute_full.load(std::memory_order_relaxed)) { ++left; continue; }
 				LocalShaderWarmup::Record input;
 				if (!decode(job.recipe.compute, input)) { ++skipped; continue; }
 				input.compute.stage.program = &job.compute->program;
 				CreatePipelineInternal(m_graphics, *job.pipeline, input.compute, job.compute->handle.module, m_driver_cache);
+				if (compute_video != UINT64_MAX && (computes.fetch_add(1, std::memory_order_relaxed) + 1) % 32 == 0) {
+					m_graphics.RefreshMemoryBudget();
+					const auto video = m_graphics.GetDeviceMemoryUsage();
+					if (video > video_start && video - video_start >= compute_video) compute_full.store(true);
+				}
 			} else {
 				LocalShaderWarmup::Record vs, ps;
 				if (!decode(job.recipe.vertex, vs) || (job.pixel && !decode(job.recipe.pixel, ps))) { ++skipped; continue; }
@@ -1691,7 +1716,7 @@ void PipelineCache::WarmPipelines() {
 		for (uint32_t t = 1; t < threads; ++t) pool.emplace_back(work);
 		work();
 	}
-	// Past the deadline, or with an undecodable input, an entry stays empty.
+	// Past the deadline, past the compute cap, or with an undecodable input, an entry stays empty.
 	std::erase_if(m_compute_pipelines, [](const auto& entry) { return entry.second->pipeline == nullptr; });
 	std::erase_if(m_graphics_pipelines, [](const auto& entry) { return entry.second->pipeline == nullptr; });
 	programs.warm_permutations.clear();
@@ -1699,6 +1724,9 @@ void PipelineCache::WarmPipelines() {
 		compiled.load(), programs.warmup.pipelines.size(), skipped.load(),
 		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
 		threads);
+	if (compute_video != UINT64_MAX)
+		PipelineCacheLog("Pipeline warmup: compute pipelines up to {} MiB of video memory, {} older ones made when first used",
+		                 compute_video >> 20u, left.load());
 }
 
 PipelineCache::~PipelineCache() {

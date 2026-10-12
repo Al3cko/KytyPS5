@@ -419,7 +419,8 @@ private:
 	void              TablePipelineDone();
 	void              MainPipelineDone();
 	void InitializeStaticCache(bool create);
-	void WarmPipelines();
+	// The recorded pipelines; compute ones, newest first, while they took less than `compute_video` bytes of video memory.
+	void WarmPipelines(uint64_t compute_video = UINT64_MAX);
 #ifdef KYTY_STATIC_PRECOMPILE
 	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
 	static bool MergeBinaryShards(GraphicContext& graphics, bool prune);
