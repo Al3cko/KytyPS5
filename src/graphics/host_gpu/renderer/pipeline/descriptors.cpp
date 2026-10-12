@@ -520,6 +520,69 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 	}
 }
 
+// The guest texture of the levels `first`.. of `full`, its larger levels left out: the tiled layout puts the mip tail
+// first and then the levels from the smallest up, so a 2D texture's levels from `first` on are the first bytes of its
+// memory, laid out as the texture of its size >> first with that many fewer levels. False where that does not hold
+// byte for byte (every level's offset, size and padding is compared).
+static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& out) {
+	if (first == 0 || first >= full.resources.levels || full.resources.levels > full.mip_layout.size()) return false;
+	const auto shift = [&](uint32_t value) { return std::max((value + (1u << first) - 1u) >> first, 1u); };
+	out                  = full;
+	out.extent.width     = shift(full.extent.width);
+	out.extent.height    = shift(full.extent.height);
+	out.resources.levels = full.resources.levels - first;
+	out.pitch            = TileGetTexturePitch(full.guest_format, out.extent.width, full.tile_mode);
+	TileSizeAlign size {};
+	if (!TileGetTextureTotalSize(full.guest_format, out.extent.width, out.extent.height, 1, out.resources.levels,
+	                             full.tile_mode, false, size) ||
+	    size.size == 0 || size.size >= full.data.size || size.align == 0 || full.data.address % size.align != 0) {
+		return false;
+	}
+	out.data       = {full.data.address, size.size};
+	out.mip_layout = {};
+	PopulateTextureMipLayout(out);
+	for (uint32_t level = 0; level < out.resources.levels; ++level) {
+		const auto& mip = out.mip_layout[level];
+		if (mip != full.mip_layout[first + level] || mip.size == 0 || mip.offset + mip.size > out.data.size) return false;
+	}
+	return true;
+}
+
+// KYTY_TEXTURE_PREFIX=1|0 (default: on with less than 12 GiB of video memory): a sampled 2D texture whose T# starts at
+// level k > 0 is held as the texture of its levels k.. (TextureFromLevel), not whole. The game streams a texture in from
+// its smallest levels and samples a larger one once it is loaded: at 1-1 on an 8 GB laptop 495 of the 913 textures
+// were never sampled from level 0, their larger levels 1.7 GB of the 3.9 GB the textures took, on a card holding 10 GB
+// in its 7.3 GB budget. An image of the whole texture, or of the texture from a lower level, serves the view as before;
+// when the game samples a larger level, the lookup makes the texture from that level (or the whole), and the smaller
+// image goes unused (a new image over its memory ends the resolution cache's hold on it).
+static bool TexturePrefixEnabled(bool small_video_memory) {
+	static const char* const value = std::getenv("KYTY_TEXTURE_PREFIX");
+	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
+}
+
+static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
+	const auto  base = desc.view_info.base_level;
+	const auto& full = desc.info;
+	if (base == 0 || !TexturePrefixEnabled(small_video_memory) || full.resources.layers != 1 || full.samples != 1 ||
+	    full.type != Prospero::ImageType::kColor2D || full.IsVolume() || full.IsDepth() || full.HasMetadata() ||
+	    full.HasStencil() || full.tile_mode == Prospero::TileMode::kLinear ||
+	    full.tile_mode == Prospero::TileMode::kDepth || full.tile_mode == Prospero::TileMode::kRenderTarget ||
+	    cache.HoldsImage(full)) {
+		return;
+	}
+	ImageInfo from {};
+	for (uint32_t first = 1; first < base; ++first) {
+		if (TextureFromLevel(full, first, from) && cache.HoldsImage(from)) {
+			desc.info                 = from;
+			desc.view_info.base_level = base - first;
+			return;
+		}
+	}
+	if (!TextureFromLevel(full, base, from)) return;
+	desc.info                 = from;
+	desc.view_info.base_level = 0;
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -871,6 +934,9 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		}
 	}
 
+	if (!storage && type == Prospero::ImageType::kColor2D) {
+		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
+	}
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);

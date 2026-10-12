@@ -50,6 +50,8 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// An image of exactly this guest texture is registered (what FindImage takes first; no lookup side effects).
+	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
 	// Addresses that gained their first registered image, in registration
 	// order: a caller that proved "no image starts here" at StartEpoch() E only
 	// needs the addresses logged after E.

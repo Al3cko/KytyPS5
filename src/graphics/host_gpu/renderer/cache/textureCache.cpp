@@ -2480,6 +2480,21 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 }
 
+bool TextureCache::HoldsImage(const ImageInfo& info) {
+	if (info.data.Empty()) return false;
+	std::scoped_lock          lock {m_lock};
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(info.data.address, info.data.size, pages)) return false;
+	const auto* owners = m_image_page_table.Find(pages.first);
+	if (owners == nullptr) return false;
+	bool held = false;
+	owners->ForEach([&](ImageId id) {
+		const auto* image = m_slot_images.try_get(id);
+		held              = held || (image != nullptr && image->registered && SameBacking(image->info, info, false));
+	});
+	return held;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	size_t         slow_candidates = 0;
 	SlowLog::Scope slow([&](double ms) {
