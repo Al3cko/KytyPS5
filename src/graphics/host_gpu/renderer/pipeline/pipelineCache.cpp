@@ -1804,7 +1804,13 @@ void PipelineCache::InitializeStaticCache(bool create) {
 			                 m_static_blobs->DataBytes() >> 20u, Common::PathToString(StaticBlobsPath()),
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
 			                     .count());
+#ifdef KYTY_STATIC_PRECOMPILE
+			// A conversion (StaticBlobsFromCache) takes what the blobs lack from the static pipeline cache too.
+			if (!StaticBlobsFromCache()) return;
+			create = false;
+#else
 			return;
+#endif
 		}
 		// None yet: the precompile makes them (and loads no static cache: every shard process would hold one whole,
 		// unless it converts one: StaticBlobsFromCache); the emulator takes a static cache from before them.
