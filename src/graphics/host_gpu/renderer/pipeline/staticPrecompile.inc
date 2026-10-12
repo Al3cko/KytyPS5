@@ -660,11 +660,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		return permutation != nullptr ? spirv_of.find(permutation)->second.words : size_t {0};
 	};
 	const auto spirv_hash = [&](const Permutation* permutation) { return spirv_of.find(permutation)->second.hash; };
-	const auto destroy = [&](Pipeline& pipeline) {
-		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
-	};
+	// (Its layouts are shared with other pipelines of the same bindings: the pipeline cache destroys them.)
+	const auto destroy = [&](Pipeline& pipeline) { m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr); };
 	// Saved every ten minutes too: an interrupted precompile loses at most that.
 	std::mutex              checkpoint_mutex;
 	std::condition_variable checkpoint_wake;

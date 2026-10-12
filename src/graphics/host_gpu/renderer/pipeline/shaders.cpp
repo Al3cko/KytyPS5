@@ -211,26 +211,6 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
-static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings,
-                                   bool native_bindings) {
-	uint32_t descriptor_count = 0;
-	for (const auto& binding: bindings) {
-		descriptor_count += binding.descriptorCount;
-	}
-	pipeline.native_bindings       = native_bindings;
-	pipeline.uses_push_descriptors = !native_bindings && descriptor_count <= graphics.max_push_descriptors;
-
-	vk::DescriptorSetLayoutCreateInfo create {};
-	create.flags        = pipeline.uses_push_descriptors
-	                          ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-	                          : vk::DescriptorSetLayoutCreateFlags {};
-	create.bindingCount = static_cast<uint32_t>(bindings.size());
-	create.pBindings    = bindings.data();
-	EXIT_IF(graphics.device.createDescriptorSetLayout(
-	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
-}
-
 // The precompile's capture (PipelineBinaryWriter): a pipeline the static pipeline cache holds (the first
 // store is made from it), its binaries then from the driver's own cache (a pipeline created with the
 // capture flag is never a cache hit: compiled); else compiled with its binaries kept.
@@ -323,6 +303,74 @@ static size_t ModuleSpirvBytes(vk::ShaderModule module) {
 	return found != g_module_bytes.end() ? found->second : 0;
 }
 
+// One descriptor set layout and pipeline layout per binding set: every pipeline with the same bindings (one shader's
+// specializations and states have the same) shares them. Made when first needed - each pair cost the driver 0.2-0.5 ms
+// (a laptop's walk: median 0.19 ms, p90 0.5 ms, up to 3.8 ms, for every pipeline it made) - and destroyed with the
+// pipeline cache (DestroySharedLayouts).
+namespace {
+struct SharedLayout {
+	std::vector<uint32_t>   words; // what the layouts are made of (SharedLayouts)
+	vk::DescriptorSetLayout set    = nullptr;
+	vk::PipelineLayout      layout = nullptr;
+};
+std::mutex                                                        g_shared_layouts_mutex;
+std::unordered_multimap<uint64_t, std::unique_ptr<SharedLayout>> g_shared_layouts;
+} // namespace
+
+static void SharedLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                          std::span<const vk::DescriptorSetLayoutBinding> bindings, bool native_bindings,
+                          vk::ShaderStageFlags push_stages) {
+	uint32_t descriptor_count = 0;
+	for (const auto& binding: bindings) {
+		descriptor_count += binding.descriptorCount;
+	}
+	pipeline.native_bindings       = native_bindings;
+	pipeline.uses_push_descriptors = !native_bindings && descriptor_count <= graphics.max_push_descriptors;
+	std::vector<uint32_t> words {pipeline.uses_push_descriptors ? 1u : 0u, static_cast<uint32_t>(push_stages)};
+	words.reserve(words.size() + bindings.size() * 4u);
+	for (const auto& binding: bindings) {
+		words.insert(words.end(), {binding.binding, static_cast<uint32_t>(binding.descriptorType), binding.descriptorCount,
+		                           static_cast<uint32_t>(binding.stageFlags)});
+	}
+	const auto      key = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+	std::lock_guard lock(g_shared_layouts_mutex);
+	for (auto [found, end] = g_shared_layouts.equal_range(key); found != end; ++found) {
+		if (found->second->words != words) continue;
+		pipeline.descriptor_set_layout = found->second->set;
+		pipeline.pipeline_layout       = found->second->layout;
+		return;
+	}
+	auto shared   = std::make_unique<SharedLayout>();
+	shared->words = std::move(words);
+	vk::DescriptorSetLayoutCreateInfo create {};
+	create.flags        = pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+	                                                     : vk::DescriptorSetLayoutCreateFlags {};
+	create.bindingCount = static_cast<uint32_t>(bindings.size());
+	create.pBindings    = bindings.data();
+	EXIT_IF(graphics.device.createDescriptorSetLayout(&create, nullptr, &shared->set) != vk::Result::eSuccess);
+	const vk::PushConstantRange  push_constants {push_stages, 0, ShaderRecompiler::IR::NativePushConstantSize};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &shared->set;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push_constants;
+	EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&layout_info, nullptr, &shared->layout) != vk::Result::eSuccess);
+	NotePipelineKeyLayout(shared->layout, bindings, pipeline.uses_push_descriptors);
+	pipeline.descriptor_set_layout = shared->set;
+	pipeline.pipeline_layout       = shared->layout;
+	g_shared_layouts.emplace(key, std::move(shared));
+}
+
+void DestroySharedLayouts(vk::Device device) {
+	std::lock_guard lock(g_shared_layouts_mutex);
+	for (const auto& [key, shared]: g_shared_layouts) {
+		(void)key;
+		device.destroyPipelineLayout(shared->layout, nullptr);
+		device.destroyDescriptorSetLayout(shared->set, nullptr);
+	}
+	g_shared_layouts.clear();
+}
+
 bool PipelineSourceLog() {
 	static const bool on = std::getenv("KYTY_PIPELINE_SOURCE_LOG") != nullptr;
 	return on;
@@ -389,6 +437,8 @@ struct BlobTimes {
 	double create_us = 0.0;
 };
 static thread_local BlobTimes t_blob_times;
+// (KYTY_PIPELINE_SOURCE_LOG) The microseconds of the last pipeline's descriptor set and pipeline layouts.
+static thread_local double t_layout_us = 0.0;
 
 static double MicrosecondsSince(std::chrono::steady_clock::time_point start) {
 	return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
@@ -532,6 +582,7 @@ void CreatePipelineInternal(
     const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache,
     bool native_bindings, PipelineBuild build) {
 	const auto source_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	t_layout_us             = 0.0;
 	const bool ps_active = ps_input_info != nullptr;
 	EXIT_IF(!vertex_program || (ps_active && !pixel_program));
 	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
@@ -774,32 +825,15 @@ void CreatePipelineInternal(
 			AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 			                  vk::ShaderStageFlagBits::eFragment, native_bindings);
 		}
-		CreateDescriptorLayout(graphics, pipeline, descriptor_bindings, native_bindings);
-		const auto                  GraphicsStages = vertex_stage | vk::ShaderStageFlagBits::eFragment;
-		const vk::PushConstantRange push_constants {GraphicsStages, 0,
-		                                            ShaderRecompiler::IR::NativePushConstantSize};
-
-		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-		pipeline_layout_info.setLayoutCount         = 1;
-		pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
-		pipeline_layout_info.pushConstantRangeCount = 1;
-		pipeline_layout_info.pPushConstantRanges    = &push_constants;
-
+		const auto layout_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		EXIT_IF(pipeline.pipeline_layout != nullptr);
-
+		SharedLayouts(graphics, pipeline, descriptor_bindings, native_bindings,
+		              vertex_stage | vk::ShaderStageFlagBits::eFragment);
+		if (PipelineSourceLog()) t_layout_us = MicrosecondsSince(layout_start);
 		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
-			     " set_layouts=1 push_constants=%" PRIu32 "\n",
-			     vertex_program.id, ps_active ? pixel_program.id : 0, 1u);
+			LOGF("PipelineTrace: pipeline layout VS=%" PRIu64 " PS=%" PRIu64 " layout=%p\n", vertex_program.id,
+			     ps_active ? pixel_program.id : 0, static_cast<void*>(pipeline.pipeline_layout));
 		}
-		result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-		                                              &pipeline.pipeline_layout);
-		NotePipelineKeyLayout(pipeline.pipeline_layout, descriptor_bindings, pipeline.uses_push_descriptors);
-		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
-			     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
-		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	}
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
@@ -914,12 +948,12 @@ void CreatePipelineInternal(
 		            pipeline.unoptimized ? 1 : 0,
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_start).count(),
 		            t_blob_times.bytes, t_blob_times.read_us, t_blob_times.cache_us, t_blob_times.create_us);
-		std::printf("PIPESPV key=%016llx spirv=%zu before_us=%.0f identity_us=%.0f handle_us=%.0f\n",
+		std::printf("PIPESPV key=%016llx spirv=%zu before_us=%.0f identity_us=%.0f handle_us=%.0f layout_us=%.0f\n",
 		            static_cast<unsigned long long>(identity),
 		            ModuleSpirvBytes(vertex_program.module) + (ps_active ? ModuleSpirvBytes(pixel_program.module) : 0),
 		            std::chrono::duration<double, std::micro>(identity_start - source_start).count(),
 		            std::chrono::duration<double, std::micro>(handle_start - identity_start).count(),
-		            MicrosecondsSince(handle_start));
+		            MicrosecondsSince(handle_start), t_layout_us);
 	}
 
 	if (tess_control_shader_module != nullptr) {
@@ -936,6 +970,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
                             PipelineBuild build, bool native_bindings) {
 	const auto source_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	t_layout_us             = 0.0;
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -957,26 +992,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 		AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 		                  vk::ShaderStageFlagBits::eCompute, native_bindings);
-		CreateDescriptorLayout(graphics, pipeline, descriptor_bindings, native_bindings);
-		const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
-		                                            ShaderRecompiler::IR::NativePushConstantSize};
-
-		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-		pipeline_layout_info.setLayoutCount         = 1;
-		pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
-		pipeline_layout_info.pushConstantRangeCount = 1;
-		pipeline_layout_info.pPushConstantRanges    = &push_constants;
-
+		const auto layout_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		EXIT_IF(pipeline.pipeline_layout != nullptr);
-
-		LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
-		     1u);
-		const auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-		                                                        &pipeline.pipeline_layout);
-		NotePipelineKeyLayout(pipeline.pipeline_layout, descriptor_bindings, pipeline.uses_push_descriptors);
-		LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
-		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		SharedLayouts(graphics, pipeline, descriptor_bindings, native_bindings, vk::ShaderStageFlagBits::eCompute);
+		if (PipelineSourceLog()) t_layout_us = MicrosecondsSince(layout_start);
+		LOGF("PipelineTrace: pipeline layout CS layout=%p\n", static_cast<void*>(pipeline.pipeline_layout));
 	}
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
@@ -1012,11 +1032,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		            t_static_hit ? 1 : 0, static_cast<int>(build), pipeline.unoptimized ? 1 : 0,
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_start).count(),
 		            t_blob_times.bytes, t_blob_times.read_us, t_blob_times.cache_us, t_blob_times.create_us);
-		std::printf("PIPESPV key=%016llx spirv=%zu before_us=%.0f identity_us=%.0f handle_us=%.0f\n",
+		std::printf("PIPESPV key=%016llx spirv=%zu before_us=%.0f identity_us=%.0f handle_us=%.0f layout_us=%.0f\n",
 		            static_cast<unsigned long long>(identity), ModuleSpirvBytes(compute_module),
 		            std::chrono::duration<double, std::micro>(identity_start - source_start).count(),
 		            std::chrono::duration<double, std::micro>(handle_start - identity_start).count(),
-		            MicrosecondsSince(handle_start));
+		            MicrosecondsSince(handle_start), t_layout_us);
 	}
 }
 

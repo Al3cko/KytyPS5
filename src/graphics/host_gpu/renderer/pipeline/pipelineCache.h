@@ -450,6 +450,9 @@ void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime);
 // hold (the precompile: of each it makes) and its modules' shader and SPIR-V hashes.
 bool PipelineKeyLog();
 void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes = 0);
+// The descriptor set and pipeline layouts the pipelines share (one pair per binding set, shaders.cpp): destroyed after
+// every pipeline that uses them.
+void DestroySharedLayouts(vk::Device device);
 // KYTY_PIPELINE_SOURCE_LOG (diagnostic): a PIPESRC line for each pipeline made (its kind, identity, whether the static
 // cache gave it, its build and time; from a cache blob: the blob's size and the microseconds of its read, of the cache
 // made of it and of the driver's creation) and a PIPESPV line (its SPIR-V size and the microseconds before its

@@ -1711,12 +1711,12 @@ PipelineCache::~PipelineCache() {
 				m_graphics.device.destroyPipeline(pipeline->optimized->pipeline, nullptr);
 			}
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
-			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
-			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
 		}
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// (The pipelines' layouts are shared: once all of them are gone.)
+	DestroySharedLayouts(m_graphics.device);
 	m_graphics.pipeline_binaries = nullptr;
 	m_graphics.pipeline_blobs    = nullptr;
 	for (const auto pipeline: m_replaced_pipelines) {
