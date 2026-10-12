@@ -449,9 +449,12 @@ void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime);
 // KYTY_PIPELINE_KEY_LOG (diagnostic): a PIPEKEY line with the driver key of each pipeline the static store did not
 // hold (the precompile: of each it makes) and its modules' shader and SPIR-V hashes.
 bool PipelineKeyLog();
-void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash);
+void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes = 0);
 // KYTY_PIPELINE_SOURCE_LOG (diagnostic): a PIPESRC line for each pipeline made (its kind, identity, whether the static
-// cache gave it, its build and time): which of the precompile's pipelines a game session meets.
+// cache gave it, its build and time; from a cache blob: the blob's size and the microseconds of its read, of the cache
+// made of it and of the driver's creation) and a PIPESPV line (its SPIR-V size and the microseconds before its
+// identity, of the identity and of the handle), a PROGSRC line per program permutation made (adopted from the
+// prefetch or translated, its time): which of the precompile's pipelines a game session meets, and what they cost.
 bool PipelineSourceLog();
 // Each shader module's SPIR-V hash is noted when made (NotePipelineKeyModule) from now on: pipeline identities need them
 // (pipeline cache blobs, the source and key logs).

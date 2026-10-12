@@ -730,8 +730,8 @@ struct PipelineCache::ProgramCache {
 		                     "create recompiled shader module");
 		EXIT_IF(module == nullptr);
 		if (ModuleSpirvHashesRecorded()) {
-			NotePipelineKeyModule(module, options.shader_hash,
-			                      XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)));
+			NotePipelineKeyModule(module, options.shader_hash, XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)),
+			                      spirv.size() * sizeof(uint32_t));
 		}
 		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
 		                     options.shader_hash);
@@ -1004,8 +1004,14 @@ struct PipelineCache::ProgramCache {
 				group->plan.reset();
 			}
 		}
+		// (KYTY_PIPELINE_SOURCE_LOG: a PROGSRC line per permutation made here - adopted from the prefetch or translated -
+		// with its time.)
+		const auto source_begin = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		bool       translated_here = false;
+		double     translate_ms    = 0.0;
 		if (entry == programs.end() ||
 		    AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor) == nullptr) {
+			translated_here = true;
 			// With the slow-call log: the translation's specialization-independent part (front) and
 			// whether the program had other permutations already.
 			const bool known_program = entry != programs.end();
@@ -1019,6 +1025,7 @@ struct PipelineCache::ProgramCache {
 			LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
+			translate_ms = front_ms;
 			if (entry == programs.end()) {
 				auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 				if (!ReportMaterialization(label, stage, params.hash, report,
@@ -1043,6 +1050,10 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		const auto& permutation = entry->second.permutations.back();
+		if (PipelineSourceLog())
+			std::printf("PROGSRC %s hash=%016llx translated=%d translate_ms=%.1f ms=%.1f\n", label,
+			            static_cast<unsigned long long>(params.hash), translated_here ? 1 : 0, translate_ms,
+			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_begin).count());
 		if (warmup.Enabled()) {
 			LocalShaderWarmup::Record record;
 			record.stage = stage;

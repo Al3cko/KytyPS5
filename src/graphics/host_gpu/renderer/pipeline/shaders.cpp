@@ -307,9 +307,20 @@ void LogPipelineKey(const char* what, const PipelineBinaries::Key& key, const In
 }
 } // namespace
 
-void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash) {
+// (KYTY_PIPELINE_SOURCE_LOG) Each module's SPIR-V size.
+static std::unordered_map<VkShaderModule, size_t> g_module_bytes;
+
+void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes) {
 	std::lock_guard lock(g_key_log_mutex);
 	g_key_log_modules[static_cast<VkShaderModule>(module)] = {shader_hash, spirv_hash};
+	if (spirv_bytes != 0) g_module_bytes[static_cast<VkShaderModule>(module)] = spirv_bytes;
+}
+
+static size_t ModuleSpirvBytes(vk::ShaderModule module) {
+	if (module == nullptr) return 0;
+	std::lock_guard lock(g_key_log_mutex);
+	const auto      found = g_module_bytes.find(static_cast<VkShaderModule>(module));
+	return found != g_module_bytes.end() ? found->second : 0;
 }
 
 bool PipelineSourceLog() {
@@ -368,8 +379,20 @@ uint64_t ComputePipelineIdentity(uint64_t spirv, const ShaderComputeInputInfo& i
 	return XXH3_64bits(parts, sizeof(parts));
 }
 
-// (KYTY_PIPELINE_SOURCE_LOG) Whether the static cache or store gave this thread's last pipeline.
+// (KYTY_PIPELINE_SOURCE_LOG) Whether the static cache or store gave this thread's last pipeline, and for a pipeline
+// cache blob: its size and the microseconds of its read, of the cache made of it and of the pipeline's creation.
 static thread_local bool t_static_hit = false;
+struct BlobTimes {
+	size_t bytes     = 0;
+	double read_us   = 0.0;
+	double cache_us  = 0.0;
+	double create_us = 0.0;
+};
+static thread_local BlobTimes t_blob_times;
+
+static double MicrosecondsSince(std::chrono::steady_clock::time_point start) {
+	return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+}
 
 // The precompile's pipeline another of its shards holds: none is made (the caller destroys a null one).
 static bool ClaimedElsewhere(const GraphicContext& graphics, vk::Result result) {
@@ -392,6 +415,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
                                        vk::PipelineCache driver_cache, PipelineBuild build, uint64_t identity,
                                        Create create) {
 	t_static_hit      = false;
+	t_blob_times      = {};
 	const auto cached = [&](vk::PipelineCache cache) {
 		if (cache == nullptr || !graphics.pipeline_cache_control_enabled) return false;
 		auto lookup = info;
@@ -436,11 +460,23 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	if (build != PipelineBuild::Optimize && identity != 0 && (blobs != nullptr || blob_writer != nullptr) &&
 	    graphics.pipeline_cache_control_enabled) {
 		std::vector<uint8_t> data;
+		const bool           timed = PipelineSourceLog();
+		auto                 start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		if (blobs != nullptr && blobs->Load(identity, data)) {
+			if (timed) {
+				t_blob_times.bytes   = data.size();
+				t_blob_times.read_us = MicrosecondsSince(start);
+				start                = std::chrono::steady_clock::now();
+			}
 			if (const auto cache = BlobCache(graphics, data)) {
+				if (timed) {
+					t_blob_times.cache_us = MicrosecondsSince(start);
+					start                 = std::chrono::steady_clock::now();
+				}
 				auto lookup = info;
 				lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 				const auto result = create(cache, lookup);
+				if (timed) t_blob_times.create_us = MicrosecondsSince(start);
 				graphics.device.destroyPipelineCache(cache, nullptr);
 				if (result == vk::Result::eSuccess) {
 					if (blob_writer != nullptr) blob_writer->Copy(identity, *blobs);
@@ -848,12 +884,14 @@ void CreatePipelineInternal(
 		     dynamic_state.dynamicStateCount);
 	}
 	// Its identity: for pipeline cache blobs and the source log.
+	const auto     identity_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const uint64_t identity =
 	    PipelineSourceLog() || graphics.pipeline_blobs != nullptr || graphics.pipeline_blob_writer != nullptr
 	        ? GraphicsPipelineIdentity(ModuleSpirvHash(vertex_program.module),
 	                                   ps_active ? ModuleSpirvHash(pixel_program.module) : 0, rendering, vertex_input,
 	                                   static_params, vs_input_info, ps_input_info, native_bindings)
 	        : 0;
+	const auto handle_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build, identity,
 	                              [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
 		                              return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr,
@@ -870,10 +908,18 @@ void CreatePipelineInternal(
 	if (PipelineSourceLog()) {
 		const bool  table = vs_input_info.stage.program->table_mode;
 		const char* kind  = table ? "gfx-table" : native_bindings ? "gfx-native" : "gfx-normal";
-		std::printf("PIPESRC %s key=%016llx static=%d build=%d unoptimized=%d ms=%.1f\n", kind,
-		            static_cast<unsigned long long>(identity), t_static_hit ? 1 : 0, static_cast<int>(build),
+		std::printf("PIPESRC %s key=%016llx static=%d build=%d unoptimized=%d ms=%.1f blob=%zu read_us=%.0f cache_us=%.0f "
+		            "create_us=%.0f\n",
+		            kind, static_cast<unsigned long long>(identity), t_static_hit ? 1 : 0, static_cast<int>(build),
 		            pipeline.unoptimized ? 1 : 0,
-		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_start).count());
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_start).count(),
+		            t_blob_times.bytes, t_blob_times.read_us, t_blob_times.cache_us, t_blob_times.create_us);
+		std::printf("PIPESPV key=%016llx spirv=%zu before_us=%.0f identity_us=%.0f handle_us=%.0f\n",
+		            static_cast<unsigned long long>(identity),
+		            ModuleSpirvBytes(vertex_program.module) + (ps_active ? ModuleSpirvBytes(pixel_program.module) : 0),
+		            std::chrono::duration<double, std::micro>(identity_start - source_start).count(),
+		            std::chrono::duration<double, std::micro>(handle_start - identity_start).count(),
+		            MicrosecondsSince(handle_start));
 	}
 
 	if (tess_control_shader_module != nullptr) {
@@ -943,10 +989,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto     identity_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const uint64_t identity =
 	    PipelineSourceLog() || graphics.pipeline_blobs != nullptr || graphics.pipeline_blob_writer != nullptr
 	        ? ComputePipelineIdentity(ModuleSpirvHash(compute_module), input_info, native_bindings)
 	        : 0;
+	const auto handle_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const auto result =
 	    CreatePipelineHandle(graphics, pipeline, info, driver_cache, build, identity,
 	                         [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
@@ -958,10 +1006,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
 	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr));
 	if (PipelineSourceLog()) {
-		std::printf("PIPESRC %s key=%016llx static=%d build=%d unoptimized=%d ms=%.1f\n", native_bindings ? "cs-table" : "cs-normal",
-		            static_cast<unsigned long long>(identity), t_static_hit ? 1 : 0, static_cast<int>(build),
-		            pipeline.unoptimized ? 1 : 0,
-		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_start).count());
+		std::printf("PIPESRC %s key=%016llx static=%d build=%d unoptimized=%d ms=%.1f blob=%zu read_us=%.0f cache_us=%.0f "
+		            "create_us=%.0f\n",
+		            native_bindings ? "cs-table" : "cs-normal", static_cast<unsigned long long>(identity),
+		            t_static_hit ? 1 : 0, static_cast<int>(build), pipeline.unoptimized ? 1 : 0,
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_start).count(),
+		            t_blob_times.bytes, t_blob_times.read_us, t_blob_times.cache_us, t_blob_times.create_us);
+		std::printf("PIPESPV key=%016llx spirv=%zu before_us=%.0f identity_us=%.0f handle_us=%.0f\n",
+		            static_cast<unsigned long long>(identity), ModuleSpirvBytes(compute_module),
+		            std::chrono::duration<double, std::micro>(identity_start - source_start).count(),
+		            std::chrono::duration<double, std::micro>(handle_start - identity_start).count(),
+		            MicrosecondsSince(handle_start));
 	}
 }
 
