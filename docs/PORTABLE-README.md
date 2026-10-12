@@ -67,6 +67,10 @@ with buttons to play, to precompile the shaders (optionally on the efficiency co
 stays responsive), and to open the logs folder. It remembers the settings (`launcher-settings.json`).
 "Up to 120 fps" (off by default) lets the game render up to 120 frames a second instead of the
 console's 60 where the PC is fast enough: play keeps its speed, but pre-rendered movies play faster.
+"Render height" (1440 by default, as on the PS5) is the height the game renders its 3D at before it
+upscales it to its 4K picture; lower heights (1296, 1152, 1080, 900) are faster where the graphics card
+limits the frame rate (a laptop RTX 3080 at Boletaria's start: 20.7 fps at 1440, 24.8 at 1080) and
+less sharp. The interface stays 4K either way.
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 
@@ -99,6 +103,7 @@ shortcut):
 | `-Width 1920 -Height 1080` | The window size (default 2560×1440, shrunk when the screen is smaller) |
 | `-Game <folder>` | The game folder (or a `.zar` archive of it) |
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
+| `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
 
 ## Shader precompile (without it the game stutters)
 

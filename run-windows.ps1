@@ -16,6 +16,8 @@
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
 #                                            virtual vblank; movies play faster)
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
+#   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
+#                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
 #   .\run-windows.ps1 -Game <folder>         the game (the folder with eboot.bin); remembered in
 #                                            game-path.txt, a folder dialog when none is known
 #   .\run-windows.ps1 -Game <file.zar>       the game folder packed into a ZArchive (read without extracting it)
@@ -44,6 +46,7 @@ param(
 	[string]$PresentMode = '',
 	[int]$Vblank = 0,
 	[switch]$Fps120,
+	[int]$RenderHeight = 0,
 	[string[]]$Set = @(),
 	[string]$Patch = '',
 	[switch]$AspectFit,
@@ -280,6 +283,10 @@ if (!$environment.Contains('KYTY_NATIVE_XPR_INSTANCES') -and !$Baseline) { $envi
 # frame at Boletaria 1-1) before drawing them; the PC GPU draws them all instead, the image unchanged
 # (same process at Boletaria 1-1: standing 34.30 -> 36.48 fps, camera turning +0.8%; GPU 60 -> 71% busy).
 if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -eq 'PPSA01341') { $environment['KYTY_GAME_CONVARS'] = 'doIndexBufferCulling=false' }
+# -RenderHeight: the height Demon's Souls' performance mode renders its 3D at (src/loader/demonsSoulsRenderSize.h);
+# the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
+# 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
+if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # Memory the game releases (texture pool layers, 64 KiB mappings each) is not unprotected mapping
 # by mapping before its unmap: VirtualProtect was ~15% of the render thread in the open area.
 if (!$environment.Contains('KYTY_UNMAP_PROTECT_SKIP') -and !$Baseline) { $environment['KYTY_UNMAP_PROTECT_SKIP'] = '1' }
