@@ -322,6 +322,11 @@ thread_local uint64_t g_packets       = 0;
 
 void Install() { InstallDispatch(); }
 const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
+void* ReplaceBindPipeline(void* entry) {
+    auto* replaced = reinterpret_cast<void*>(original.vkCmdBindPipeline);
+    original.vkCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(entry);
+    return replaced;
+}
 uint64_t WorkCalls() { return g_work_calls; }
 uint64_t RecordedWork() { return g_work_calls + g_packets; }
 uint64_t RecordedWrites() { return g_writing_calls + g_packets; }

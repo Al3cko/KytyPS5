@@ -4,15 +4,29 @@
 // whose ranges held them, live or destroyed (work recorded against a buffer freed under it faults on its address).
 // After a loss the timeline semaphores read UINT64_MAX: everything looks complete and is freed, so the validation
 // layer's "destroyed while in use" errors that follow are symptoms; the address here is the cause's.
+// A hang (a TDR: 10-13 laptop walk) reports only the running shaders' instruction pointers: the report also lists the
+// last submissions with the pipelines each bound (Breadcrumbs, always kept). KYTY_GPU_CHECKPOINTS=1 (diagnostic; NVIDIA
+// VK_NV_device_diagnostic_checkpoints: the laptop's 1-1 ran 12.8 instead of 22 fps) puts a checkpoint after each
+// pipeline bind: the report then names, per queue, the pipeline whose work the GPU started last and the one whose work
+// it finished last.
 
+#include "common/assert.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace DeviceFault {
@@ -25,9 +39,36 @@ struct Registry {
 	PFN_vkGetDeviceFaultInfoEXT            get = nullptr;
 	std::mutex                             mutex;
 	std::multimap<uint64_t, BufferSpan>    buffers; // by device address (an address reused after a free: both)
-	std::atomic<bool>                      reported {false};
+	std::atomic<int>                       report_state {0}; // 0 none, 1 being written, 2 written
 };
 inline Registry g_registry;
+
+// Every pipeline bind goes through BindPipelineHook (installed at device creation): it keeps, per command buffer, the
+// pipelines bound in it (a plain append on the binding thread), and NoteSubmit files them under the submission's
+// timeline tick. A hang's report lists the last submissions: the first past the tick its timeline reached ("STALL
+// graphics timeline: ... at N") is the one the GPU did not finish.
+struct Breadcrumbs {
+	PFN_vkCmdBindPipeline                                      bind = nullptr; // the bind the hook replaced
+	std::mutex                                                 mutex;
+	std::unordered_map<VkCommandBuffer, std::vector<uint64_t>> open;      // binds of buffers not yet submitted
+	std::unordered_map<uint64_t, std::string>                  pipelines; // VkPipeline -> what it runs
+	struct Submission {
+		uint64_t              timeline = 0, tick = 0;
+		std::vector<uint64_t> pipelines;
+	};
+	std::array<Submission, 32> submitted;
+	size_t                     next = 0;
+};
+inline Breadcrumbs                         g_breadcrumbs;
+inline thread_local VkCommandBuffer        t_bind_command = VK_NULL_HANDLE;
+inline thread_local std::vector<uint64_t>* t_bind_log     = nullptr;
+
+struct Checkpoints {
+	PFN_vkCmdSetCheckpointNV                     set = nullptr;
+	PFN_vkGetQueueCheckpointDataNV               get = nullptr;
+	std::vector<std::pair<VkQueue, const char*>> queues;
+};
+inline Checkpoints g_checkpoints;
 
 [[nodiscard]] inline uint64_t NowNs() noexcept {
 	return static_cast<uint64_t>(
@@ -38,6 +79,89 @@ inline Registry g_registry;
 inline void Enable(VkDevice device, PFN_vkGetDeviceProcAddr get_proc) {
 	g_registry.get = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(get_proc(device, "vkGetDeviceFaultInfoEXT"));
 	if (g_registry.get != nullptr) g_registry.device.store(device, std::memory_order_release);
+}
+
+[[nodiscard]] inline bool CheckpointsRequested() {
+	static const bool requested = std::getenv("KYTY_GPU_CHECKPOINTS") != nullptr;
+	return requested;
+}
+[[nodiscard]] inline bool CheckpointsOn() noexcept {
+	return g_checkpoints.set != nullptr;
+}
+[[nodiscard]] inline bool BreadcrumbsOn() noexcept {
+	return g_breadcrumbs.bind != nullptr;
+}
+[[nodiscard]] inline uint64_t PipelineKey(VkPipeline pipeline) noexcept {
+	return (uint64_t)(pipeline); // NOLINT (a pointer or an integer, by platform)
+}
+
+inline VKAPI_ATTR void VKAPI_CALL BindPipelineHook(VkCommandBuffer command, VkPipelineBindPoint point,
+                                                  VkPipeline pipeline) {
+	g_breadcrumbs.bind(command, point, pipeline);
+	// (A buffer is recorded by one thread at a time; the map's nodes stay where they are.)
+	if (command != t_bind_command) {
+		std::lock_guard lock(g_breadcrumbs.mutex);
+		t_bind_log     = &g_breadcrumbs.open[command];
+		t_bind_command = command;
+	}
+	auto&      log = *t_bind_log;
+	const auto key = PipelineKey(pipeline);
+	if (log.empty() || log.back() != key) {
+		if (log.size() >= 512) log.erase(log.begin(), log.begin() + 256);
+		log.push_back(key);
+	}
+	if (g_checkpoints.set != nullptr) g_checkpoints.set(command, (void*)(pipeline)); // NOLINT
+}
+
+// `bind` is the entry every pipeline bind goes through: replaced by the hook. Before any command is recorded.
+inline void InstallBindHook(PFN_vkCmdBindPipeline* bind) {
+	if (bind == nullptr || *bind == nullptr || g_breadcrumbs.bind != nullptr) return;
+	g_breadcrumbs.bind = *bind;
+	*bind              = BindPipelineHook;
+}
+
+// The device was created with VK_NV_device_diagnostic_checkpoints: the hook adds a checkpoint after each bind.
+inline void EnableCheckpoints(VkDevice device, PFN_vkGetDeviceProcAddr get_proc) {
+	const auto set = reinterpret_cast<PFN_vkCmdSetCheckpointNV>(get_proc(device, "vkCmdSetCheckpointNV"));
+	const auto get = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(get_proc(device, "vkGetQueueCheckpointDataNV"));
+	if (set == nullptr || get == nullptr) return;
+	g_checkpoints.get = get;
+	g_checkpoints.set = set;
+	std::printf("GPU checkpoints: one after each pipeline bind (KYTY_GPU_CHECKPOINTS)\n");
+}
+
+// Before any command is recorded.
+inline void NoteQueue(VkQueue queue, const char* name) {
+	if (CheckpointsOn() && queue != VK_NULL_HANDLE) g_checkpoints.queues.emplace_back(queue, name);
+}
+
+inline void NotePipeline(VkPipeline pipeline, std::string what) {
+	if (!BreadcrumbsOn() || pipeline == VK_NULL_HANDLE) return;
+	std::lock_guard lock(g_breadcrumbs.mutex);
+	g_breadcrumbs.pipelines[PipelineKey(pipeline)] = std::move(what);
+}
+
+// The buffers' binds, filed under the submission (`timeline` signalled to `tick`).
+inline void NoteSubmit(uint64_t timeline, uint64_t tick, const VkCommandBuffer* commands, uint32_t count) {
+	if (!BreadcrumbsOn()) return;
+	std::lock_guard lock(g_breadcrumbs.mutex);
+	auto&           entry = g_breadcrumbs.submitted[g_breadcrumbs.next++ % g_breadcrumbs.submitted.size()];
+	entry.timeline        = timeline;
+	entry.tick            = tick;
+	entry.pipelines.clear();
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto found = g_breadcrumbs.open.find(commands[i]);
+		if (found == g_breadcrumbs.open.end()) continue;
+		entry.pipelines.insert(entry.pipelines.end(), found->second.begin(), found->second.end());
+		found->second.clear();
+	}
+}
+
+// A buffer reset without a submission.
+inline void NoteDiscard(VkCommandBuffer command) {
+	if (!BreadcrumbsOn()) return;
+	std::lock_guard lock(g_breadcrumbs.mutex);
+	if (const auto found = g_breadcrumbs.open.find(command); found != g_breadcrumbs.open.end()) found->second.clear();
 }
 
 inline void NoteCreated(uint64_t device, uint64_t size, uint64_t cpu) {
@@ -73,15 +197,21 @@ inline const char* AddressType(VkDeviceFaultAddressTypeEXT type) {
 	}
 }
 
-// Once, at the first sign of the loss (any thread).
-inline void Report() {
-	const auto device = g_registry.device.load(std::memory_order_acquire);
-	if (device == VK_NULL_HANDLE || g_registry.reported.exchange(true)) return;
+// NOLINTNEXTLINE(cert-dcl50-cpp)
+inline void Append(std::string& text, const char* format, ...) {
+	char    line[1024];
+	va_list args;
+	va_start(args, format);
+	const int length = std::vsnprintf(line, sizeof(line), format, args);
+	va_end(args);
+	if (length > 0) text.append(line, std::min(static_cast<size_t>(length), sizeof(line) - 1));
+}
+
+inline void AppendFault(std::string& text, VkDevice device) {
 	VkDeviceFaultCountsEXT counts {};
 	counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
 	if (g_registry.get(device, &counts, nullptr) != VK_SUCCESS) {
-		std::printf("Device fault: no report\n");
-		std::fflush(stdout);
+		text += "Device fault: no report\n";
 		return;
 	}
 	std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
@@ -92,50 +222,126 @@ inline void Report() {
 	info.pAddressInfos = addresses.data();
 	info.pVendorInfos  = vendors.data();
 	const auto result  = g_registry.get(device, &counts, &info);
-	std::printf("Device fault (%d): %s; %u addresses, %u vendor records\n", static_cast<int>(result), info.description,
-	            counts.addressInfoCount, counts.vendorInfoCount);
-	const auto now = NowNs();
+	Append(text, "Device fault (%d): %s; %u addresses, %u vendor records\n", static_cast<int>(result), info.description,
+	       counts.addressInfoCount, counts.vendorInfoCount);
+	addresses.resize(std::min<size_t>(addresses.size(), counts.addressInfoCount));
+	// The same address from many warps (a hang lists each running one's instruction pointer): once, with its count.
+	std::vector<std::pair<VkDeviceFaultAddressInfoEXT, uint32_t>> unique;
+	for (const auto& address: addresses) {
+		auto same = std::find_if(unique.begin(), unique.end(), [&](const auto& item) {
+			return item.first.addressType == address.addressType && item.first.reportedAddress == address.reportedAddress;
+		});
+		if (same != unique.end()) ++same->second;
+		else unique.emplace_back(address, 1);
+	}
+	const auto      now = NowNs();
 	std::lock_guard lock(g_registry.mutex);
-	for (uint32_t i = 0; i < counts.addressInfoCount && i < addresses.size(); ++i) {
-		const auto& address = addresses[i];
+	for (uint32_t i = 0; i < unique.size(); ++i) {
+		const auto& [address, count] = unique[i];
 		// (The precision is a power of two: the fault is somewhere in the aligned range of that size.)
 		const auto precision = address.addressPrecision != 0 ? address.addressPrecision : 1;
 		const auto begin     = address.reportedAddress & ~(precision - 1);
 		const auto end       = begin + precision;
-		std::printf("Device fault address %u: %s 0x%llx (precision 0x%llx)\n", i, AddressType(address.addressType),
-		            static_cast<unsigned long long>(address.reportedAddress),
-		            static_cast<unsigned long long>(address.addressPrecision));
+		Append(text, "Device fault address %u: %s 0x%llx (precision 0x%llx) x%u\n", i, AddressType(address.addressType),
+		       static_cast<unsigned long long>(address.reportedAddress),
+		       static_cast<unsigned long long>(address.addressPrecision), count);
 		uint32_t shown = 0;
 		for (const auto& [device_address, span]: g_registry.buffers) {
-			if (device_address >= end || device_address + span.size <= begin) continue;
+			if (device_address >= end) break;
+			if (device_address + span.size <= begin) continue;
 			if (++shown > 16) break;
-			std::printf("  buffer device 0x%llx size 0x%llx guest 0x%llx: created %.1f ms ago, ",
-			            static_cast<unsigned long long>(device_address), static_cast<unsigned long long>(span.size),
-			            static_cast<unsigned long long>(span.cpu), static_cast<double>(now - span.created_ns) / 1e6);
-			if (span.destroyed_ns != 0) std::printf("destroyed %.1f ms ago\n", static_cast<double>(now - span.destroyed_ns) / 1e6);
-			else std::printf("live\n");
+			Append(text, "  buffer device 0x%llx size 0x%llx guest 0x%llx: created %.1f ms ago, ",
+			       static_cast<unsigned long long>(device_address), static_cast<unsigned long long>(span.size),
+			       static_cast<unsigned long long>(span.cpu), static_cast<double>(now - span.created_ns) / 1e6);
+			if (span.destroyed_ns != 0) Append(text, "destroyed %.1f ms ago\n", static_cast<double>(now - span.destroyed_ns) / 1e6);
+			else text += "live\n";
 		}
 		if (shown == 0) {
 			// The nearest buffers below and above.
 			auto above = g_registry.buffers.lower_bound(begin);
 			if (above != g_registry.buffers.begin()) {
 				const auto& [below_address, below] = *std::prev(above);
-				std::printf("  nearest below: device 0x%llx size 0x%llx guest 0x%llx %s\n",
-				            static_cast<unsigned long long>(below_address), static_cast<unsigned long long>(below.size),
-				            static_cast<unsigned long long>(below.cpu), below.destroyed_ns != 0 ? "destroyed" : "live");
+				Append(text, "  nearest below: device 0x%llx size 0x%llx guest 0x%llx %s\n",
+				       static_cast<unsigned long long>(below_address), static_cast<unsigned long long>(below.size),
+				       static_cast<unsigned long long>(below.cpu), below.destroyed_ns != 0 ? "destroyed" : "live");
 			}
 			if (above != g_registry.buffers.end())
-				std::printf("  nearest above: device 0x%llx size 0x%llx guest 0x%llx %s\n",
-				            static_cast<unsigned long long>(above->first), static_cast<unsigned long long>(above->second.size),
-				            static_cast<unsigned long long>(above->second.cpu),
-				            above->second.destroyed_ns != 0 ? "destroyed" : "live");
+				Append(text, "  nearest above: device 0x%llx size 0x%llx guest 0x%llx %s\n",
+				       static_cast<unsigned long long>(above->first), static_cast<unsigned long long>(above->second.size),
+				       static_cast<unsigned long long>(above->second.cpu),
+				       above->second.destroyed_ns != 0 ? "destroyed" : "live");
 		}
 	}
 	for (uint32_t i = 0; i < counts.vendorInfoCount && i < vendors.size(); ++i)
-		std::printf("Device fault vendor %u: %s code 0x%llx data 0x%llx\n", i, vendors[i].description,
-		            static_cast<unsigned long long>(vendors[i].vendorFaultCode),
-		            static_cast<unsigned long long>(vendors[i].vendorFaultData));
+		Append(text, "Device fault vendor %u: %s code 0x%llx data 0x%llx\n", i, vendors[i].description,
+		       static_cast<unsigned long long>(vendors[i].vendorFaultCode),
+		       static_cast<unsigned long long>(vendors[i].vendorFaultData));
+}
+
+[[nodiscard]] inline const char* PipelineName(uint64_t key) {
+	const auto found = g_breadcrumbs.pipelines.find(key);
+	return found != g_breadcrumbs.pipelines.end() ? found->second.c_str() : "(not a known pipeline)";
+}
+
+inline void AppendSubmissions(std::string& text) {
+	std::lock_guard lock(g_breadcrumbs.mutex);
+	const auto      count = std::min(g_breadcrumbs.next, g_breadcrumbs.submitted.size());
+	Append(text, "Last %zu submissions (each: its timeline and tick, then the pipelines it bound, first-bound order):\n", count);
+	std::vector<std::pair<uint64_t, uint32_t>> distinct;
+	for (size_t i = g_breadcrumbs.next - count; i < g_breadcrumbs.next; ++i) {
+		const auto& entry = g_breadcrumbs.submitted[i % g_breadcrumbs.submitted.size()];
+		distinct.clear();
+		for (const auto key: entry.pipelines) {
+			auto same = std::find_if(distinct.begin(), distinct.end(), [&](const auto& item) { return item.first == key; });
+			if (same != distinct.end()) ++same->second;
+			else distinct.emplace_back(key, 1);
+		}
+		Append(text, "  timeline 0x%llx tick %llu: %zu binds, %zu pipelines\n", static_cast<unsigned long long>(entry.timeline),
+		       static_cast<unsigned long long>(entry.tick), entry.pipelines.size(), distinct.size());
+		for (const auto& [key, binds]: distinct)
+			Append(text, "    0x%llx %s x%u\n", static_cast<unsigned long long>(key), PipelineName(key), binds);
+	}
+}
+
+inline void AppendCheckpoints(std::string& text) {
+	std::lock_guard lock(g_breadcrumbs.mutex);
+	for (const auto& [queue, name]: g_checkpoints.queues) {
+		uint32_t count = 0;
+		g_checkpoints.get(queue, &count, nullptr);
+		std::vector<VkCheckpointDataNV> data(count);
+		for (auto& item: data) item.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+		g_checkpoints.get(queue, &count, data.data());
+		Append(text, "GPU checkpoints of the %s queue: %u\n", name, count);
+		for (uint32_t i = 0; i < count && i < data.size(); ++i) {
+			const auto  key   = reinterpret_cast<uint64_t>(data[i].pCheckpointMarker);
+			const char* stage = data[i].stage == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT      ? "started"
+			                    : data[i].stage == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT ? "finished"
+			                                                                            : "stage";
+			Append(text, "  %s (0x%x): pipeline 0x%llx %s\n", stage, static_cast<unsigned>(data[i].stage),
+			       static_cast<unsigned long long>(key), PipelineName(key));
+		}
+	}
+}
+
+// Once, at the first sign of the loss (any thread); the others wait until it is written.
+inline void Report() {
+	const auto device = g_registry.device.load(std::memory_order_acquire);
+	int        state  = 0;
+	if (!g_registry.report_state.compare_exchange_strong(state, 1, std::memory_order_acq_rel)) {
+		// (Another thread writes it: a fatal exit here ended a 10-13 hang's report after the first of its 110 addresses.)
+		for (int i = 0; i < 500 && g_registry.report_state.load(std::memory_order_acquire) == 1; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		return;
+	}
+	Common::BeginExitBlockingReport();
+	std::string text;
+	if (device != VK_NULL_HANDLE) AppendFault(text, device);
+	if (BreadcrumbsOn()) AppendSubmissions(text);
+	if (CheckpointsOn()) AppendCheckpoints(text);
+	std::fwrite(text.data(), 1, text.size(), stdout);
 	std::fflush(stdout);
+	g_registry.report_state.store(2, std::memory_order_release);
+	Common::EndExitBlockingReport();
 }
 
 } // namespace DeviceFault

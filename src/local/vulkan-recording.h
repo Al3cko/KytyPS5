@@ -14,6 +14,9 @@ namespace LocalVulkanRecording {
 void Install();
 // The Vulkan entry points without recording: for a queue the recording worker does not own.
 const vk::detail::DispatchLoaderDynamic& DirectDispatch();
+// Replaces the vkCmdBindPipeline every bind ends in (recorded, packet or direct: the device-loss breadcrumbs of
+// device-fault.h) and returns the one replaced. After Install, before any command is recorded.
+void* ReplaceBindPipeline(void* entry);
 // Complete this producer's CPU recording before handing its Vulkan objects to
 // another thread. A receiver's drain cannot flush the sender's thread-local queue.
 // This does not wait for GPU execution.

@@ -19,6 +19,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "device-fault.h"
 
 #include <algorithm>
 #include <atomic>
@@ -937,6 +938,15 @@ void CreatePipelineInternal(
 	}
 	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
 	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr));
+	if (DeviceFault::BreadcrumbsOn()) {
+		DeviceFault::NotePipeline(pipeline.pipeline,
+		                          fmt::format("{} vs {:016x} ps {:016x}",
+		                                      vs_input_info.stage.program->table_mode ? "gfx-table"
+		                                      : native_bindings                       ? "gfx-native"
+		                                                                              : "gfx-normal",
+		                                      vs_input_info.stage.program->shader_hash,
+		                                      ps_active ? ps_input_info->stage.program->shader_hash : 0));
+	}
 	// KYTY_PIPELINE_SOURCE_LOG (diagnostic): each pipeline's kind, identity (the precompile's), whether the static cache
 	// gave it, how it was built (0 full, 1 fast, 2 optimize) and the time it took.
 	if (PipelineSourceLog()) {
@@ -1025,6 +1035,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(!ClaimedElsewhere(graphics, result) &&
 	                     (result != vk::Result::eSuccess || pipeline.pipeline == nullptr));
+	if (DeviceFault::BreadcrumbsOn()) {
+		DeviceFault::NotePipeline(pipeline.pipeline, fmt::format("{} cs {:016x}", native_bindings ? "cs-table" : "cs-normal",
+		                                                         input_info.stage.program->shader_hash));
+	}
 	if (PipelineSourceLog()) {
 		std::printf("PIPESRC %s key=%016llx static=%d build=%d unoptimized=%d ms=%.1f blob=%zu read_us=%.0f cache_us=%.0f "
 		            "create_us=%.0f\n",

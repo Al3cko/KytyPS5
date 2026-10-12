@@ -596,6 +596,11 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	info.pCommandBuffers      = submit.commands;
 	info.signalSemaphoreCount = submit.signals;
 	info.pSignalSemaphores    = submit.signal_semaphores;
+	for (uint32_t i = 0; i < submit.signals; ++i) {
+		if (submit.signal_ticks[i] != submit.tick) continue;
+		DeviceFault::NoteSubmit((uint64_t)(submit.signal_semaphores[i]), submit.tick, submit.commands, submit.count); // NOLINT
+		break;
+	}
 	VkResult result;
 	{
 		Common::LockGuard lock(*submit.queue_mutex);
@@ -612,6 +617,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 void ReplayDiscard(std::span<const LocalVulkanRecording::Segment> segments,
                    const vk::detail::DispatchLoaderDynamic& dispatch) {
 	const auto command = *static_cast<const VkCommandBuffer*>(segments[0].data);
+	DeviceFault::NoteDiscard(command);
 	if (dispatch.vkResetCommandBuffer(command, 0) != VK_SUCCESS) {
 		EXIT("deferred vkResetCommandBuffer failed\n");
 	}
@@ -745,6 +751,12 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		submit_info.pCommandBuffers      = buffers.data();
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		static_assert(sizeof(vk::CommandBuffer) == sizeof(VkCommandBuffer));
+		DeviceFault::NoteSubmit((uint64_t)(static_cast<VkSemaphore>(m_master.Handle())), tick, // NOLINT
+		                        reinterpret_cast<const VkCommandBuffer*>(buffers.data()),
+		                        static_cast<uint32_t>(entries.size()));
+#endif
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 		m_driver_tick.store(tick, std::memory_order_release);

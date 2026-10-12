@@ -33,6 +33,11 @@ void DbgExit(int status);
 void SetExitDrain(void (*drain)()) noexcept;
 void RunExitDrain() noexcept;
 
+// A report a thread is writing (the device-loss report): a fatal exit on another thread ends the process after it
+// (DbgExit waits, 5 s at most), not in its middle.
+void BeginExitBlockingReport() noexcept;
+void EndExitBlockingReport() noexcept;
+
 // While one is alive, EXIT on this thread throws RecoverableExit instead of ending the process: a
 // precompile tool (PipelineCache::WarmSeeds) compiling inputs the game may never use skips them.
 struct RecoverableExit {

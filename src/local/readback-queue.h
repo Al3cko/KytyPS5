@@ -13,6 +13,7 @@
 // Without them the GPU thread records and submits.
 
 #include "common/assert.h"
+#include "device-fault.h"
 #include "graphics/host_gpu/graphicContext.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -224,6 +225,7 @@ private:
 		std::fflush(stdout);
 	}
 	static void Check(VkResult result, const char* what) {
+		if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
 		if (result != VK_SUCCESS) EXIT("%s failed: %d\n", what, static_cast<int>(result));
 	}
 	void Advance(uint64_t value) {
