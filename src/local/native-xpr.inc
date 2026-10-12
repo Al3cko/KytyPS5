@@ -2478,7 +2478,8 @@ class NativeXprReader {
 public:
 	explicit NativeXprReader(GpuResourceManager& resources)
 	    : m_resources(resources), m_granules(resources.ReadGranules()) {}
-	void Read(uint64_t address, uint32_t count, uint32_t* out) {
+	// (no_builtin: the short copy loop below stays a loop, not a memcpy call.)
+	__attribute__((no_builtin("memcpy"))) void Read(uint64_t address, uint32_t count, uint32_t* out) {
 		const uint64_t bytes = uint64_t {count} * 4u;
 		const uint64_t first = address >> 12u, last = (address + bytes - 1u) >> 12u;
 		if (first == last) {
@@ -2495,6 +2496,13 @@ public:
 				// processor's pending writes leave it.)
 				if (auto* spec = Spec::Current()) {
 					if (!spec->ReadJournaled(address, count, out)) return Spec::Refuse("memory the processor writes");
+					return;
+				}
+				if (count <= 16) {
+					// (A run of a few words: a CRT call each, ~10-15 per evaluation, was ~2% of the render thread on a
+					// laptop's Ryzen 9 5900HX; inline, its render time 33.6 -> 33.0 ms a frame, same process.)
+					const auto* from = reinterpret_cast<const uint32_t*>(address);
+					for (uint32_t i = 0; i < count; ++i) out[i] = from[i];
 					return;
 				}
 				std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
