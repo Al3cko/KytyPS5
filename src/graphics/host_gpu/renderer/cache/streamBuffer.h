@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -26,6 +27,9 @@ enum class MemoryUsage : uint8_t {
 	Upload,
 	Download,
 	Stream,
+	// Video memory bound page by page as it is used (Buffer::MakeResident); a page with none reads zero and drops writes
+	// (GraphicContext::sparse_residency_buffers).
+	SparseDeviceLocal,
 };
 
 inline constexpr vk::BufferUsageFlags ReadFlags =
@@ -73,6 +77,10 @@ public:
 	void CopyInRun(CommandBuffer& command, const Buffer& source, uint64_t source_offset, uint64_t destination_offset,
 	               uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	// MemoryUsage::SparseDeviceLocal: binds video memory to the pages of [offset, offset + size) without any and zeroes
+	// them (a fill recorded in the current command buffer, whose submission waits for the binding on the GPU:
+	// CommandScheduler::WaitBeforeNextSubmit). Other buffers: nothing.
+	void MakeResident(uint64_t offset, uint64_t size);
 
 	// BufferCache state lives directly on the resource (is_deleted also read by a speculative translation's thread).
 	std::atomic<bool> is_deleted {false};
@@ -105,6 +113,8 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
+	struct Sparse;
+	std::unique_ptr<Sparse> m_sparse;
 };
 
 class StreamBuffer final: public Buffer {

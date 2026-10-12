@@ -674,7 +674,36 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	return tick;
 }
 
+void CommandScheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t value) {
+	// (One semaphore at a time: a later value of the same one replaces the earlier; another one is waited for now.)
+	if (m_next_wait_semaphore == semaphore) {
+		m_next_wait_value = std::max(m_next_wait_value, value);
+		return;
+	}
+	if (m_next_wait_semaphore != nullptr) {
+		vk::SemaphoreWaitInfo wait {};
+		wait.semaphoreCount = 1;
+		wait.pSemaphores    = &m_next_wait_semaphore;
+		wait.pValues        = &m_next_wait_value;
+		EXIT_NOT_IMPLEMENTED(m_graphics.device.waitSemaphores(&wait, UINT64_MAX) != vk::Result::eSuccess);
+	}
+	m_next_wait_semaphore = semaphore;
+	m_next_wait_value     = value;
+}
+
 uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
+	if (m_next_wait_semaphore != nullptr) {
+		if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
+			submit.AddWait(m_next_wait_semaphore, m_next_wait_value);
+		} else {
+			vk::SemaphoreWaitInfo wait {};
+			wait.semaphoreCount = 1;
+			wait.pSemaphores    = &m_next_wait_semaphore;
+			wait.pValues        = &m_next_wait_value;
+			EXIT_NOT_IMPLEMENTED(m_graphics.device.waitSemaphores(&wait, UINT64_MAX) != vk::Result::eSuccess);
+		}
+		m_next_wait_semaphore = nullptr;
+	}
 	// The work may run once submitted: the pages it writes are read-protected first.
 	PageManager::FlushDeferredProtection();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||

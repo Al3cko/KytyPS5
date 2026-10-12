@@ -842,6 +842,24 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.multiDrawIndirect                    = VK_TRUE; // (indirect draws of several argument sets)
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue (the BDA page table).
+	{
+		vk::PhysicalDeviceProperties properties {};
+		physical_device.getProperties(&properties);
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		graphics.sparse_residency_buffers =
+		    supported_features2.features.sparseBinding == VK_TRUE &&
+		    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+		    properties.sparseProperties.residencyNonResidentStrict == VK_TRUE && queue_family < family_count &&
+		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		if (graphics.sparse_residency_buffers) {
+			device_features.sparseBinding         = VK_TRUE;
+			device_features.sparseResidencyBuffer = VK_TRUE;
+		}
+	}
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;

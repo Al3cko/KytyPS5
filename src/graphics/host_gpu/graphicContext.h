@@ -156,6 +156,9 @@ struct GraphicContext {
 	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video
 	// memory to render targets and buffers (CreateImage); the pipeline warmup leaves its pipelines to first use.
 	bool                          small_video_memory = false;
+	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
+	// (MemoryUsage::SparseDeviceLocal).
+	bool                          sparse_residency_buffers = false;
 	// An image only sampled and copied (CreateImage places these apart on such a GPU).
 	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
 		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |

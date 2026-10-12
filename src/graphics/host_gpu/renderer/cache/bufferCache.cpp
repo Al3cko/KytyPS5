@@ -1029,6 +1029,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
+		m_bda_pagetable_buffer.MakeResident(pages.first * sizeof(vk::DeviceAddress), size_pages * sizeof(vk::DeviceAddress));
 		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 	} else {
@@ -1335,14 +1336,23 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 
 static BufferCache* g_sync_cache = nullptr;
 
+// KYTY_BDA_SPARSE=1|0 (default: on with less than 12 GiB of video memory, where the device has strict sparse residency
+// buffers): the BDA page table (an entry per 16 KiB page of the 1 TiB guest address space, 512 MiB) gets video memory
+// only for the 64 KiB pages of entries a buffer registration wrote (Buffer::MakeResident); the others read zero, as
+// the whole table did. The game's memory spans ~100 such pages (128 MiB of guest address space each).
+static MemoryUsage PageTableUsage(const GraphicContext& graphics) {
+	static const char* const value  = std::getenv("KYTY_BDA_SPARSE");
+	const bool               wanted = value != nullptr && value[0] != '\0' ? value[0] != '0' : graphics.small_video_memory;
+	return wanted && graphics.sparse_residency_buffers ? MemoryUsage::SparseDeviceLocal : MemoryUsage::DeviceLocal;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache,
                          GpuResourceManager* resources)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_lod_stats_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, 256 * 16),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+      m_bda_pagetable_buffer(graphics, scheduler, PageTableUsage(graphics), 0, AllFlags, BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB,
                        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress),

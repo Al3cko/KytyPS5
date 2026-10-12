@@ -5,6 +5,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "device-fault.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -97,7 +100,8 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 			       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 		case MemoryUsage::Download:
 			return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-		case MemoryUsage::DeviceLocal: return {};
+		case MemoryUsage::DeviceLocal:
+		case MemoryUsage::SparseDeviceLocal: return {};
 	}
 	return {};
 }
@@ -105,6 +109,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 [[nodiscard]] VmaMemoryUsage AllocationUsage(MemoryUsage usage) {
 	switch (usage) {
 		case MemoryUsage::DeviceLocal:
+		case MemoryUsage::SparseDeviceLocal:
 		case MemoryUsage::Stream: return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 		case MemoryUsage::Upload:
 		case MemoryUsage::Download: return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -130,7 +135,20 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 	return true;
 }
 
+// Pages of video memory bound to a sparse buffer as it is used, from chunks of SparseChunkPages pages.
+constexpr uint32_t SparseChunkPages = 32;
+
 } // namespace
+
+struct Buffer::Sparse {
+	uint64_t                    page_size   = 0;
+	uint32_t                    memory_type = 0;
+	std::vector<uint8_t>        resident; // per page
+	std::vector<VkDeviceMemory> chunks;
+	uint32_t                    free_in_chunk = 0; // pages of the last chunk not bound yet
+	VkSemaphore                 timeline      = VK_NULL_HANDLE;
+	uint64_t                    value         = 0;
+};
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
@@ -138,6 +156,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
+	EXIT_IF(usage == MemoryUsage::SparseDeviceLocal && !graphics.sparse_residency_buffers);
 
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
@@ -167,6 +186,46 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+	if (usage == MemoryUsage::SparseDeviceLocal) {
+		const auto native_device = static_cast<VkDevice>(graphics.device);
+		buffer_info.flags        = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+		VkBuffer   sparse_buffer = VK_NULL_HANDLE;
+		const auto raw           = static_cast<VkBufferCreateInfo>(buffer_info);
+		EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateBuffer(native_device, &raw, nullptr, &sparse_buffer) != VK_SUCCESS);
+		m_buffer = sparse_buffer;
+		VkMemoryRequirements requirements {};
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferMemoryRequirements(native_device, sparse_buffer, &requirements);
+		m_sparse            = std::make_unique<Sparse>();
+		m_sparse->page_size = requirements.alignment;
+		EXIT_IF(m_sparse->page_size == 0);
+		m_sparse->resident.resize((size + m_sparse->page_size - 1) / m_sparse->page_size);
+		const auto& memory     = graphics.physical_device_memory_properties;
+		uint32_t    type_index = UINT32_MAX;
+		for (uint32_t i = 0; i < memory.memoryTypeCount && type_index == UINT32_MAX; ++i) {
+			const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+			if ((requirements.memoryTypeBits & (1u << i)) != 0 && properties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+				type_index = i;
+		}
+		for (uint32_t i = 0; i < memory.memoryTypeCount && type_index == UINT32_MAX; ++i) {
+			const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+			if ((requirements.memoryTypeBits & (1u << i)) != 0 && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0)
+				type_index = i;
+		}
+		EXIT_NOT_IMPLEMENTED(type_index == UINT32_MAX);
+		m_sparse->memory_type = type_index;
+		VkSemaphoreTypeCreateInfo timeline {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+		timeline.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+		VkSemaphoreCreateInfo semaphore {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+		semaphore.pNext = &timeline;
+		EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateSemaphore(native_device, &semaphore, nullptr, &m_sparse->timeline) != VK_SUCCESS);
+		if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = m_buffer;
+			m_device_address    = graphics.device.getBufferAddress(address_info);
+		}
+		return;
+	}
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -206,6 +265,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	DeviceFault::NoteDestroyed(m_device_address);
+	if (m_sparse) {
+		const auto native_device = static_cast<VkDevice>(m_graphics->device);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer(native_device, static_cast<VkBuffer>(m_buffer), nullptr);
+		for (const auto chunk: m_sparse->chunks) VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(native_device, chunk, nullptr);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroySemaphore(native_device, m_sparse->timeline, nullptr);
+		return;
+	}
 	if (m_buffer != nullptr) {
 		if (kyty_local_buffer_reclaim_mode.load(std::memory_order_relaxed) != 0) {
 			Reclaimer().Push(m_graphics->allocator, m_buffer, m_allocation);
@@ -347,6 +413,64 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+}
+
+void Buffer::MakeResident(uint64_t offset, uint64_t size) {
+	if (!m_sparse || size == 0 || offset >= m_size) return;
+	auto&          sparse = *m_sparse;
+	const uint64_t first  = offset / sparse.page_size;
+	const uint64_t last   = std::min((offset + size - 1) / sparse.page_size, uint64_t {sparse.resident.size() - 1});
+	std::vector<VkSparseMemoryBind> binds;
+	for (uint64_t page = first; page <= last; ++page) {
+		if (sparse.resident[page] != 0) continue;
+		if (sparse.free_in_chunk == 0) {
+			VkMemoryAllocateInfo allocate {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+			allocate.allocationSize  = sparse.page_size * SparseChunkPages;
+			allocate.memoryTypeIndex = sparse.memory_type;
+			VkDeviceMemory chunk     = VK_NULL_HANDLE;
+			EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device), &allocate, nullptr, &chunk) !=
+			                     VK_SUCCESS);
+			sparse.chunks.push_back(chunk);
+			sparse.free_in_chunk = SparseChunkPages;
+		}
+		const uint64_t slot = SparseChunkPages - sparse.free_in_chunk--;
+		binds.push_back({page * sparse.page_size, sparse.page_size, sparse.chunks.back(), slot * sparse.page_size, 0});
+		sparse.resident[page] = 1;
+	}
+	if (binds.empty()) return;
+	VkSparseBufferMemoryBindInfo buffer_bind {static_cast<VkBuffer>(m_buffer), static_cast<uint32_t>(binds.size()),
+	                                          binds.data()};
+	const uint64_t                signal = ++sparse.value;
+	VkTimelineSemaphoreSubmitInfo timeline {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+	timeline.signalSemaphoreValueCount = 1;
+	timeline.pSignalSemaphoreValues    = &signal;
+	VkBindSparseInfo info {VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+	info.pNext                = &timeline;
+	info.bufferBindCount      = 1;
+	info.pBufferBinds         = &buffer_bind;
+	info.signalSemaphoreCount = 1;
+	info.pSignalSemaphores    = &sparse.timeline;
+	VkResult result           = VK_SUCCESS;
+	{
+		// (The queue the recording worker submits on, and not through the recording layer: its direct call first drains
+		// the stream, whose submissions wait for this lock.)
+		Common::LockGuard lock(m_graphics->queue_mutex);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		const auto& dispatch = LocalVulkanRecording::DirectDispatch();
+#else
+		const auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
+#endif
+		result = dispatch.vkQueueBindSparse(static_cast<VkQueue>(m_graphics->queue), 1, &info, VK_NULL_HANDLE);
+	}
+	if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
+	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	// The submission of what is recorded next (the zeroing below, the caller's writes) waits for the binding on the GPU:
+	// binding operations keep no order with command buffers but through semaphores. (A wait here, on the CPU, behind
+	// everything queued before it: 1-1 loading 14 -> 141 s.) Earlier submissions see the pages bound or not, zero
+	// either way (strict residency).
+	Scheduler().WaitBeforeNextSubmit(vk::Semaphore(sparse.timeline), signal);
+	// New memory, zeroed: an entry nobody wrote is a page no buffer holds.
+	for (const auto& bind: binds) Fill(bind.resourceOffset, std::min(bind.size, m_size - bind.resourceOffset) & ~uint64_t {3}, 0);
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
