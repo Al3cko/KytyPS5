@@ -59,6 +59,7 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+#include <zstd.h>
 
 extern "C" {
 // 1: find graphics pipelines through a block-hashed index of the full key.
@@ -365,12 +366,14 @@ struct PipelineCache::ProgramCache {
 		bool                                         table_mode = false; // an empty handle: refused
 	};
 
-	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file.
+	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file: zstd-compressed (spirv_bytes,
+	// a fifth of it), or as it is (spirv_bytes 0).
 	struct PrefetchedModule {
 		ShaderRecompiler::IR::ResourceSpecialization specialization; // compiled with
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		uint64_t                                     spirv_offset = 0;
 		size_t                                       spirv_words  = 0;
+		size_t                                       spirv_bytes  = 0;
 	};
 
 	// A table mode permutation a compile worker translates (Get): the next Get of its specialization and push data
@@ -462,6 +465,7 @@ struct PipelineCache::ProgramCache {
 		std::atomic<bool>                                      ready {false}, stop {false};
 		std::atomic<size_t>                                    next {0}, finished {0};
 		std::atomic<uint64_t>                                  spill_end {0};
+		std::atomic<uint64_t>                                  spirv_bytes {0}; // before compression
 		uint64_t                                               spill = 0;
 		std::thread                                            loader;
 		std::vector<std::thread>                               threads;
@@ -513,7 +517,12 @@ struct PipelineCache::ProgramCache {
 				PipelineCacheLog("Shader prefetch: no temporary file for the SPIR-V");
 				return;
 			}
-			uint32_t threads = std::max(2u, std::thread::hardware_concurrency() / 2u);
+			// The CPUs the game leaves: its loading keeps about 12 threads busy (guest job threads, the GPU and recording
+			// threads), and prefetch threads beside them (on the other half of a core) slow them however low their
+			// priority. An 8-core laptop (16 CPUs) with 8 prefetch threads took 120+ s instead of 20 s to load 1-1
+			// (start-up to the game 264-300 s; with 4: 107 s); half the CPUs at most (a 32-CPU desktop keeps 16).
+			const uint32_t cpus    = std::max(1u, std::thread::hardware_concurrency());
+			uint32_t       threads = std::clamp(cpus > 12u ? cpus - 12u : 2u, 2u, std::max(2u, cpus / 2u));
 			if (const char* value = std::getenv("KYTY_SHADER_PREFETCH_THREADS"); value != nullptr && *value != '\0')
 				threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
 			PipelineCacheLog("Shader prefetch: {} programs ({} inputs) to translate on {} threads, loaded in {} ms",
@@ -538,7 +547,8 @@ struct PipelineCache::ProgramCache {
 				group.state.notify_all();
 			}
 			if (p.finished.fetch_add(1, std::memory_order_relaxed) + 1 == p.groups.size()) {
-				PipelineCacheLog("Shader prefetch: all {} programs translated, {} MiB of SPIR-V", p.groups.size(),
+				PipelineCacheLog("Shader prefetch: all {} programs translated, {} MiB of SPIR-V ({} MiB compressed)",
+				                 p.groups.size(), p.spirv_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_end.load(std::memory_order_relaxed) >> 20u);
 				std::vector<std::vector<uint32_t>>().swap(p.inputs.records); // no longer read
 			}
@@ -562,11 +572,19 @@ struct PipelineCache::ProgramCache {
 				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization);
 				auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization,
 				                                               record.push_cursor);
-				const auto bytes  = result.spirv.size() * sizeof(uint32_t);
-				const auto offset = p.spill_end.fetch_add(bytes, std::memory_order_relaxed);
-				if (!LocalPlatform::WriteScratchFile(p.spill, offset, result.spirv.data(), bytes)) continue;
+				// Compressed (a fifth of the bytes): the file of a whole game's SPIR-V (4.5 GB) is kept in memory by the
+				// system as a temporary file, which an 8 GB-GPU laptop with 32 GB of RAM did not have to spare.
+				const auto  bytes  = result.spirv.size() * sizeof(uint32_t);
+				std::vector<char> packed(ZSTD_compressBound(bytes));
+				const auto  packed_size = ZSTD_compress(packed.data(), packed.size(), result.spirv.data(), bytes, 1);
+				const bool  compressed  = !ZSTD_isError(packed_size) && packed_size < bytes;
+				const void* data        = compressed ? static_cast<const void*>(packed.data()) : result.spirv.data();
+				const auto  stored      = compressed ? packed_size : bytes;
+				const auto  offset      = p.spill_end.fetch_add(stored, std::memory_order_relaxed);
+				p.spirv_bytes.fetch_add(bytes, std::memory_order_relaxed);
+				if (!LocalPlatform::WriteScratchFile(p.spill, offset, data, stored)) continue;
 				group.modules.push_back({std::move(record.specialization), std::move(result.program).TakeCompiledInfo(),
-				                         offset, result.spirv.size()});
+				                         offset, result.spirv.size(), compressed ? stored : 0});
 			} catch (const Common::RecoverableExit&) {
 			}
 		}
@@ -610,9 +628,15 @@ struct PipelineCache::ProgramCache {
 		});
 		if (module == source.prefetched.end()) return nullptr;
 		std::vector<uint32_t> spirv(module->spirv_words);
-		if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, spirv.data(),
-		                                    spirv.size() * sizeof(uint32_t)))
+		const auto            bytes = spirv.size() * sizeof(uint32_t);
+		if (module->spirv_bytes != 0) {
+			std::vector<char> packed(module->spirv_bytes);
+			if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, packed.data(), packed.size()) ||
+			    ZSTD_decompress(spirv.data(), bytes, packed.data(), packed.size()) != bytes)
+				return nullptr;
+		} else if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, spirv.data(), bytes)) {
 			return nullptr;
+		}
 		source.permutations.push_back(
 		    ModulePermutation(options, spirv, std::move(module->program), std::move(specialization)));
 		source.prefetched.erase(module);
