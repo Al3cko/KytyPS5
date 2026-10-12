@@ -33,6 +33,7 @@ struct LocalDescriptorPlan;
 #endif
 class CommandBuffer;
 class PipelineBinaries;
+class PipelineCacheBlobs;
 
 namespace HW {
 class Context;
@@ -347,6 +348,7 @@ private:
 	vk::PipelineCache             m_static_cache = nullptr;
 	// Or its binaries (pipelineBinaries.h): GraphicContext::pipeline_binaries while open.
 	std::unique_ptr<PipelineBinaries> m_static_binaries;
+	std::unique_ptr<PipelineCacheBlobs> m_static_blobs;
 	std::filesystem::path         m_driver_cache_path;
 	std::string                   m_driver_cache_key;
 	// The size of the driver cache's data when it was loaded or last saved (Save skips an unchanged one).
@@ -451,6 +453,10 @@ void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64
 // KYTY_PIPELINE_SOURCE_LOG (diagnostic): a PIPESRC line for each pipeline made (its kind, identity, whether the static
 // cache gave it, its build and time): which of the precompile's pipelines a game session meets.
 bool PipelineSourceLog();
+// Each shader module's SPIR-V hash is noted when made (NotePipelineKeyModule) from now on: pipeline identities need them
+// (pipeline cache blobs, the source and key logs).
+void RecordModuleSpirvHashes();
+bool ModuleSpirvHashesRecorded();
 // A pipeline's identity: its modules' SPIR-V, its fixed-function state (as a recipe holds it), its stages' static input
 // keys and native bindings; the same for the same pipeline (the precompile's plan keys it so, the source log too).
 uint64_t GraphicsPipelineIdentity(uint64_t vertex_spirv, uint64_t pixel_spirv, const PipelineRenderingState& rendering,

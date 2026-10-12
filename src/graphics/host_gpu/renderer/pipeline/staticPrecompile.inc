@@ -564,23 +564,41 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	// are not kept. The static cache is looked up first (CreatePipelineInternal): a rerun compiles
 	// only what it misses. With pipeline binaries every pipeline's binaries go to a shard file
 	// (.shard<i>of<n>-<seeds>, merged by --merge --prune), copied from the store when it holds them, else captured
-	// (from the static cache, else compiled through a cache of the shard's own).
-	const bool                            binaries = create_pipelines && m_graphics.pipeline_binaries_enabled;
-	std::unique_ptr<PipelineBinaryWriter> writer;
+	// (from the static cache, else compiled through a cache of the shard's own). Without them, each pipeline's own
+	// pipeline cache data goes to the shard file (pipelineCacheBlobs.h), copied from the store's blobs or made.
+	const bool binaries = create_pipelines && m_graphics.pipeline_binaries_enabled;
+	const bool blobs    = create_pipelines && !binaries && StaticBlobsMode(m_graphics);
+	std::unique_ptr<PipelineBinaryWriter>    writer;
+	std::unique_ptr<PipelineCacheBlobWriter> blob_writer;
 	if (binaries) {
 		writer                            = std::make_unique<PipelineBinaryWriter>(m_graphics.device);
 		m_graphics.pipeline_binary_writer = writer.get();
 	}
-	vk::PipelineCache target = binaries ? nullptr : m_static_cache;
-	if (create_pipelines && (shards > 1 || binaries)) {
+	if (blobs) {
+		blob_writer                     = std::make_unique<PipelineCacheBlobWriter>();
+		m_graphics.pipeline_blob_writer = blob_writer.get();
+	}
+	vk::PipelineCache target = binaries || blobs ? nullptr : m_static_cache;
+	if (create_pipelines && !blobs && (shards > 1 || binaries)) {
 		vk::PipelineCacheCreateInfo info {};
 		if (m_graphics.device.createPipelineCache(&info, nullptr, &target) != vk::Result::eSuccess) target = nullptr;
 	}
-	auto target_file = binaries ? StaticBinariesPath() : StaticCachePath();
+	auto target_file = binaries ? StaticBinariesPath() : blobs ? StaticBlobsPath() : StaticCachePath();
 	// Named after the seed file too: a run shards several (precompile-windows.ps1: seeds and recorded).
-	if (shards > 1 || binaries)
+	if (shards > 1 || binaries || blobs)
 		target_file += fmt::format(".shard{}of{}-{}", shard, shards, Common::PathToString(args.seeds.stem()));
 	const auto save = [&] {
+		if (blobs) {
+			auto temporary = target_file;
+			temporary += ".tmp";
+			std::error_code error;
+			if (!blob_writer->Save(temporary, StaticBlobsSignature(m_graphics.GetPhysicalDeviceProperties()))) return false;
+			std::filesystem::rename(temporary, target_file, error);
+			PipelineCacheLog("Static pipeline blobs: saved {} pipelines ({} made, {} from the store, {} left out) to {}",
+			                 blob_writer->Pipelines(), blob_writer->Made(), blob_writer->Copied(), blob_writer->LeftOut(),
+			                 Common::PathToString(target_file));
+			return !error;
+		}
 		if (!binaries) return SaveStaticCache(target, target_file);
 		auto temporary = target_file;
 		temporary += ".tmp";
@@ -652,7 +670,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	std::condition_variable checkpoint_wake;
 	bool                    pipelines_done = false;
 	std::jthread            checkpoints;
-	if (create_pipelines && !args.dry_run && (target != nullptr || binaries)) {
+	if (create_pipelines && !args.dry_run && (target != nullptr || binaries || blobs)) {
 		checkpoints = std::jthread([&] {
 			std::unique_lock lock(checkpoint_mutex);
 			while (!checkpoint_wake.wait_for(lock, std::chrono::minutes(10), [&] { return pipelines_done; })) {
@@ -665,8 +683,10 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	}
 	if (create_pipelines) {
 		parallel(seed_words.size() + recipes.size(), [&](size_t n) {
-			// Once binaries are left out, the rest would be too: for a smaller shard.
-			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0)) return;
+			// Once binaries (or blobs) are left out, the rest would be too: for a smaller shard.
+			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0) ||
+			    (blob_writer != nullptr && blob_writer->LeftOut() != 0))
+				return;
 			if (n < seed_words.size()) {
 				if (stage_of(n) != ShaderType::Compute) return;
 				LocalShaderWarmup::Record input;
@@ -801,7 +821,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	checkpoint_wake.notify_all();
 	if (checkpoints.joinable()) checkpoints.join();
 
-	const bool saved_pipelines = !create_pipelines || args.dry_run || ((target != nullptr || binaries) && save());
+	const bool saved_pipelines =
+	    !create_pipelines || args.dry_run || ((target != nullptr || binaries || blobs) && save());
 	if (args.dry_run && !args.plan.empty()) {
 		const bool written = plan.Save(args.plan);
 		PipelineCacheLog("Shader seeds: plan {} {} ({} pipelines, {} of them this seed file's)",
@@ -809,8 +830,9 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		                 plan.owners.size() - planned_keys);
 		if (!written) return false;
 	}
-	left_out                          = writer != nullptr ? writer->LeftOut() : 0;
+	left_out = (writer != nullptr ? writer->LeftOut() : 0) + (blob_writer != nullptr ? blob_writer->LeftOut() : 0);
 	m_graphics.pipeline_binary_writer = nullptr;
+	m_graphics.pipeline_blob_writer   = nullptr;
 	if (!args.timings.empty()) {
 		auto path = args.timings;
 		if (shards > 1) path += fmt::format(".shard{}", shard);
@@ -952,16 +974,21 @@ bool PipelineCache::Precompile(GraphicContext& graphics, const PrecompileOptions
 
 // Both files are saved whole (a temporary file renamed), so their first line tells the GPU and driver.
 bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::filesystem::path& seeds) {
+	const bool blobs = StaticBlobsMode(graphics);
 	if (!seeds.empty()) {
 		std::error_code error;
 		const auto      written = std::filesystem::last_write_time(
-		    graphics.pipeline_binaries_enabled ? StaticBinariesPath() : StaticCachePath(), error);
+		    graphics.pipeline_binaries_enabled ? StaticBinariesPath() : blobs ? StaticBlobsPath() : StaticCachePath(), error);
 		if (error) return false;
 		const auto seeded = std::filesystem::last_write_time(seeds, error);
 		if (error || written < seeded) return false;
 	}
 	if (graphics.pipeline_binaries_enabled) {
 		return PipelineBinaries::Open(graphics.device, StaticBinariesPath(), StaticBinariesSignature(graphics)) != nullptr;
+	}
+	if (blobs) {
+		return PipelineCacheBlobs::Open(StaticBlobsPath(), StaticBlobsSignature(graphics.GetPhysicalDeviceProperties())) !=
+		       nullptr;
 	}
 	const auto    signature = StaticCacheSignature(graphics.GetPhysicalDeviceProperties());
 	std::ifstream file(StaticCachePath(), std::ios::binary);
@@ -1022,9 +1049,52 @@ bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune) {
 	return merged;
 }
 
+// The blobs and their shards' files (or only the shards': prune) into new blobs; the shard files are removed once
+// merged. Their data is copied from the files when the new one is written.
+static bool MergeBlobShards(GraphicContext& graphics, bool prune) {
+	const auto                                       path      = StaticBlobsPath();
+	const auto                                       signature = StaticBlobsSignature(graphics.GetPhysicalDeviceProperties());
+	PipelineCacheBlobWriter                          writer;
+	std::vector<std::unique_ptr<PipelineCacheBlobs>> sources;
+	std::vector<std::filesystem::path>               files;
+	if (!prune) {
+		if (auto store = PipelineCacheBlobs::Open(path, signature)) {
+			writer.CopyAll(*store);
+			sources.push_back(std::move(store));
+		}
+	}
+	std::error_code error;
+	for (const auto& entry: std::filesystem::directory_iterator(path.parent_path(), error)) {
+		const auto name = entry.path().filename().string();
+		if (!name.starts_with(path.filename().string() + ".shard") || name.ends_with(".tmp")) continue;
+		if (auto shard = PipelineCacheBlobs::Open(entry.path(), signature)) {
+			writer.CopyAll(*shard);
+			sources.push_back(std::move(shard));
+			files.push_back(entry.path());
+		}
+	}
+	if (files.empty()) {
+		PipelineCacheLog("Static pipeline blobs: no shards to merge");
+		return true;
+	}
+	auto temporary = path;
+	temporary += ".tmp";
+	const bool saved = writer.Save(temporary, signature);
+	sources.clear(); // closes the files: the blobs may be replaced
+	if (saved) std::filesystem::rename(temporary, path, error);
+	const bool merged = saved && !error;
+	if (merged) {
+		for (const auto& file: files) std::filesystem::remove(file, error);
+	}
+	PipelineCacheLog("Static pipeline blobs: merged {} shards{}, {} pipelines{}", files.size(), prune ? " (pruned)" : "",
+	                 writer.Pipelines(), merged ? "" : ": FAILED");
+	return merged;
+}
+
 // The shard files are removed once merged.
 bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune) {
 	if (graphics.pipeline_binaries_enabled) return MergeBinaryShards(graphics, prune);
+	if (StaticBlobsMode(graphics)) return MergeBlobShards(graphics, prune);
 	PipelineCache cache(graphics);
 	if (cache.m_static_cache == nullptr) cache.InitializeStaticCache(true);
 	if (cache.m_static_cache == nullptr) return false;

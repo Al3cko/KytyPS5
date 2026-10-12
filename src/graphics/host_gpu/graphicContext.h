@@ -17,6 +17,8 @@ namespace Libs::Graphics {
 struct VulkanImage;
 class PipelineBinaries;
 class PipelineBinaryWriter;
+class PipelineCacheBlobs;
+class PipelineCacheBlobWriter;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -55,6 +57,10 @@ struct GraphicContext {
 	bool                               pipeline_binary_internal_cache        = true;
 	const PipelineBinaries*            pipeline_binaries                     = nullptr;
 	PipelineBinaryWriter*              pipeline_binary_writer                = nullptr;
+	// Without pipeline binaries: the static precompile's pipelines as each one's own pipeline cache data, keyed by
+	// its identity (pipelineCacheBlobs.h); in the precompile, its output.
+	const PipelineCacheBlobs*          pipeline_blobs                        = nullptr;
+	PipelineCacheBlobWriter*           pipeline_blob_writer                  = nullptr;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

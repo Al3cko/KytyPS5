@@ -4,7 +4,9 @@
 #                                         looks up before compiling (hours the first time: run it overnight); with
 #                                         a driver that has VK_KHR_pipeline_binary (NVIDIA 5xx) the pipelines'
 #                                         binaries instead, <title>_<version>.binaries, read only when a pipeline is
-#                                         needed (the driver copies a whole .bin into memory: GBs)
+#                                         needed (the driver copies a whole .bin into memory: GBs); without them,
+#                                         each pipeline's own pipeline cache data, <title>_<version>.blobs, read
+#                                         alike (a .bin made before them stays in use, and a run adds to it)
 #   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
@@ -264,7 +266,8 @@ while ($pending.Count -or $running.Count) {
 $env:KYTY_PRECOMPILE_CLAIMS = $null
 Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
-$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries" -ErrorAction SilentlyContinue |
+$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries",
+	"$PSScriptRoot\_PipelineCache\static\$gameId.blobs" -ErrorAction SilentlyContinue |
 	Sort-Object LastWriteTime | Select-Object -Last 1
 Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB; {3} shards split)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB), $split)
 } finally {

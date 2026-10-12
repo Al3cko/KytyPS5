@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCacheBlobs.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -704,7 +705,7 @@ struct PipelineCache::ProgramCache {
 		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 		                     "create recompiled shader module");
 		EXIT_IF(module == nullptr);
-		if (PipelineKeyLog() || PipelineSourceLog()) {
+		if (ModuleSpirvHashesRecorded()) {
 			NotePipelineKeyModule(module, options.shader_hash,
 			                      XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)));
 		}
@@ -1682,6 +1683,7 @@ PipelineCache::~PipelineCache() {
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
 	m_graphics.pipeline_binaries = nullptr;
+	m_graphics.pipeline_blobs    = nullptr;
 	for (const auto pipeline: m_replaced_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
@@ -1717,6 +1719,56 @@ static std::string StaticBinariesSignature(GraphicContext& graphics) {
 	return PipelineBinaries::Signature(graphics.device, ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties()));
 }
 
+// Without pipeline binaries: each pipeline's own pipeline cache data (pipelineCacheBlobs.h), read when it is needed,
+// in place of the static pipeline cache, which the driver copies into memory whole. KYTY_STATIC_BLOBS=0: the cache.
+static bool StaticBlobsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STATIC_BLOBS");
+		return !(value != nullptr && std::string_view(value) == "0");
+	}();
+	return enabled;
+}
+
+static std::filesystem::path StaticBlobsPath() {
+	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".blobs");
+}
+
+static std::string StaticBlobsSignature(const vk::PhysicalDeviceProperties& properties) {
+	return "KytyPCBlobs1" + ShaderInputDeviceSignature(properties);
+}
+
+// KYTY_STATIC_BLOBS_FROM_CACHE=1 (the precompile): blobs made of the static pipeline cache's pipelines (loaded as a
+// source), compiled only where the driver cannot give them otherwise.
+static bool StaticBlobsFromCache() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_STATIC_BLOBS_FROM_CACHE");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return on;
+}
+
+// A static pipeline cache of this GPU and driver exists (its file begins with their signature).
+static bool StaticCacheFileMatches(const vk::PhysicalDeviceProperties& properties) {
+	const auto    signature = StaticCacheSignature(properties);
+	std::ifstream file(StaticCachePath(), std::ios::binary);
+	std::string   saved(signature.size(), '\0');
+	return file.read(saved.data(), static_cast<std::streamsize>(saved.size())) && saved == signature;
+}
+
+// Whether this PC's static precompile is pipeline cache blobs: without pipeline binaries, unless a static pipeline cache
+// of this GPU and driver was made before them (no blobs beside it). That one stays in use, and a precompile adds to it as
+// it did: a cache made once is never made again for the blobs, which come with the next cache made from nothing (a new
+// install, a driver update). Decided once per process.
+static bool StaticBlobsMode(GraphicContext& graphics) {
+	if (graphics.pipeline_binaries_enabled || !StaticBlobsEnabled()) return false;
+	static const bool mode = [&] {
+		std::error_code error;
+		return std::filesystem::exists(StaticBlobsPath(), error) || StaticBlobsFromCache() ||
+		       !StaticCacheFileMatches(graphics.GetPhysicalDeviceProperties());
+	}();
+	return mode;
+}
+
 // A pipeline cache file (signature, XXH3 of the payload, payload): the payload, or nothing when the
 // file is missing, damaged or from another GPU or driver.
 static std::vector<uint8_t> ReadPipelineCacheFile(const std::filesystem::path& path, const std::string& signature) {
@@ -1742,7 +1794,27 @@ void PipelineCache::InitializeStaticCache(bool create) {
 	    std::string_view(value) == "0")
 		return;
 	const auto begin = std::chrono::steady_clock::now();
-	if (m_static_binaries != nullptr) return;
+	if (m_static_binaries != nullptr || m_static_blobs != nullptr) return;
+	if (StaticBlobsMode(m_graphics)) {
+		RecordModuleSpirvHashes();
+		m_static_blobs = PipelineCacheBlobs::Open(StaticBlobsPath(), StaticBlobsSignature(m_graphics.GetPhysicalDeviceProperties()));
+		if (m_static_blobs != nullptr) {
+			m_graphics.pipeline_blobs = m_static_blobs.get();
+			PipelineCacheLog("Static pipeline blobs: {} pipelines, {} MiB in {} ({} ms)", m_static_blobs->Pipelines(),
+			                 m_static_blobs->DataBytes() >> 20u, Common::PathToString(StaticBlobsPath()),
+			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
+			                     .count());
+			return;
+		}
+		// None yet: the precompile makes them (and loads no static cache: every shard process would hold one whole,
+		// unless it converts one: StaticBlobsFromCache); the emulator takes a static cache from before them.
+#ifdef KYTY_STATIC_PRECOMPILE
+		if (!StaticBlobsFromCache()) return;
+		create = false;
+#else
+		if (create) return;
+#endif
+	}
 	if (m_graphics.pipeline_binaries_enabled) {
 		m_static_binaries = PipelineBinaries::Open(m_graphics.device, StaticBinariesPath(), StaticBinariesSignature(m_graphics));
 		if (m_static_binaries != nullptr) {

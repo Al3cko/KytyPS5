@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCacheBlobs.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -20,6 +21,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -315,6 +317,16 @@ bool PipelineSourceLog() {
 	return on;
 }
 
+static std::atomic<bool> g_module_hashes {false};
+
+void RecordModuleSpirvHashes() {
+	g_module_hashes.store(true, std::memory_order_relaxed);
+}
+
+bool ModuleSpirvHashesRecorded() {
+	return g_module_hashes.load(std::memory_order_relaxed) || PipelineKeyLog() || PipelineSourceLog();
+}
+
 // (Noted for the pipeline key and source logs only: 0 otherwise.)
 static uint64_t ModuleSpirvHash(vk::ShaderModule module) {
 	if (module == nullptr) return 0;
@@ -364,10 +376,21 @@ static bool ClaimedElsewhere(const GraphicContext& graphics, vk::Result result) 
 	return result == vk::Result::ePipelineCompileRequired && graphics.pipeline_binary_writer != nullptr;
 }
 
-// The static precompile's pipeline when it holds this one (no compilation), else built as `build` says.
+// A pipeline cache made of one pipeline's cache data (pipelineCacheBlobs.h), or none.
+static vk::PipelineCache BlobCache(GraphicContext& graphics, const std::vector<uint8_t>& data) {
+	vk::PipelineCacheCreateInfo create {};
+	create.initialDataSize  = data.size();
+	create.pInitialData     = data.data();
+	vk::PipelineCache cache = nullptr;
+	return graphics.device.createPipelineCache(&create, nullptr, &cache) == vk::Result::eSuccess ? cache : nullptr;
+}
+
+// The static precompile's pipeline when it holds this one (no compilation), else built as `build` says. `identity`
+// (GraphicsPipelineIdentity, ComputePipelineIdentity; 0: none) finds it among pipeline cache blobs.
 template <typename Info, typename Create>
 static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, Info info,
-                                       vk::PipelineCache driver_cache, PipelineBuild build, Create create) {
+                                       vk::PipelineCache driver_cache, PipelineBuild build, uint64_t identity,
+                                       Create create) {
 	t_static_hit      = false;
 	const auto cached = [&](vk::PipelineCache cache) {
 		if (cache == nullptr || !graphics.pipeline_cache_control_enabled) return false;
@@ -403,6 +426,53 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 			}
 			if (writer == nullptr && PipelineKeyLog()) LogPipelineKey("miss", key, info);
 			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
+		}
+	}
+	// Without pipeline binaries, its own cache data by its identity: a cache made of it gives the pipeline without
+	// compiling (and holds nothing else: the driver copies a whole static cache into memory). The precompile compiles
+	// one it lacks into a cache of its own, whose data it keeps.
+	const auto* blobs       = graphics.pipeline_blobs;
+	auto*       blob_writer = graphics.pipeline_blob_writer;
+	if (build != PipelineBuild::Optimize && identity != 0 && (blobs != nullptr || blob_writer != nullptr) &&
+	    graphics.pipeline_cache_control_enabled) {
+		std::vector<uint8_t> data;
+		if (blobs != nullptr && blobs->Load(identity, data)) {
+			if (const auto cache = BlobCache(graphics, data)) {
+				auto lookup = info;
+				lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+				const auto result = create(cache, lookup);
+				graphics.device.destroyPipelineCache(cache, nullptr);
+				if (result == vk::Result::eSuccess) {
+					if (blob_writer != nullptr) blob_writer->Copy(identity, *blobs);
+					t_static_hit = true;
+					return result;
+				}
+				pipeline.pipeline = nullptr;
+			}
+		}
+		if (blob_writer != nullptr) {
+			// A static pipeline cache from before the blobs (a conversion, KYTY_STATIC_BLOBS_FROM_CACHE): its hit gives the
+			// driver the pipeline, which a cache of the pipeline's own may then take without compiling.
+			if (cached(graphics.static_pipeline_cache)) {
+				graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+				pipeline.pipeline = nullptr;
+			}
+			vk::PipelineCacheCreateInfo empty {};
+			vk::PipelineCache           own = nullptr;
+			if (graphics.device.createPipelineCache(&empty, nullptr, &own) == vk::Result::eSuccess) {
+				const auto result = create(own, info);
+				size_t     size   = 0;
+				if (result == vk::Result::eSuccess &&
+				    graphics.device.getPipelineCacheData(own, &size, nullptr) == vk::Result::eSuccess && size != 0) {
+					data.resize(size);
+					if (graphics.device.getPipelineCacheData(own, &size, data.data()) == vk::Result::eSuccess) {
+						data.resize(size);
+						(void)blob_writer->Add(identity, std::move(data));
+					}
+				}
+				graphics.device.destroyPipelineCache(own, nullptr);
+				return result;
+			}
 		}
 	}
 	if (build != PipelineBuild::Optimize && store == nullptr && cached(graphics.static_pipeline_cache)) {
@@ -777,14 +847,14 @@ void CreatePipelineInternal(
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	// Its identity: for the source log.
+	// Its identity: for pipeline cache blobs and the source log.
 	const uint64_t identity =
-	    PipelineSourceLog() ? GraphicsPipelineIdentity(ModuleSpirvHash(vertex_program.module),
-	                                                   ps_active ? ModuleSpirvHash(pixel_program.module) : 0, rendering,
-	                                                   vertex_input, static_params, vs_input_info, ps_input_info,
-	                                                   native_bindings)
-	                        : 0;
-	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build,
+	    PipelineSourceLog() || graphics.pipeline_blobs != nullptr || graphics.pipeline_blob_writer != nullptr
+	        ? GraphicsPipelineIdentity(ModuleSpirvHash(vertex_program.module),
+	                                   ps_active ? ModuleSpirvHash(pixel_program.module) : 0, rendering, vertex_input,
+	                                   static_params, vs_input_info, ps_input_info, native_bindings)
+	        : 0;
+	result = CreatePipelineHandle(graphics, pipeline, pipeline_info, driver_cache, build, identity,
 	                              [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
 		                              return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr,
 		                                                                            &pipeline.pipeline);
@@ -874,9 +944,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
 	const uint64_t identity =
-	    PipelineSourceLog() ? ComputePipelineIdentity(ModuleSpirvHash(compute_module), input_info, native_bindings) : 0;
+	    PipelineSourceLog() || graphics.pipeline_blobs != nullptr || graphics.pipeline_blob_writer != nullptr
+	        ? ComputePipelineIdentity(ModuleSpirvHash(compute_module), input_info, native_bindings)
+	        : 0;
 	const auto result =
-	    CreatePipelineHandle(graphics, pipeline, info, driver_cache, build,
+	    CreatePipelineHandle(graphics, pipeline, info, driver_cache, build, identity,
 	                         [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
 		                         return graphics.device.createComputePipelines(cache, 1, &create, nullptr,
 		                                                                      &pipeline.pipeline);
