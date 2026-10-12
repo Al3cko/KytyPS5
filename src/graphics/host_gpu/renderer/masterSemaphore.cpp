@@ -56,9 +56,20 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	if (result == vk::Result::eErrorDeviceLost) DeviceFault::Report();
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// (A tick that does not come says every 5 s where the timeline is: a stalled GPU, 8 GB sim 10-12.)
+	constexpr uint64_t StallSeconds = 5;
+	for (uint32_t round = 1;; ++round) {
+		const auto result = m_graphics.device.waitSemaphores(&wait_info, StallSeconds * 1000000000ull);
+		if (result == vk::Result::eSuccess) break;
+		if (result == vk::Result::eErrorDeviceLost) DeviceFault::Report();
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eTimeout);
+		uint64_t now = 0;
+		(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &now);
+		std::printf("STALL graphics timeline: tick %llu not reached after %llu s, at %llu\n",
+		            static_cast<unsigned long long>(tick), static_cast<unsigned long long>(round * StallSeconds),
+		            static_cast<unsigned long long>(now));
+		std::fflush(stdout);
+	}
 	Refresh();
 }
 

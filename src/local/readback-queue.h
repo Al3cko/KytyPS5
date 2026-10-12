@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <span>
 #include <utility>
 
@@ -148,7 +149,8 @@ public:
 		const size_t   index   = value % Buffers;
 		const auto     command = m_commands[index];
 		if (m_used[index] != 0) Wait(m_used[index]);
-		m_used[index] = value;
+		m_used[index]  = value;
+		m_waits[index] = {timeline, wait_value};
 		const SubmitPacket packet {m_queue, command, timeline, wait_value, m_semaphore, value};
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// With deferred submits the worker records the command buffer too: the driver calls leave the GPU thread
@@ -197,11 +199,30 @@ public:
 		wait.semaphoreCount = 1;
 		wait.pSemaphores    = &m_semaphore;
 		wait.pValues        = &value;
-		Check(d.vkWaitSemaphores(m_device, &wait, UINT64_MAX), "wait for readback copy");
+		// (A copy that does not finish says every 5 s what it waits for: is the graphics queue or this one stuck?)
+		for (uint32_t round = 1;; ++round) {
+			const VkResult result = d.vkWaitSemaphores(m_device, &wait, StallSeconds * 1000000000ull);
+			if (result == VK_SUCCESS) break;
+			if (result != VK_TIMEOUT) Check(result, "wait for readback copy");
+			ReportStall(value, round);
+		}
 		Advance(value);
 	}
 
 private:
+	static constexpr uint64_t StallSeconds = 5;
+	void ReportStall(uint64_t value, uint32_t round) const {
+		const auto [graphics, graphics_value] = m_waits[value % Buffers];
+		uint64_t graphics_now = 0, copies_now = 0;
+		if (graphics != VK_NULL_HANDLE) (void)d.vkGetSemaphoreCounterValue(m_device, graphics, &graphics_now);
+		(void)d.vkGetSemaphoreCounterValue(m_device, m_semaphore, &copies_now);
+		std::printf("STALL readback copy %llu not done after %llu s: copy timeline %llu (%llu submitted); it waits for the "
+		            "graphics timeline at %llu, which is at %llu\n",
+		            static_cast<unsigned long long>(value), static_cast<unsigned long long>(round * StallSeconds),
+		            static_cast<unsigned long long>(copies_now), static_cast<unsigned long long>(m_submitted),
+		            static_cast<unsigned long long>(graphics_value), static_cast<unsigned long long>(graphics_now));
+		std::fflush(stdout);
+	}
 	static void Check(VkResult result, const char* what) {
 		if (result != VK_SUCCESS) EXIT("%s failed: %d\n", what, static_cast<int>(result));
 	}
@@ -217,6 +238,7 @@ private:
 	VkSemaphore                              m_semaphore = VK_NULL_HANDLE;
 	std::array<VkCommandBuffer, Buffers>     m_commands {};
 	std::array<uint64_t, Buffers>            m_used {};
+	std::array<std::pair<VkSemaphore, uint64_t>, Buffers> m_waits {}; // each copy's graphics timeline wait (stall reports)
 	uint64_t                                 m_submitted = 0;
 	bool                                     m_worker_records = false; // the worker may record into the pool
 	std::atomic<uint64_t>                    m_known {0};
