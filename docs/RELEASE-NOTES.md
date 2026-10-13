@@ -25,6 +25,9 @@
 - **Fewer hitches while walking on GPUs with less than 12 GB of video memory**: the shaders this PC has recorded are
   prepared at start-up there too, within 1/16 of the video memory, and pipelines share their layouts (a laptop's
   1-1 walk: no frame of 90 ms or more, before 200-900 ms hitches).
+- **Less video memory on GPUs with less than 12 GB**: a texture the game has so far streamed in only from its smaller
+  levels now takes only the memory of those levels (an 8 GB laptop at 1-1: textures 4.2 -> 2.6 GB, so the game fits
+  in video memory instead of being paged in and out; walking about 8% faster).
 
 ## 本版本的变化
 
@@ -39,3 +42,4 @@
   - 不再把同一批管线重复编译好几遍；测试笔记本上之前完整预编译约需 3.5 小时。
   - 在不支持 pipeline binary 的驱动上（570 之前的 NVIDIA 驱动、AMD、Intel），预编译结果改为用到时逐个读取，不再一次全部载入，约少占 4 GB 内存。
 - **显存小于 12 GB 的显卡走动时卡顿更少**：这类显卡现在也会在启动时准备本机已记录的着色器（占用不超过显存的 1/16），管线之间也共享布局（笔记本 1-1 走动：没有超过 90 ms 的帧，之前有 200-900 ms 的卡顿）。
+- **显存小于 12 GB 的显卡占用更少显存**：游戏目前只流式载入了较小几级 mipmap 的纹理，现在只占用这几级的显存（8 GB 笔记本在 1-1：纹理 4.2 -> 2.6 GB，游戏能放进显存，不再被换入换出；走动约快 8%）。
