@@ -531,6 +531,15 @@ static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& o
 	out.extent.width     = shift(full.extent.width);
 	out.extent.height    = shift(full.extent.height);
 	out.resources.levels = full.resources.levels - first;
+	// (A tiling the smaller texture has no layout for: TileGetTextureSize would end the emulator. 10-13, 2-2: format 182,
+	// tile 27, the levels from 1 of a texture as 67x1, one level.)
+	if (TileSurfaceLayout probe {}; full.tile_mode != Prospero::TileMode::kLinear &&
+	                                !TileGetTiledTextureLayout({full.guest_format, full.tile_mode, TileSurfaceDimension::Dim2D,
+	                                                            out.extent.width, out.extent.height, 1,
+	                                                            out.resources.levels, 1},
+	                                                           probe)) {
+		return false;
+	}
 	out.pitch            = TileGetTexturePitch(full.guest_format, out.extent.width, full.tile_mode);
 	TileSizeAlign size {};
 	if (!TileGetTextureTotalSize(full.guest_format, out.extent.width, out.extent.height, 1, out.resources.levels,
