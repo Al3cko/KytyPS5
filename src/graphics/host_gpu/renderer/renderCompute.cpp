@@ -41,8 +41,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -51,6 +55,152 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// KYTY_DISPATCH_TIMING=<hash>[,<hash>...] (or ;): the GPU time of those programs' normal-path dispatches, from
+// timestamps written around each (the interval also holds the tails of earlier work it overlaps), printed for a
+// dispatch of KYTY_DISPATCH_TIMING_MS (default 20) or more, with a summary per program every 5 s. (The culling chain's
+// GPU hangs, 10-13: a dispatch looping for seconds - its shader's per-lane loop runs a count read from memory - or one
+// that never ends.)
+namespace DispatchTiming {
+constexpr uint32_t Slots = 8192; // (pairs of timestamps)
+struct Totals {
+	std::atomic<uint64_t> count {0}, ns {0}, max_ns {0};
+};
+// A slot's dispatch, for a stall: the one whose start the GPU wrote and whose end it did not is the dispatch it is stuck
+// in.
+struct Record {
+	uint64_t tick = 0, hash = 0, sequence = 0;
+	uint32_t x = 0, y = 0, z = 0;
+};
+struct State {
+	std::vector<uint64_t>     hashes;
+	std::deque<Totals>        totals; // (one per hash)
+	double                    threshold_ms = 20.0;
+	vk::QueryPool             pool {};
+	vk::Device                device {};
+	uint64_t                  next = 0;
+	std::array<Record, Slots> records {};
+	std::atomic<int64_t>      printed {0};
+};
+static void StallDump(uint64_t reached);
+static State& Get() {
+	static State      state;
+	static const bool parsed = [] {
+		for (const char* at = std::getenv("KYTY_DISPATCH_TIMING"); at != nullptr && *at != '\0';) {
+			char* end = nullptr;
+			state.hashes.push_back(std::strtoull(at, &end, 16));
+			state.totals.emplace_back();
+			if (end == nullptr || (*end != ',' && *end != ';')) break;
+			at = end + 1;
+		}
+		if (const char* ms = std::getenv("KYTY_DISPATCH_TIMING_MS"); ms != nullptr && *ms != '\0')
+			state.threshold_ms = std::atof(ms);
+		if (!state.hashes.empty()) DeviceFault::g_stall_dump.store(&StallDump, std::memory_order_release);
+		return true;
+	}();
+	(void)parsed;
+	return state;
+}
+// Before the dispatch: a slot (UINT32_MAX: not timed).
+static uint32_t Begin(GraphicContext& graphics, vk::CommandBuffer command, uint64_t hash) {
+	auto& s = Get();
+	if (s.hashes.empty() || std::ranges::find(s.hashes, hash) == s.hashes.end()) return UINT32_MAX;
+	if (!s.pool) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = Slots * 2;
+		if (graphics.device.createQueryPool(&info, nullptr, &s.pool) != vk::Result::eSuccess) return UINT32_MAX;
+		s.device = graphics.device;
+	}
+	const uint64_t sequence = s.next++;
+	const uint32_t slot     = static_cast<uint32_t>(sequence % Slots) * 2;
+	s.records[slot / 2]     = {.tick = 0, .hash = hash, .sequence = sequence};
+	command.resetQueryPool(s.pool, slot, 2);
+	command.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, s.pool, slot);
+	return slot;
+}
+// After it: read once the tick's work completed.
+static void End(GraphicContext& graphics, CommandScheduler& scheduler, vk::CommandBuffer command, uint32_t slot,
+                uint64_t hash, uint32_t x, uint32_t y, uint32_t z) {
+	if (slot == UINT32_MAX) return;
+	auto& s = Get();
+	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, s.pool, slot + 1);
+	const double period = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+	const auto   tick   = scheduler.CurrentTick();
+	auto&        record = s.records[slot / 2];
+	record.tick         = tick;
+	record.x            = x;
+	record.y            = y;
+	record.z            = z;
+	scheduler.DeferOperation([&graphics, slot, hash, x, y, z, period, tick] {
+		auto&                   s = Get();
+		std::array<uint64_t, 2> stamps {};
+		if (graphics.device.getQueryPoolResults(s.pool, slot, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                        vk::QueryResultFlagBits::e64) != vk::Result::eSuccess ||
+		    stamps[1] < stamps[0])
+			return;
+		const auto ns    = static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period);
+		const auto index = static_cast<size_t>(std::ranges::find(s.hashes, hash) - s.hashes.begin());
+		auto&      t     = s.totals[index];
+		t.count.fetch_add(1, std::memory_order_relaxed);
+		t.ns.fetch_add(ns, std::memory_order_relaxed);
+		for (auto old = t.max_ns.load(std::memory_order_relaxed); ns > old && !t.max_ns.compare_exchange_weak(old, ns);) {}
+		if (static_cast<double>(ns) / 1e6 >= s.threshold_ms)
+			std::printf("DISPATCH-TIME %016llx %.1f ms tick %llu groups %u x %u x %u\n", static_cast<unsigned long long>(hash),
+			            static_cast<double>(ns) / 1e6, static_cast<unsigned long long>(tick), x, y, z);
+		const auto now  = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		auto       last = s.printed.load(std::memory_order_relaxed);
+		if (now - last < 5 || !s.printed.compare_exchange_strong(last, now)) return;
+		for (size_t i = 0; i < s.hashes.size(); ++i) {
+			auto&      sum   = s.totals[i];
+			const auto count = sum.count.exchange(0);
+			if (count == 0) continue;
+			std::printf("DISPATCH-TIMES %016llx: %llu, mean %.2f ms, max %.1f ms\n",
+			            static_cast<unsigned long long>(s.hashes[i]), static_cast<unsigned long long>(count),
+			            static_cast<double>(sum.ns.exchange(0)) / 1e6 / static_cast<double>(count),
+			            static_cast<double>(sum.max_ns.exchange(0)) / 1e6);
+		}
+		std::fflush(stdout);
+	});
+}
+// The timed dispatches past `reached` (the first few submissions), in recording order: done, started only (the GPU is
+// in it), or not started.
+static void StallDump(uint64_t reached) {
+	auto& s = Get();
+	if (!s.pool) return;
+	std::vector<const Record*> stalled;
+	for (const auto& record: s.records)
+		if (record.tick > reached && record.tick <= reached + 4) stalled.push_back(&record);
+	std::ranges::sort(stalled, {}, &Record::sequence);
+	uint32_t done = 0, shown = 0;
+	for (const auto* record: stalled) {
+		const auto              slot = static_cast<uint32_t>(record->sequence % Slots) * 2;
+		std::array<uint64_t, 4> values {}; // (value, availability) x 2
+		const auto              result =
+		    s.device.getQueryPoolResults(s.pool, slot, 2, sizeof(values), values.data(), 2 * sizeof(uint64_t),
+		                                 vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+		if (result != vk::Result::eSuccess && result != vk::Result::eNotReady) {
+			std::printf("STALL-TIME query read failed (%d)\n", static_cast<int>(result));
+			break;
+		}
+		const bool started = values[1] != 0, ended = values[3] != 0;
+		if (started && ended) {
+			++done;
+			continue;
+		}
+		if (shown++ < 12)
+			std::printf("STALL-TIME tick %llu #%llu %016llx groups %u x %u x %u: %s (%u timed dispatches done before it)\n",
+			            static_cast<unsigned long long>(record->tick), static_cast<unsigned long long>(record->sequence),
+			            static_cast<unsigned long long>(record->hash), record->x, record->y, record->z,
+			            started ? "STARTED, NOT ENDED" : "not started", done);
+	}
+	std::printf("STALL-TIME %zu timed dispatches past tick %llu, %u done\n", stalled.size(),
+	            static_cast<unsigned long long>(reached), done);
+	std::fflush(stdout);
+}
+} // namespace DispatchTiming
+
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
@@ -794,10 +944,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,
 			                          nullptr);
 		}
+		const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
+		                    program.shader_hash, 0, 0, 0);
 		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, 0, 0, 0, indirect_args);
 	} else {
+		const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
+		                    program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
 		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, thread_group_x,
 		                          thread_group_y, thread_group_z, 0);
 	}

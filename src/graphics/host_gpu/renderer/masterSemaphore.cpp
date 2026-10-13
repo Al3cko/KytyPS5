@@ -5,6 +5,8 @@
 #include "live-census.h"
 #include "device-fault.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
@@ -56,12 +58,25 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	// (A tick that does not come says every 5 s where the timeline is: a stalled GPU, 8 GB sim 10-12.)
-	constexpr uint64_t StallSeconds = 5;
+	// (A tick that does not come says every 5 s where the timeline is: a stalled GPU, 8 GB sim 10-12. KYTY_STALL_SECONDS:
+	// another period - under Windows' 2 s GPU timeout, a hung GPU is reported before the reset.)
+	static const uint64_t StallSeconds = [] {
+		const char* value = std::getenv("KYTY_STALL_SECONDS");
+		const auto  seconds = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+		return seconds != 0 ? seconds : uint64_t {5};
+	}();
 	for (uint32_t round = 1;; ++round) {
 		const auto result = m_graphics.device.waitSemaphores(&wait_info, StallSeconds * 1000000000ull);
 		if (result == vk::Result::eSuccess) break;
-		if (result == vk::Result::eErrorDeviceLost) DeviceFault::Report();
+		if (result == vk::Result::eErrorDeviceLost) {
+			// (A diagnostic's state too: what the GPU was in when it was reset, if it still reads.)
+			if (const auto dump = DeviceFault::g_stall_dump.load(std::memory_order_acquire); dump != nullptr) {
+				uint64_t now = 0;
+				(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &now);
+				dump(now);
+			}
+			DeviceFault::Report();
+		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eTimeout);
 		uint64_t now = 0;
 		(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &now);
