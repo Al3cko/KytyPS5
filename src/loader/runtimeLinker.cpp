@@ -21,6 +21,7 @@
 #include "loader/demonsSoulsGpuPages.h"
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsSceneGuard.h"
+#include "loader/demonsSoulsTouchGuard.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -1621,6 +1622,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsRenderSize::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
