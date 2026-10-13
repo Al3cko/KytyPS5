@@ -598,7 +598,8 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	info.pSignalSemaphores    = submit.signal_semaphores;
 	for (uint32_t i = 0; i < submit.signals; ++i) {
 		if (submit.signal_ticks[i] != submit.tick) continue;
-		DeviceFault::NoteSubmit((uint64_t)(submit.signal_semaphores[i]), submit.tick, submit.commands, submit.count); // NOLINT
+		DeviceFault::NoteSubmit((uint64_t)(submit.signal_semaphores[i]), submit.tick, submit.commands, submit.count, // NOLINT
+		                        submit.wait_semaphores, submit.wait_ticks, submit.waits);
 		break;
 	}
 	VkResult result;
@@ -784,7 +785,9 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		static_assert(sizeof(vk::CommandBuffer) == sizeof(VkCommandBuffer));
 		DeviceFault::NoteSubmit((uint64_t)(static_cast<VkSemaphore>(m_master.Handle())), tick, // NOLINT
 		                        reinterpret_cast<const VkCommandBuffer*>(buffers.data()),
-		                        static_cast<uint32_t>(entries.size()));
+		                        static_cast<uint32_t>(entries.size()),
+		                        reinterpret_cast<const VkSemaphore*>(submit.wait_semaphores.data()), submit.wait_ticks.data(),
+		                        submit.num_wait_semaphores);
 #endif
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);

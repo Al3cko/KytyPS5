@@ -63,9 +63,11 @@ public:
 	~TileManager();
 	KYTY_CLASS_NO_COPY(TileManager);
 
-	// The returned device-local buffer remains alive through the current scheduler tick.
+	// The returned device-local buffer remains alive through the current scheduler tick. (`host_source`: `tiled` is in
+	// system memory, the image staging ring: KYTY_TILER_TIMING counts it apart.)
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos);
+	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
+	                            bool host_source = false);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, std::span<const GpuTileInfo> infos);
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
@@ -130,6 +132,9 @@ private:
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
+	// KYTY_TILER_TIMING=1: the GPU time of each detile (timestamps after all earlier work and after it), summed.
+	[[nodiscard]] uint32_t TimingBegin(vk::CommandBuffer command);
+	void                   TimingEnd(vk::CommandBuffer command, uint32_t slot, uint64_t bytes, bool host_source);
 	void                       SwapBgra16(Result input, Result output, uint32_t pixels);
 
 	GraphicContext&                         m_graphics;
@@ -155,6 +160,8 @@ private:
 	std::vector<PooledScratch> m_scratch_pool;
 	uint64_t                   m_scratch_pool_bytes = 0;
 	uint64_t                   m_scratch_pool_budget = 0; // ScratchPoolBudget, at most a 32nd of the GPU's memory budget
+	vk::QueryPool              m_timing_pool         = nullptr;
+	uint32_t                   m_timing_next         = 0;
 };
 
 } // namespace Libs::Graphics

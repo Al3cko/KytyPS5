@@ -20,7 +20,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -64,6 +68,7 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 TileManager::~TileManager() {
+	if (m_timing_pool != nullptr) m_graphics.device.destroyQueryPool(m_timing_pool, nullptr);
 	for (const auto& pooled: m_scratch_pool) {
 		vmaDestroyBuffer(m_graphics.allocator, pooled.buffer, pooled.allocation);
 	}
@@ -415,9 +420,65 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	                        &barriers[1], 0, nullptr);
 }
 
+static constexpr uint32_t TimingSlots = 4096; // (pairs of timestamps)
+
+uint32_t TileManager::TimingBegin(vk::CommandBuffer command) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TILER_TIMING");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) return UINT32_MAX;
+	if (m_timing_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = TimingSlots * 2;
+		if (m_graphics.device.createQueryPool(&info, nullptr, &m_timing_pool) != vk::Result::eSuccess) return UINT32_MAX;
+	}
+	const uint32_t slot = (m_timing_next++ % TimingSlots) * 2;
+	command.resetQueryPool(m_timing_pool, slot, 2);
+	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timing_pool, slot);
+	return slot;
+}
+
+void TileManager::TimingEnd(vk::CommandBuffer command, uint32_t slot, uint64_t bytes, bool host_source) {
+	if (slot == UINT32_MAX) return;
+	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timing_pool, slot + 1);
+	struct Totals {
+		std::atomic<uint64_t> ns[2] {}, bytes[2] {}, count[2] {};
+		std::atomic<int64_t>  printed {0};
+	};
+	static Totals totals;
+	const double  period = m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+	m_scheduler.DeferOperation([this, slot, bytes, host_source, period] {
+		std::array<uint64_t, 2> stamps {};
+		if (m_graphics.device.getQueryPoolResults(m_timing_pool, slot, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                          vk::QueryResultFlagBits::e64) != vk::Result::eSuccess ||
+		    stamps[1] < stamps[0])
+			return;
+		const auto ns = static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period);
+		totals.ns[host_source].fetch_add(ns, std::memory_order_relaxed);
+		totals.bytes[host_source].fetch_add(bytes, std::memory_order_relaxed);
+		totals.count[host_source].fetch_add(1, std::memory_order_relaxed);
+		const auto now  = std::chrono::duration_cast<std::chrono::seconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		auto       last = totals.printed.load(std::memory_order_relaxed);
+		if (now - last < 5 || !totals.printed.compare_exchange_strong(last, now)) return;
+		for (int host = 1; host >= 0; --host) {
+			const auto b = totals.bytes[host].exchange(0), n = totals.ns[host].exchange(0),
+			           c = totals.count[host].exchange(0);
+			if (c == 0) continue;
+			std::printf("TILER detiles from %s memory: %llu, %.1f MiB in %.1f ms GPU (%.2f GB/s)\n",
+			            host != 0 ? "system" : "video", static_cast<unsigned long long>(c),
+			            static_cast<double>(b) / (1024.0 * 1024.0), static_cast<double>(n) / 1e6,
+			            n != 0 ? static_cast<double>(b) / static_cast<double>(n) : 0.0);
+		}
+	});
+}
+
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
-                                        std::span<const GpuTileInfo> infos) {
+                                        std::span<const GpuTileInfo> infos, bool host_source) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -426,8 +487,11 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
 	auto scratch = AllocateScratch((linear_capacity + 3u) & ~uint64_t {3});
 	DeferDestroy(scratch);
+	m_scheduler.EndRendering();
+	const auto timing = TimingBegin(m_scheduler.Current().Handle());
 	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
 	       true);
+	TimingEnd(m_scheduler.Current().Handle(), timing, tiled_capacity, host_source);
 	return {scratch.buffer, 0, linear_capacity};
 }
 

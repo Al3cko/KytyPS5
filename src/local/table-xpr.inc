@@ -1143,6 +1143,280 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 	table.gathered = &pair;
 }
 
+// KYTY_TABLE_WATCH=<hash>:<sgpr>:<offset>[:<limit>],... (or ;): a diagnostic of those programs' table dispatches. The
+// V# at the user data pointer s<sgpr>, s<sgpr+1> plus <offset>: its buffer's first dwords as guest memory holds them
+// before the blocks are made, printed ("ODD") when dword 2 exceeds <limit> (default 32), and every 4096th use. When the
+// block gives the program a copy in the table upload ring, the copy is compared with them ("RING MISMATCH") and again
+// once the GPU ran the dispatch ("RING CHANGED": the ring was reused under it); when it gives a cached buffer, a copy of
+// its bytes made on the GPU just before the dispatch is compared with them once it ran ("DEVICE MISMATCH": the buffer
+// held other bytes than the guest's). (The culling programs' plane loops run dword 2 times: a garbage count hung the
+// GPU, 10-13.)
+namespace TableWatchState {
+struct Watch {
+	uint64_t hash;
+	uint32_t sgpr, offset, limit;
+	uint64_t uses;
+	std::atomic<uint64_t> checked {0}, mismatches {0}; // (GPU-side comparisons done, failed)
+};
+struct Current {
+	Watch*                  watch = nullptr;
+	uint64_t                table = 0;
+	std::array<uint32_t, 4> words {};
+	std::array<uint32_t, 8> dwords {};
+	bool                    read   = false;
+	vk::DeviceAddress       device = 0;
+};
+// The last watched dispatches as they were recorded: a stall (DeviceFault::ReportStall) compares the stalled ones' block
+// and V# bytes in the ring with what the ring holds then ("STALL-WATCH": the hanging dispatch itself, whose own check
+// after it ran never comes).
+struct Recorded {
+	uint64_t                tick = 0, hash = 0;
+	vk::DeviceAddress       block_address = 0, device = 0;
+	const uint8_t*          block_host = nullptr; // (in the mapped ring)
+	std::vector<uint32_t>   block;
+	const uint8_t*          ring_host = nullptr; // the V#'s copy in the ring, if it is one
+	std::array<uint32_t, 8> ring {}, guest {};
+	uint64_t                indirect = 0;     // the arguments' guest address of an indirect dispatch
+	bool                    chained  = false; // no barrier before it (CommandBuffer::ComputeChainPending)
+};
+static std::mutex                g_recorded_mutex;
+static std::array<Recorded, 256> g_recorded;
+static size_t                    g_recorded_next = 0;
+thread_local size_t              g_recorded_last = SIZE_MAX; // (this thread's last, for TableWatchDispatch)
+static void StallDump(uint64_t reached) {
+	std::lock_guard lock(g_recorded_mutex);
+	for (size_t i = g_recorded_next > g_recorded.size() ? g_recorded_next - g_recorded.size() : 0; i < g_recorded_next; ++i) {
+		const auto& r = g_recorded[i % g_recorded.size()];
+		if (r.tick <= reached || r.tick > reached + 64) continue;
+		size_t first = r.block.size();
+		for (size_t n = 0; n < r.block.size() && first == r.block.size(); ++n)
+			if (std::memcmp(r.block_host + n * 4, &r.block[n], 4) != 0) first = n;
+		uint32_t block_now = 0;
+		if (first < r.block.size()) std::memcpy(&block_now, r.block_host + first * 4, 4);
+		std::array<uint32_t, 8> ring_now {};
+		if (r.ring_host != nullptr) std::memcpy(ring_now.data(), r.ring_host, sizeof(ring_now));
+		std::printf("STALL-WATCH tick %llu %016llx%s%s: block 0x%llx (%zu dwords) %s dword %zu %08x -> %08x; V# at 0x%llx "
+		            "(%s): guest %08x %08x %08x %08x, ring then %08x %08x %08x %08x, now %08x %08x %08x %08x\n",
+		            static_cast<unsigned long long>(r.tick), static_cast<unsigned long long>(r.hash),
+		            r.indirect != 0 ? " indirect" : "", r.chained ? " chained" : "",
+		            static_cast<unsigned long long>(r.block_address), r.block.size(),
+		            first < r.block.size() ? "CHANGED at" : "same, last", first < r.block.size() ? first : r.block.size(),
+		            first < r.block.size() ? r.block[first] : 0u, block_now, static_cast<unsigned long long>(r.device),
+		            r.ring_host != nullptr ? "ring" : "cached buffer", r.guest[0], r.guest[1], r.guest[2], r.guest[3],
+		            r.ring[0], r.ring[1], r.ring[2], r.ring[3], ring_now[0], ring_now[1], ring_now[2], ring_now[3]);
+	}
+	std::fflush(stdout);
+}
+static std::deque<Watch>& Watches() {
+	static std::deque<Watch> watches;
+	static const bool        parsed = [] {
+		const char* value = std::getenv("KYTY_TABLE_WATCH");
+		for (const char* at = value; at != nullptr && *at != '\0';) {
+			char*          end  = nullptr;
+			const uint64_t hash = std::strtoull(at, &end, 16);
+			if (end == nullptr || *end != ':') break;
+			const auto sgpr = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+			if (*end != ':') break;
+			const auto offset = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+			uint32_t   limit  = 32;
+			if (*end == ':') limit = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+			auto& watch  = watches.emplace_back();
+			watch.hash   = hash;
+			watch.sgpr   = sgpr;
+			watch.offset = offset;
+			watch.limit  = limit;
+			watch.uses   = 0;
+			if (*end != ',' && *end != ';') break;
+			at = end + 1;
+		}
+		if (!watches.empty()) DeviceFault::g_stall_dump.store(&StallDump, std::memory_order_release);
+		return true;
+	}();
+	(void)parsed;
+	return watches;
+}
+thread_local Current g_current;
+} // namespace TableWatchState
+
+// Before the blocks: the watched V# and its buffer's bytes.
+static void TableWatchBegin(const ShaderRecompiler::IR::CompiledShaderInfo& program, std::span<const uint32_t> user_data) {
+	auto& current = TableWatchState::g_current;
+	current.watch = nullptr;
+	auto& watches = TableWatchState::Watches();
+	if (watches.empty()) return;
+	for (auto& watch : watches) {
+		if (watch.hash != program.shader_hash || watch.sgpr + 1 >= user_data.size()) continue;
+		current       = {.watch = &watch};
+		current.table = user_data[watch.sgpr] | uint64_t {user_data[watch.sgpr + 1] & 0xffffu} << 32u;
+		current.read  = Libs::LibKernel::Memory::TryReadBackingToHost(current.table + watch.offset, current.words.data(), 16);
+		if (current.read) {
+			ShaderBufferResource descriptor;
+			std::copy_n(current.words.begin(), 4, descriptor.fields);
+			current.read = descriptor.Base48() != 0 &&
+			               Libs::LibKernel::Memory::TryReadBackingToHost(descriptor.Base48(), current.dwords.data(),
+			                                                             sizeof(current.dwords));
+		}
+		return;
+	}
+}
+
+// TableBlocks: the device address a block gives the buffer of these V# words.
+static void TableWatchNote(const std::array<uint32_t, 4>& words, vk::DeviceAddress device) {
+	auto& current = TableWatchState::g_current;
+	if (current.watch != nullptr && current.device == 0 && words == current.words) current.device = device;
+}
+
+// After the blocks, before the dispatch is recorded into `vk_buffer`: printed, and what the GPU reads checked once it ran
+// the dispatch (`scheduler`: the main executor's own translation, else no check). The program's block (`block`, copied
+// to `block_address` in the ring) is checked the same way ("BLOCK CHANGED": the device addresses it reads were
+// overwritten before it ran; a ring reuse between the GPU finishing and the check running would show too), and kept
+// for a stall (TableWatchState::StallDump). The GPU copy of a cached buffer's bytes needs KYTY_TABLE_WATCH_GPU=1: its
+// barrier orders the dispatch after all earlier work, which would hide a missing dependency.
+static void TableWatchEnd(const StreamBuffer& upload, BufferCache& cache, GraphicContext& graphics,
+                          CommandScheduler* scheduler, vk::CommandBuffer vk_buffer, vk::DeviceAddress block_address,
+                          std::span<const uint32_t> block) {
+	auto& current = TableWatchState::g_current;
+	if (current.watch == nullptr) return;
+	if (const auto ring_base = upload.BufferDeviceAddress(), bytes = block.size_bytes();
+	    scheduler != nullptr && block_address >= ring_base && bytes != 0 &&
+	    block_address - ring_base + bytes <= upload.Mapped().size()) {
+		const auto* at = upload.Mapped().data() + (block_address - ring_base);
+		if (std::memcmp(at, block.data(), bytes) != 0)
+			std::printf("TABLE_WATCH %016llx BLOCK MISMATCH at record: 0x%llx\n",
+			            static_cast<unsigned long long>(current.watch->hash),
+			            static_cast<unsigned long long>(block_address));
+		scheduler->DeferOperation([at, copy = std::vector<uint32_t>(block.begin(), block.end()), hash = current.watch->hash,
+		                           block_address] {
+			if (std::memcmp(at, copy.data(), copy.size() * sizeof(uint32_t)) == 0) return;
+			size_t first = 0;
+			while (first < copy.size() && std::memcmp(at + first * 4, &copy[first], 4) == 0) ++first;
+			uint32_t now = 0;
+			std::memcpy(&now, at + first * 4, 4);
+			std::printf("TABLE_WATCH %016llx BLOCK CHANGED before the GPU finished: 0x%llx dword %zu of %zu was %08x now "
+			            "%08x\n",
+			            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(block_address), first,
+			            copy.size(), first < copy.size() ? copy[first] : 0u, now);
+		});
+	}
+	auto& watch   = *current.watch;
+	current.watch = nullptr;
+	const auto              ring_base = upload.BufferDeviceAddress();
+	const auto              mapped    = upload.Mapped();
+	const bool              in_ring   = current.device >= ring_base && !mapped.empty() &&
+	                                    current.device - ring_base + sizeof(current.dwords) <= mapped.size();
+	std::array<uint32_t, 8> ring {};
+	if (in_ring) std::memcpy(ring.data(), mapped.data() + (current.device - ring_base), sizeof(ring));
+	ShaderBufferResource descriptor;
+	std::copy_n(current.words.begin(), 4, descriptor.fields);
+	const uint64_t bytes   = descriptor.Stride() != 0 ? uint64_t {descriptor.Stride()} * descriptor.NumRecords()
+	                                                  : uint64_t {descriptor.NumRecords()};
+	bool           differs = false;
+	for (uint64_t n = 0; in_ring && current.read && n < std::min<uint64_t>(bytes / 4, ring.size()); ++n)
+		differs |= ring[n] != current.dwords[n];
+	if (const auto block_bytes = block.size_bytes(); scheduler != nullptr && block_address >= ring_base && block_bytes != 0 &&
+	                                                 block_address - ring_base + block_bytes <= mapped.size()) {
+		std::lock_guard lock(TableWatchState::g_recorded_mutex);
+		auto& recorded = TableWatchState::g_recorded[TableWatchState::g_recorded_next++ % TableWatchState::g_recorded.size()];
+		recorded.tick          = scheduler->CurrentTick();
+		recorded.hash          = watch.hash;
+		recorded.block_address = block_address;
+		recorded.device        = current.device;
+		recorded.block_host    = mapped.data() + (block_address - ring_base);
+		recorded.block.assign(block.begin(), block.end());
+		recorded.ring_host = in_ring ? mapped.data() + (current.device - ring_base) : nullptr;
+		recorded.ring      = ring;
+		recorded.guest     = current.dwords;
+		recorded.indirect  = 0;
+		recorded.chained   = false;
+		TableWatchState::g_recorded_last = TableWatchState::g_recorded_next - 1;
+	}
+	const bool odd = !current.read || current.dwords[2] > watch.limit || (in_ring && ring[2] > watch.limit);
+	if (odd || differs || (watch.uses & 4095u) == 0)
+		std::printf("TABLE_WATCH %016llx use %llu (checked %llu, mismatches %llu): table 0x%llx V# %08x %08x %08x %08x "
+		            "bytes %llu %s 0x%llx: %s%s guest %08x %08x %08x %08x %08x %08x %08x %08x ring %08x %08x %08x %08x\n",
+		            static_cast<unsigned long long>(watch.hash), static_cast<unsigned long long>(watch.uses),
+		            static_cast<unsigned long long>(watch.checked.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(watch.mismatches.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(current.table), current.words[0], current.words[1], current.words[2],
+		            current.words[3], static_cast<unsigned long long>(bytes),
+		            in_ring ? "ring" : current.device != 0 ? "device" : "unnoted",
+		            static_cast<unsigned long long>(current.device), odd ? "ODD" : "ok", differs ? " RING MISMATCH" : "",
+		            current.dwords[0], current.dwords[1], current.dwords[2], current.dwords[3], current.dwords[4],
+		            current.dwords[5], current.dwords[6], current.dwords[7], ring[0], ring[1], ring[2], ring[3]);
+	++watch.uses;
+	if (in_ring && scheduler != nullptr) {
+		const auto* at = mapped.data() + (current.device - ring_base);
+		scheduler->DeferOperation([at, ring, hash = watch.hash, device = current.device] {
+			std::array<uint32_t, 8> now {};
+			std::memcpy(now.data(), at, sizeof(now));
+			if (now != ring)
+				std::printf("TABLE_WATCH %016llx RING CHANGED before the GPU finished: 0x%llx was %08x %08x %08x %08x, "
+				            "now %08x %08x %08x %08x\n",
+				            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(device), ring[0],
+				            ring[1], ring[2], ring[3], now[0], now[1], now[2], now[3]);
+		});
+	}
+	static const bool gpu_copy = [] {
+		const char* value = std::getenv("KYTY_TABLE_WATCH_GPU");
+		return value != nullptr && value[0] == '1';
+	}();
+	const auto base = descriptor.Base48();
+	auto*      owner =
+	    gpu_copy && !in_ring && current.device != 0 && current.read && scheduler != nullptr && bytes >= sizeof(current.dwords)
+	              ? cache.GetBufferIfLive(cache.RegisteredBuffer(base, sizeof(current.dwords)))
+	              : nullptr;
+	if (owner == nullptr || owner->BufferDeviceAddress() + owner->Offset(base) != current.device) return;
+	static std::unique_ptr<StreamBuffer> readback;
+	if (!readback)
+		readback = std::make_unique<StreamBuffer>(graphics, *scheduler, MemoryUsage::Download, uint64_t {1} << 20u,
+		                                          vk::BufferUsageFlagBits::eTransferDst);
+	const auto [host, offset] = readback->Map(sizeof(current.dwords), 16, false);
+	if (host == nullptr) return;
+	readback->Commit();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                          vk::DependencyFlags {}, 1, &before, 0, nullptr, 0, nullptr);
+	vk::BufferCopy copy {};
+	copy.srcOffset = owner->Offset(base);
+	copy.dstOffset = offset;
+	copy.size      = sizeof(current.dwords);
+	vk_buffer.copyBuffer(owner->Handle(), readback->Handle(), 1, &copy);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                          vk::DependencyFlags {}, 1, &after, 0, nullptr, 0, nullptr);
+	scheduler->DeferOperation([buffer = readback.get(), host, offset, guest = current.dwords, hash = watch.hash, &watch,
+	                           device = current.device, base] {
+		buffer->Invalidate(offset, sizeof(guest));
+		std::array<uint32_t, 8> gpu {};
+		std::memcpy(gpu.data(), host, sizeof(gpu));
+		watch.checked.fetch_add(1, std::memory_order_relaxed);
+		if (gpu != guest) watch.mismatches.fetch_add(1, std::memory_order_relaxed);
+		if (gpu != guest)
+			std::printf("TABLE_WATCH %016llx DEVICE MISMATCH 0x%llx (guest 0x%llx): guest %08x %08x %08x %08x %08x %08x "
+			            "%08x %08x gpu %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(device),
+			            static_cast<unsigned long long>(base), guest[0], guest[1], guest[2], guest[3], guest[4], guest[5],
+			            guest[6], guest[7], gpu[0], gpu[1], gpu[2], gpu[3], gpu[4], gpu[5], gpu[6], gpu[7]);
+	});
+}
+
+// The dispatch TableWatchEnd recorded last on this thread: indirect (its arguments' address) and chained.
+static void TableWatchDispatch(uint64_t indirect, bool chained) {
+	auto& last = TableWatchState::g_recorded_last;
+	if (last == SIZE_MAX) return;
+	std::lock_guard lock(TableWatchState::g_recorded_mutex);
+	if (TableWatchState::g_recorded_next - last <= TableWatchState::g_recorded.size()) {
+		auto& recorded    = TableWatchState::g_recorded[last % TableWatchState::g_recorded.size()];
+		recorded.indirect = indirect;
+		recorded.chained  = chained;
+	}
+	last = SIZE_MAX;
+}
+
 bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
                                  std::array<vk::DeviceAddress, 2>& blocks, bool* writes) {
 	using Kind         = ShaderRecompiler::IR::TablePlan::Operand::Kind;
@@ -1424,6 +1698,10 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 			block[plan.BufferDword(i) + 3] = word;
 			block[plan.BufferDword(i) + 4] = stride;
 		}
+		if (TableWatchState::g_current.watch != nullptr)
+			for (size_t i = 0; i < plan.buffers.size(); ++i)
+				TableWatchNote(entries[i].first,
+				               block[plan.BufferDword(i)] | uint64_t {block[plan.BufferDword(i) + 1]} << 32u);
 		if (plan.BlockDwords() != 0) // (a stage with neither slots nor buffers reads no block)
 			blocks[st] = upload.BufferDeviceAddress() + upload.Copy(block.data(), block.size() * sizeof(uint32_t), 16);
 	}
@@ -2042,6 +2320,30 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		            })),
 		            program->table_plan.images.size(), program->table_plan.samplers.size());
 	}
+	// KYTY_TABLE_DENY=<hash>,... (or ;): those programs' dispatches take the normal path (a bisection of the table
+	// dispatches: the culling chain's GPU hangs at 2-2, 10-13).
+	static const std::vector<uint64_t> denied = [] {
+		std::vector<uint64_t> list;
+		for (const char* at = std::getenv("KYTY_TABLE_DENY"); at != nullptr && *at != '\0';) {
+			char* end = nullptr;
+			list.push_back(std::strtoull(at, &end, 16));
+			if (end == nullptr || (*end != ',' && *end != ';')) break;
+			at = end + 1;
+		}
+		return list;
+	}();
+	if (!denied.empty() && std::ranges::find(denied, pair.programs[0]->shader_hash) != denied.end())
+		return m_dispatch_declined = "table: denied", false;
+	// KYTY_TABLE_DENY_RANGE=<lo>-<hi> (hex): the programs whose hash is in [lo, hi] too (a bisection by hash).
+	static const std::pair<uint64_t, uint64_t> denied_range = [] {
+		const char* value = std::getenv("KYTY_TABLE_DENY_RANGE");
+		if (value == nullptr || *value == '\0') return std::pair<uint64_t, uint64_t> {1, 0};
+		char*          end = nullptr;
+		const uint64_t lo  = std::strtoull(value, &end, 16);
+		return std::pair<uint64_t, uint64_t> {lo, end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : lo};
+	}();
+	if (const auto hash = pair.programs[0]->shader_hash; hash >= denied_range.first && hash <= denied_range.second)
+		return m_dispatch_declined = "table: denied", false;
 	if (pair.pipeline == nullptr) {
 		const auto* pipeline = pipelines.TryCreateComputePipeline(*pair.compute, pair.compute_program);
 		{
@@ -2074,7 +2376,11 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	auto&                            cache          = m_context.GetBufferCache();
 	TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
 	const auto                       registration   = cache.RegistrationEpoch(); // (as TableDraw's)
-	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return m_dispatch_declined = "table: blocks", false;
+	TableWatchBegin(*pair.programs[0], user_data[0]);
+	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) {
+		TableWatchState::g_current.watch = nullptr;
+		return m_dispatch_declined = "table: blocks", false;
+	}
 	vk::Buffer indirect_buffer = nullptr;
 	uint64_t   indirect_offset = 0;
 	if (indirect_args != 0) {
@@ -2096,6 +2402,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	buffer.EndRendering();
 	const bool chain     = DemonsSouls::IsSupportedGame();
 	const auto vk_buffer = chain ? buffer.ChainHandle() : buffer.Handle();
+	TableWatchEnd(cache.GetTableUploadBuffer(), cache, m_context.GetGraphics(),
+	              Role() == 0 && Spec::Current() == nullptr ? &m_context.GetCommandScheduler() : nullptr, vk_buffer,
+	              blocks[0], pair.programs[0]->table_plan.BlockDwords() != 0 ? std::span<const uint32_t> {OwnTable().blocks[0]}
+	                                                                         : std::span<const uint32_t> {});
 	// (As a draw's: the set's images as its last dispatch's transit left them, while no image changed since.)
 	auto&      dispatch_textures = m_context.GetTextureCache();
 	const bool own_transit       = Role() == 0 && Spec::Current() == nullptr;
@@ -2124,6 +2434,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		                        push_data.dwords.data());
 	}
 	const bool continues_chain = chain && buffer.ComputeChainPending();
+	TableWatchDispatch(indirect_args, continues_chain);
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (indirect_args != 0) {
@@ -2136,17 +2447,29 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		args_barrier.buffer              = indirect_buffer;
 		args_barrier.offset              = indirect_offset;
 		args_barrier.size                = 3u * sizeof(uint32_t);
-		if (!continues_chain)
+		// (KYTY_INDIRECT_ARGS_BARRIER=1: also within a chain of dispatches - a test of whether the arguments a dispatch
+		// before wrote were read before they landed: the culling chain's GPU hangs, 10-13.)
+		static const bool args_barrier_always = [] {
+			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (!continues_chain || args_barrier_always)
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, 0, 0, 0, indirect_args);
 	} else if (thread_dimensions) {
 		// Thread counts: the groups that cover them, as the normal path's.
 		const auto& r      = cs.cs_regs;
 		const auto  groups = [](uint32_t threads, uint32_t size) { return (threads + std::max(size, 1u) - 1u) / std::max(size, 1u); };
 		vk_buffer.dispatch(groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y), groups(groups_z, r.num_thread_z));
+		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash,
+		                          groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y),
+		                          groups(groups_z, r.num_thread_z), 0);
 	} else {
 		vk_buffer.dispatch(groups_x, groups_y, groups_z);
+		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, groups_x, groups_y,
+		                          groups_z, 0);
 	}
 	if (chain) buffer.ContinueComputeChain();
 	else ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

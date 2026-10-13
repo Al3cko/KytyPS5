@@ -2359,7 +2359,17 @@ bool BufferCache::RefillImageStaging(const Buffer& ring, uint64_t offset, uint64
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<StagingPiece>& pieces,
-                                                           uint64_t total) {
+                                                           uint64_t total, const char** why) {
+	static std::atomic<uint32_t> reports {0};
+	const auto refuse = [&](const char* reason, uint64_t vaddr, uint64_t size, const Buffer* owner) {
+		if (why != nullptr) *why = reason;
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 32)
+			std::printf("StageImagePieces refused (%s): piece 0x%llx size 0x%llx, owner 0x%llx size 0x%llx\n", reason,
+			            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+			            static_cast<unsigned long long>(owner != nullptr ? owner->CpuAddress() : 0),
+			            static_cast<unsigned long long>(owner != nullptr ? owner->Size() : 0));
+		return std::pair<Buffer*, uint64_t> {nullptr, 0};
+	};
 	for (const auto& piece: pieces) {
 		if (!GuestRange {piece.vaddr, piece.size}.Valid() || piece.offset > total ||
 		    piece.size > total - piece.offset) {
@@ -2367,13 +2377,12 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 		}
 		DrainGuestReadback(piece.vaddr, piece.size);
 		const auto* owner = m_page_table.Find(piece.vaddr >> PageTable::kPageBits);
-		if ((owner != nullptr && *owner) || IsRegionGpuModified(piece.vaddr, piece.size)) {
-			return {nullptr, 0};
-		}
+		if (owner != nullptr && *owner) return refuse("owner", piece.vaddr, piece.size, &m_slot_buffers[*owner]);
+		if (IsRegionGpuModified(piece.vaddr, piece.size)) return refuse("gpu", piece.vaddr, piece.size, nullptr);
 	}
 	auto [staging, stage_offset] = m_staging_buffer.Map(total, 16);
 	if (staging == nullptr) {
-		return {nullptr, 0};
+		return refuse("map", 0, total, nullptr);
 	}
 	const bool async = kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2 &&
 	                   m_staging_buffer.IsCoherent();

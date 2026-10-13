@@ -1657,7 +1657,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (!plan.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
-			                        plan.LinearSize(), plan.tiles);
+			                        plan.LinearSize(), plan.tiles, source.Usage() == MemoryUsage::Upload);
 		}
 		if (plan.swap_bgra16) {
 			linear = m_tiler.SwapBgra16(linear);
@@ -1678,7 +1678,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (info.IsTiled()) {
 		const auto tiles = BuildDepthTiles(info);
 		linear =
-		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles);
+		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles,
+		                   source.Usage() == MemoryUsage::Upload);
 	}
 	const auto transfer_bytes = DepthAspectTransferBytes(info.pixel_format);
 	if (transfer_bytes != info.bytes_per_block) {
@@ -1752,7 +1753,8 @@ void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_o
 		tiles.back().surface_z = layer;
 	}
 	const auto linear =
-	    m_tiler.Detile(source.Handle(), source_offset, info.stencil.size, info.stencil.size, tiles);
+	    m_tiler.Detile(source.Handle(), source_offset, info.stencil.size, info.stencil.size, tiles,
+	                   source.Usage() == MemoryUsage::Upload);
 	for (auto& copy: copies) {
 		copy.bufferOffset += linear.offset;
 	}
@@ -2069,9 +2071,13 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 		}
 		total = pieces.back().offset + pieces.back().size;
 	}
-	const auto [source, source_offset] = m_buffer_cache.StageImagePieces(pieces, total);
+	const char* refused = nullptr;
+	const auto [source, source_offset] = m_buffer_cache.StageImagePieces(pieces, total, &refused);
 	if (source == nullptr) {
-		return PartialFail("depth_stage");
+		return PartialFail(refused == nullptr        ? "depth_stage"
+		                   : refused[0] == 'o' ? "depth_stage:owner"
+		                   : refused[0] == 'g' ? "depth_stage:gpu"
+		                                       : "depth_stage:map");
 	}
 	// The picked layers, packed: as the whole path's copies and tiles, at their own layer.
 	std::vector<vk::BufferImageCopy> copies(picked.size());
@@ -2094,7 +2100,8 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 			                 info.extent.width, info.extent.height, 1, info.pitch});
 			tiles.back().surface_z = picked[i];
 		}
-		linear = m_tiler.Detile(source->Handle(), source_offset, total, slice * picked.size(), tiles);
+		linear = m_tiler.Detile(source->Handle(), source_offset, total, slice * picked.size(), tiles,
+		                        source->Usage() == MemoryUsage::Upload);
 	}
 	for (auto& copy: copies) {
 		copy.bufferOffset += linear.offset;
@@ -2250,7 +2257,8 @@ bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint6
 	if (source == nullptr) {
 		return PartialFail("stage");
 	}
-	const auto linear = m_tiler.Detile(source->Handle(), source_offset, total, linear_total, tiles);
+	const auto linear = m_tiler.Detile(source->Handle(), source_offset, total, linear_total, tiles,
+	                                   source->Usage() == MemoryUsage::Upload);
 	for (auto& region: regions) {
 		region.bufferOffset += linear.offset;
 	}

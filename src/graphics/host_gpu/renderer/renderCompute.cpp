@@ -33,6 +33,7 @@
 #include <unordered_map>
 #include <xxhash.h>
 #include "xpr-capture.h"
+#include "device-fault.h"
 #include "speculation-state.h"
 #include "live-census.h"
 #include "live-counters.h"
@@ -782,15 +783,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		args_barrier.buffer              = indirect_buffer;
 		args_barrier.offset              = indirect_offset;
 		args_barrier.size                = 3u * sizeof(uint32_t);
-		if (!continues_chain) {
+		// (KYTY_INDIRECT_ARGS_BARRIER=1: also within a chain of dispatches, as TableDispatch's.)
+		static const bool args_barrier_always = [] {
+			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (!continues_chain || args_barrier_always) {
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 			                          vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,
 			                          nullptr);
 		}
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, 0, 0, 0, indirect_args);
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, thread_group_x,
+		                          thread_group_y, thread_group_z, 0);
 	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.

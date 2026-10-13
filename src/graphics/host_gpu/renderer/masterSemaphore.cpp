@@ -69,6 +69,13 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		            static_cast<unsigned long long>(tick), static_cast<unsigned long long>(round * StallSeconds),
 		            static_cast<unsigned long long>(now));
 		std::fflush(stdout);
+		if (round == 1) {
+			DeviceFault::ReportStall((uint64_t)(static_cast<VkSemaphore>(m_semaphore)), now, [&](uint64_t semaphore) { // NOLINT
+				uint64_t value = 0;
+				(void)m_graphics.device.getSemaphoreCounterValue(vk::Semaphore(reinterpret_cast<VkSemaphore>(semaphore)), &value);
+				return value;
+			});
+		}
 	}
 	Refresh();
 }

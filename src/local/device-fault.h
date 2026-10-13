@@ -55,6 +55,8 @@ struct Breadcrumbs {
 	struct Submission {
 		uint64_t              timeline = 0, tick = 0;
 		std::vector<uint64_t> pipelines;
+		// What it waited for: (semaphore, value) pairs.
+		std::vector<std::pair<uint64_t, uint64_t>> waits;
 	};
 	std::array<Submission, 32> submitted;
 	size_t                     next = 0;
@@ -142,13 +144,17 @@ inline void NotePipeline(VkPipeline pipeline, std::string what) {
 }
 
 // The buffers' binds, filed under the submission (`timeline` signalled to `tick`).
-inline void NoteSubmit(uint64_t timeline, uint64_t tick, const VkCommandBuffer* commands, uint32_t count) {
+inline void NoteSubmit(uint64_t timeline, uint64_t tick, const VkCommandBuffer* commands, uint32_t count,
+                       const VkSemaphore* wait_semaphores = nullptr, const uint64_t* wait_values = nullptr,
+                       uint32_t waits = 0) {
 	if (!BreadcrumbsOn()) return;
 	std::lock_guard lock(g_breadcrumbs.mutex);
 	auto&           entry = g_breadcrumbs.submitted[g_breadcrumbs.next++ % g_breadcrumbs.submitted.size()];
 	entry.timeline        = timeline;
 	entry.tick            = tick;
 	entry.pipelines.clear();
+	entry.waits.clear();
+	for (uint32_t i = 0; i < waits; ++i) entry.waits.emplace_back((uint64_t)(wait_semaphores[i]), wait_values[i]); // NOLINT
 	for (uint32_t i = 0; i < count; ++i) {
 		const auto found = g_breadcrumbs.open.find(commands[i]);
 		if (found == g_breadcrumbs.open.end()) continue;
@@ -321,6 +327,85 @@ inline void AppendCheckpoints(std::string& text) {
 			       static_cast<unsigned long long>(key), PipelineName(key));
 		}
 	}
+}
+
+// A diagnostic's report of its own state for the work past `reached` (KYTY_TABLE_WATCH: what the stalled dispatches'
+// blocks held when they were recorded and hold now), called once per stall.
+inline std::atomic<void (*)(uint64_t reached)> g_stall_dump {nullptr};
+
+// The last dispatches recorded (the render thread's; a stall reads them unlocked, a torn entry is possible): their
+// submission tick, program and size, for ReportStall. (The culling chain's TDR at 2-2, 10-13: its inputs were intact.)
+struct DispatchNote {
+	uint64_t tick = 0, hash = 0, indirect = 0;
+	uint32_t x = 0, y = 0, z = 0;
+};
+inline std::array<DispatchNote, 4096> g_dispatches;
+inline std::atomic<size_t>            g_dispatch_next {0};
+inline void NoteDispatch(uint64_t tick, uint64_t hash, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
+	if (!BreadcrumbsOn()) return;
+	const auto at = g_dispatch_next.fetch_add(1, std::memory_order_relaxed);
+	g_dispatches[at % g_dispatches.size()] = {.tick = tick, .hash = hash, .indirect = indirect, .x = x, .y = y, .z = z};
+}
+
+// A timeline that stopped (MasterSemaphore::Wait's STALL): the submissions of it the GPU has not finished (the first
+// few), each with what it waits for and where those semaphores are now (`counter`: a semaphore's current value).
+// The 8 GB simulation froze with everything submitted and no thread in a binding (10-13): is the first unfinished
+// submission waiting for a semaphore that never comes (a sparse binding's, WaitBeforeNextSubmit), or did the GPU stall?
+template <typename Counter>
+inline void ReportStall(uint64_t timeline, uint64_t reached, Counter&& counter) {
+	if (const auto dump = g_stall_dump.load(std::memory_order_acquire); dump != nullptr) {
+		static std::atomic<uint64_t> dumped {UINT64_MAX};
+		if (dumped.exchange(reached) != reached) dump(reached);
+	}
+	if (!BreadcrumbsOn()) return;
+	std::string text;
+	{
+		std::lock_guard lock(g_breadcrumbs.mutex);
+		const auto      count = std::min(g_breadcrumbs.next, g_breadcrumbs.submitted.size());
+		uint32_t        shown = 0;
+		for (size_t i = g_breadcrumbs.next - count; i < g_breadcrumbs.next && shown < 4; ++i) {
+			const auto& entry = g_breadcrumbs.submitted[i % g_breadcrumbs.submitted.size()];
+			if (entry.timeline != timeline || entry.tick <= reached) continue;
+			++shown;
+			Append(text, "  STALL submission tick %llu: %zu pipelines, %zu waits\n", static_cast<unsigned long long>(entry.tick),
+			       entry.pipelines.size(), entry.waits.size());
+			for (const auto& [semaphore, value]: entry.waits)
+				Append(text, "    waits for semaphore 0x%llx >= %llu, now %llu%s\n", static_cast<unsigned long long>(semaphore),
+				       static_cast<unsigned long long>(value), static_cast<unsigned long long>(counter(semaphore)),
+				       semaphore == timeline ? " (this timeline)" : "");
+		}
+		if (shown == 0) Append(text, "  STALL: no submission after tick %llu in the last %zu\n", static_cast<unsigned long long>(reached), count);
+	}
+	// The dispatches of the first unfinished submissions, by program: how many, the largest (groups).
+	{
+		struct Sum {
+			uint64_t tick, hash;
+			uint32_t count = 0, indirect = 0;
+			uint64_t largest = 0;
+			uint32_t x = 0, y = 0, z = 0;
+		};
+		std::vector<Sum> sums;
+		const auto       next = g_dispatch_next.load(std::memory_order_relaxed);
+		for (size_t i = next > g_dispatches.size() ? next - g_dispatches.size() : 0; i < next; ++i) {
+			const auto note = g_dispatches[i % g_dispatches.size()];
+			if (note.tick <= reached || note.tick > reached + 4) continue;
+			auto it = std::find_if(sums.begin(), sums.end(), [&](const Sum& s) { return s.tick == note.tick && s.hash == note.hash; });
+			if (it == sums.end()) it = sums.insert(sums.end(), Sum {.tick = note.tick, .hash = note.hash});
+			++it->count;
+			if (note.indirect != 0) ++it->indirect;
+			const uint64_t groups = uint64_t {note.x} * note.y * note.z;
+			if (groups >= it->largest) {
+				it->largest = groups;
+				it->x = note.x, it->y = note.y, it->z = note.z;
+			}
+		}
+		for (const auto& s: sums)
+			Append(text, "    STALL dispatches tick %llu cs %016llx: %u (%u indirect), largest %llu groups (%u x %u x %u)\n",
+			       static_cast<unsigned long long>(s.tick), static_cast<unsigned long long>(s.hash), s.count, s.indirect,
+			       static_cast<unsigned long long>(s.largest), s.x, s.y, s.z);
+	}
+	std::fwrite(text.data(), 1, text.size(), stdout);
+	std::fflush(stdout);
 }
 
 // Once, at the first sign of the loss (any thread); the others wait until it is written.

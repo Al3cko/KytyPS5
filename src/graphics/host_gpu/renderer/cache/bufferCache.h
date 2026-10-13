@@ -80,6 +80,7 @@ public:
 			case MemoryUsage::Stream: return m_stream_buffer;
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
+			case MemoryUsage::SparseDeviceLocal: break;
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
@@ -119,8 +120,9 @@ public:
 		uint64_t size   = 0;
 		uint64_t offset = 0;
 	};
+	// (`why`: what refused, when nothing is staged - "owner", "gpu" or "map".)
 	[[nodiscard]] std::pair<Buffer*, uint64_t> StageImagePieces(const std::vector<StagingPiece>& pieces,
-	                                                            uint64_t total);
+	                                                            uint64_t total, const char** why = nullptr);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
