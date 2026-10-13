@@ -2291,6 +2291,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return {&m_staging_buffer, stage_offset};
 }
 
+bool BufferCache::BufferHoldsRange(uint64_t vaddr, uint64_t size) {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size);
+}
+
 void BufferCache::ApplyImageProtects() {
 	for (const auto& range: m_image_protects) m_image_protect_manager->SyncProtection(range.address, range.size);
 	m_image_protects.clear();
@@ -2376,9 +2381,13 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 			EXIT("BufferCache: invalid image staging piece\n");
 		}
 		DrainGuestReadback(piece.vaddr, piece.size);
-		const auto* owner = m_page_table.Find(piece.vaddr >> PageTable::kPageBits);
-		if (owner != nullptr && *owner) return refuse("owner", piece.vaddr, piece.size, &m_slot_buffers[*owner]);
-		if (IsRegionGpuModified(piece.vaddr, piece.size)) return refuse("gpu", piece.vaddr, piece.size, nullptr);
+		// (A cached buffer over a piece holds no newer bytes than guest memory where none of them is GPU-written: the
+		// buffer only takes CPU writes from it. Pieces in one refused before, and the whole image was uploaded: the
+		// shadow-map pool at 4-2, inside a buffer over a texture pool, 320 MiB at every layer the game streamed.)
+		if (IsRegionGpuModified(piece.vaddr, piece.size)) {
+			const auto* owner = m_page_table.Find(piece.vaddr >> PageTable::kPageBits);
+			return refuse("gpu", piece.vaddr, piece.size, owner != nullptr && *owner ? &m_slot_buffers[*owner] : nullptr);
+		}
 	}
 	auto [staging, stage_offset] = m_staging_buffer.Map(total, 16);
 	if (staging == nullptr) {

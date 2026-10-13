@@ -478,21 +478,35 @@ void TileManager::TimingEnd(vk::CommandBuffer command, uint32_t slot, uint64_t b
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
-                                        std::span<const GpuTileInfo> infos, bool host_source) {
+                                        std::span<const GpuTileInfo> infos, bool host_source,
+                                        bool reuse_scratch) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	const uint64_t        source_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
-	auto scratch = AllocateScratch((linear_capacity + 3u) & ~uint64_t {3});
-	DeferDestroy(scratch);
+	const uint64_t size = (linear_capacity + 3u) & ~uint64_t {3};
+	vk::Buffer     output {};
+	// (After Prepare, whose parameter ring may submit the tick: a buffer is reused only in the tick it is kept through.
+	// Record's first barrier waits for every earlier command, the reused buffer's readers.)
+	if (reuse_scratch && m_reused_scratch.buffer != vk::Buffer {} && m_reused_tick == m_scheduler.CurrentTick() &&
+	    m_reused_scratch.size >= size) {
+		output = m_reused_scratch.buffer;
+	} else {
+		auto scratch = AllocateScratch(size);
+		DeferDestroy(scratch);
+		output = scratch.buffer;
+		if (reuse_scratch) {
+			m_reused_scratch = {scratch.buffer, 0, ScratchCapacity(size)};
+			m_reused_tick    = m_scheduler.CurrentTick();
+		}
+	}
 	m_scheduler.EndRendering();
 	const auto timing = TimingBegin(m_scheduler.Current().Handle());
-	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
-	       true);
+	Record(tiled, tiled_offset, tiled_capacity, output, 0, size, dispatches, true);
 	TimingEnd(m_scheduler.Current().Handle(), timing, tiled_capacity, host_source);
-	return {scratch.buffer, 0, linear_capacity};
+	return {output, 0, linear_capacity};
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,

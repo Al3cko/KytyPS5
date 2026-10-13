@@ -98,6 +98,8 @@ public:
 	// again while the upload is unsubmitted).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size,
 	                                                               bool* refillable = nullptr);
+	// A cached buffer holds all of [vaddr, vaddr + size) (ObtainBufferForImage then reads that buffer).
+	[[nodiscard]] bool BufferHoldsRange(uint64_t vaddr, uint64_t size);
 	// KYTY_ASYNC_REPROTECT: the write protection of the pages an image starts watching again (TextureCache's
 	// DeferredImageProtects sets the page manager's deferred write-protect sink to this list around TrackImage), applied
 	// by the upload worker ahead of an upload copy that reads those pages whole (the whole image: PushImageStagingCopies;
@@ -113,14 +115,14 @@ public:
 	// with nothing done, where ObtainBufferForImage would not stage them that way now.
 	[[nodiscard]] bool RefillImageStaging(const Buffer& ring, uint64_t offset, uint64_t vaddr, uint64_t size);
 	// Guest ranges staged one after another in one staging allocation of `total` bytes, each
-	// at its `offset`. Returns nullptr (nothing staged) when a range starts in a cached buffer
-	// or holds GPU-written pages: the caller then uploads the whole image instead.
+	// at its `offset`. Returns nullptr (nothing staged) when a range holds GPU-written pages: the
+	// caller then uploads the whole image instead.
 	struct StagingPiece {
 		uint64_t vaddr  = 0;
 		uint64_t size   = 0;
 		uint64_t offset = 0;
 	};
-	// (`why`: what refused, when nothing is staged - "owner", "gpu" or "map".)
+	// (`why`: what refused, when nothing is staged - "gpu" or "map".)
 	[[nodiscard]] std::pair<Buffer*, uint64_t> StageImagePieces(const std::vector<StagingPiece>& pieces,
 	                                                            uint64_t total, const char** why = nullptr);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);

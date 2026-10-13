@@ -238,6 +238,8 @@ private:
 	void               FinishRefresh(Image& image);
 	// The dirty subresources over [window_begin, window_end) only (a whole one where it crosses an end).
 	[[nodiscard]] bool UploadImagePartial(Image& image, uint64_t window_begin = 0, uint64_t window_end = UINT64_MAX);
+	// A whole upload of a large image a piece of guest memory at a time; false: not such an image (ObtainBufferForImage's).
+	[[nodiscard]] bool UploadImageChunked(Image& image);
 	// The dirty layers in [first_layer, last_layer) only.
 	[[nodiscard]] bool UploadDepthPartial(Image& image, uint32_t first_layer = 0,
 	                                      uint32_t last_layer = UINT32_MAX);
