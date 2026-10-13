@@ -259,12 +259,49 @@ public:
 	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
+	// Bytes GPU work wrote through a buffer: all of the image (where it is not known), or [begin, end) ranges of it, which
+	// TextureCache::InitializeImage uploads alone (BufferModifiedRanges: sorted, merged; empty when all of it).
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
+		m_buffer_whole    = true;
+		m_buffer_ranges.clear();
 		++validity;
 		MoveImageStateEpoch();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void MarkBufferModified(uint64_t begin, uint64_t end) {
+		if (!m_buffer_modified) {
+			m_buffer_whole = false;
+			m_buffer_ranges.clear();
+		}
+		m_buffer_modified = true;
+		if (!m_buffer_whole && begin < end) {
+			auto at = std::lower_bound(m_buffer_ranges.begin(), m_buffer_ranges.end(), begin,
+			                           [](const auto& range, uint64_t value) { return range.second < value; });
+			auto last = at;
+			while (last != m_buffer_ranges.end() && last->first <= end) {
+				begin = std::min(begin, last->first);
+				end   = std::max(end, last->second);
+				++last;
+			}
+			at = m_buffer_ranges.erase(at, last);
+			m_buffer_ranges.insert(at, {begin, end});
+			// (Past a few, all of it: what a whole upload costs.)
+			if (m_buffer_ranges.size() > 16) {
+				m_buffer_whole = true;
+				m_buffer_ranges.clear();
+			}
+		}
+		++validity;
+		MoveImageStateEpoch();
+	}
+	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& BufferModifiedRanges() const noexcept {
+		return m_buffer_ranges;
+	}
+	void ClearBufferModified() noexcept {
+		m_buffer_modified = false;
+		m_buffer_whole    = false;
+		m_buffer_ranges.clear();
+	}
 
 	[[nodiscard]] bool IsStencilModified() const noexcept { return m_stencil_modified; }
 	void               MarkStencilModified() noexcept {
@@ -359,6 +396,8 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	bool              m_buffer_whole     = false; // (with m_buffer_modified: where is not known)
+	std::vector<std::pair<uint64_t, uint64_t>> m_buffer_ranges;
 	bool              m_stencil_modified  = false;
 	bool              m_partial_dirty     = false;
 	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;

@@ -42,6 +42,9 @@
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode {0};
 // 0: a sampled view refreshes the whole texture, not only its levels (RefreshTextureLevels; on by default, 0 for an A/B).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_texture_levels_mode {1};
+// 0: an image GPU buffer writes covered parts of is uploaded whole, not only the subresources over them (InitializeImage;
+// on by default, 0 for an A/B).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_ranges_mode {1};
 
 namespace Libs::Graphics {
 
@@ -1912,6 +1915,16 @@ void TextureCache::InitializeImage(ImageId id) {
 				image.staged_ring = nullptr;
 			}
 		}
+		// GPU buffer writes over known parts of it and no CPU write: the subresources over those parts alone, from the
+		// buffers holding them. At Boletaria every frame a compute shader writes two 15 MiB buffers in memory shared with
+		// render targets - a 1440p R32 array, 720p RGBA16F ones - and each of them was uploaded whole again: 105 MiB of
+		// detiles a frame for 30 MiB written (10-13).
+		if (!uploaded && image.IsBufferModified() && !image.IsCpuDirty() && !image.BufferModifiedRanges().empty() &&
+		    kyty_local_buffer_ranges_mode.load(std::memory_order_relaxed) != 0) {
+			const auto ranges = image.BufferModifiedRanges();
+			uploaded          = UploadImageChunked(image, &ranges);
+			if (uploaded) image.staged_ring = nullptr;
+		}
 		if (!uploaded && UploadImageChunked(image)) {
 			uploaded            = true;
 			image.staged_ring   = nullptr;
@@ -2180,13 +2193,18 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 // buffer: one each lived until the submission completed, as much again. (An image a cached buffer holds whole too: its
 // pieces copy from that buffer, where its whole detile asked for a scratch buffer of the image's size - a user's 8 GB
 // GPU had neither the video nor the system memory for one of 2 GiB, and the emulator exited, 10-13.)
-bool TextureCache::UploadImageChunked(Image& image) {
+bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>* only) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
-	if (binding == BindingType::DepthTarget || info.data.size < ChunkedUploadMin || info.IsVolume() || base % 256 != 0) {
+	if (binding == BindingType::DepthTarget || (only == nullptr && info.data.size < ChunkedUploadMin) ||
+	    info.IsVolume() || base % 256 != 0) {
 		return false;
 	}
+	// (`only`: of an image of any size, the subresources over those ranges alone.)
+	const auto selected = [&](uint64_t begin, uint64_t end) {
+		return only == nullptr || IntersectsRanges(*only, begin, end);
+	};
 	auto& cached = m_partial_plans[image.serial];
 	if (cached.plan == nullptr || cached.binding != binding) {
 		cached.plan    = std::make_shared<TextureTransferPlan>(
@@ -2211,17 +2229,22 @@ bool TextureCache::UploadImageChunked(Image& image) {
 	std::vector<vk::BufferImageCopy> regions;
 	uint64_t                         pieces     = 0;
 	uint64_t                         gpu_pieces = 0;
+	uint64_t                         uploaded   = 0;
 	for (size_t at = 0; at < order.size();) {
 		const auto& first   = plan.tiles[order[at]];
 		uint64_t    begin   = base + first.tiled_offset;
 		uint64_t    end     = begin + first.tiled_size;
+		if (!selected(begin, end)) {
+			at++;
+			continue;
+		}
 		size_t      next    = at + 1;
 		const bool  written = m_buffer_cache.IsRegionGpuModified(begin, end - begin);
 		while (!written && next < order.size()) {
 			const auto&    tile       = plan.tiles[order[next]];
 			const uint64_t tile_begin = base + tile.tiled_offset;
 			const uint64_t tile_end   = tile_begin + tile.tiled_size;
-			if (std::max(end, tile_end) - begin > ChunkedUploadPiece ||
+			if (std::max(end, tile_end) - begin > ChunkedUploadPiece || !selected(tile_begin, tile_end) ||
 			    m_buffer_cache.IsRegionGpuModified(tile_begin, tile.tiled_size)) {
 				break;
 			}
@@ -2256,7 +2279,13 @@ bool TextureCache::UploadImageChunked(Image& image) {
 		image.Upload(regions, linear.buffer, linear.offset, linear.size);
 		pieces++;
 		gpu_pieces += written ? 1 : 0;
+		uploaded += end - begin;
 		at = next;
+	}
+	if (only != nullptr) {
+		LiveCounters::Add(LiveCounters::PartialUploads);
+		LiveCounters::Add(LiveCounters::PartialUploadBytes, uploaded);
+		return true;
 	}
 	LiveCounters::Add(LiveCounters::FullUploads);
 	LiveCounters::Add(LiveCounters::FullUploadBytes, info.data.size);
@@ -3606,7 +3635,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, cons
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}
-		image.MarkBufferModified();
+		// (The written bytes of it: InitializeImage uploads only the subresources over them.)
+		image.MarkBufferModified(std::max(address, image.info.data.address),
+		                         std::min(address + size, image.info.data.End()));
 	}
 }
 
