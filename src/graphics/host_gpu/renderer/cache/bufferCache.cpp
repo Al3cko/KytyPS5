@@ -1336,13 +1336,14 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 
 static BufferCache* g_sync_cache = nullptr;
 
-// KYTY_BDA_SPARSE=1|0 (default: on with less than 12 GiB of video memory, where the device has strict sparse residency
-// buffers): the BDA page table (an entry per 16 KiB page of the 1 TiB guest address space, 512 MiB) gets video memory
-// only for the 64 KiB pages of entries a buffer registration wrote (Buffer::MakeResident); the others read zero, as
-// the whole table did. The game's memory spans ~100 such pages (128 MiB of guest address space each).
+// KYTY_BDA_SPARSE=1 (where the device has strict sparse residency buffers; off by default while a GPU hang in 2-2's
+// culling chain on an 8 GB card is open, the default it had: on with less than 12 GiB of video memory): the BDA page
+// table (an entry per 16 KiB page of the 1 TiB guest address space, 512 MiB) gets video memory only for the 64 KiB
+// pages of entries a buffer registration wrote (Buffer::MakeResident); the others read zero, as the whole table did.
+// The game's memory spans ~100 such pages (128 MiB of guest address space each).
 static MemoryUsage PageTableUsage(const GraphicContext& graphics) {
 	static const char* const value  = std::getenv("KYTY_BDA_SPARSE");
-	const bool               wanted = value != nullptr && value[0] != '\0' ? value[0] != '0' : graphics.small_video_memory;
+	const bool               wanted = value != nullptr && value[0] != '\0' && value[0] != '0';
 	return wanted && graphics.sparse_residency_buffers ? MemoryUsage::SparseDeviceLocal : MemoryUsage::DeviceLocal;
 }
 

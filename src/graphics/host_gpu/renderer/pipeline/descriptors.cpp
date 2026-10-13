@@ -548,7 +548,8 @@ static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& o
 	return true;
 }
 
-// KYTY_TEXTURE_PREFIX=1|0 (default: on with less than 12 GiB of video memory): a sampled 2D texture whose T# starts at
+// KYTY_TEXTURE_PREFIX=1 (off by default while the levels of a small texture with no tiled layout of their own exit the
+// emulator, the default it had: on with less than 12 GiB of video memory): a sampled 2D texture whose T# starts at
 // level k > 0 is held as the texture of its levels k.. (TextureFromLevel), not whole. The game streams a texture in from
 // its smallest levels and samples a larger one once it is loaded: at 1-1 on an 8 GB laptop 495 of the 913 textures
 // were never sampled from level 0, their larger levels 1.7 GB of the 3.9 GB the textures took, on a card holding 10 GB
@@ -557,7 +558,8 @@ static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& o
 // image goes unused (a new image over its memory ends the resolution cache's hold on it).
 static bool TexturePrefixEnabled(bool small_video_memory) {
 	static const char* const value = std::getenv("KYTY_TEXTURE_PREFIX");
-	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
+	static_cast<void>(small_video_memory);
+	return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
 static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
