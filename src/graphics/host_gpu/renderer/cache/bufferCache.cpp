@@ -2292,11 +2292,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return {&m_staging_buffer, stage_offset};
 }
 
-bool BufferCache::BufferHoldsRange(uint64_t vaddr, uint64_t size) {
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size);
-}
-
 void BufferCache::ApplyImageProtects() {
 	for (const auto& range: m_image_protects) m_image_protect_manager->SyncProtection(range.address, range.size);
 	m_image_protects.clear();

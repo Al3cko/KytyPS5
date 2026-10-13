@@ -98,8 +98,6 @@ public:
 	// again while the upload is unsubmitted).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size,
 	                                                               bool* refillable = nullptr);
-	// A cached buffer holds all of [vaddr, vaddr + size) (ObtainBufferForImage then reads that buffer).
-	[[nodiscard]] bool BufferHoldsRange(uint64_t vaddr, uint64_t size);
 	// KYTY_ASYNC_REPROTECT: the write protection of the pages an image starts watching again (TextureCache's
 	// DeferredImageProtects sets the page manager's deferred write-protect sink to this list around TrackImage), applied
 	// by the upload worker ahead of an upload copy that reads those pages whole (the whole image: PushImageStagingCopies;

@@ -2171,19 +2171,20 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 	return true;
 }
 
-// A whole upload of a large image no cached buffer holds whole, a piece of guest memory at a time, each piece from the
-// source ObtainBufferForImage picks for it: staged guest bytes, the buffer holding it, or (a subresource with
-// GPU-written bytes, a piece of its own) a buffer over that subresource. The whole range at once took a buffer over
-// all of it: a texture-pool view at Shrine of Storms 4-2 (1568 1 MiB layers) joined the 103 small buffers inside it
-// into one 1.57 GB buffer (3.2 s), and with the image and its detiling scratch (2 GiB) an 8 GB laptop paged for seconds;
-// its shadow-map pool, inside that buffer, then took whole 320 MiB uploads at every layer the game streamed. The
-// pieces detile into one reused scratch buffer: one each lived until the submission completed, as much again.
+// A whole upload of a large image, a piece of guest memory at a time, each piece from the source ObtainBufferForImage
+// picks for it: staged guest bytes, the buffer holding it, or (a subresource with GPU-written bytes, a piece of its
+// own) a buffer over that subresource. The whole range at once took a buffer over all of it: a texture-pool view at
+// Shrine of Storms 4-2 (1568 1 MiB layers) joined the 103 small buffers inside it into one 1.57 GB buffer (3.2 s), and
+// with the image and its detiling scratch (2 GiB) an 8 GB laptop paged for seconds; its shadow-map pool, inside that
+// buffer, then took whole 320 MiB uploads at every layer the game streamed. The pieces detile into one reused scratch
+// buffer: one each lived until the submission completed, as much again. (An image a cached buffer holds whole too: its
+// pieces copy from that buffer, where its whole detile asked for a scratch buffer of the image's size - a user's 8 GB
+// GPU had neither the video nor the system memory for one of 2 GiB, and the emulator exited, 10-13.)
 bool TextureCache::UploadImageChunked(Image& image) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
-	if (binding == BindingType::DepthTarget || info.data.size < ChunkedUploadMin || info.IsVolume() || base % 256 != 0 ||
-	    m_buffer_cache.BufferHoldsRange(base, info.data.size)) {
+	if (binding == BindingType::DepthTarget || info.data.size < ChunkedUploadMin || info.IsVolume() || base % 256 != 0) {
 		return false;
 	}
 	auto& cached = m_partial_plans[image.serial];

@@ -100,8 +100,12 @@ TileManager::~TileManager() {
 	}
 }
 
-// Scratch capacities are powers of two from 64 KiB, so buffers of similar requests are reused.
+// Scratch capacities are powers of two from 64 KiB, so buffers of similar requests are reused; past 64 MiB, multiples of
+// 64 MiB (a power of two made a 1.5 GB texture's scratch 2 GiB: on an 8 GB GPU neither video nor system memory had it,
+// and the emulator exited, 10-13).
 static uint64_t ScratchCapacity(uint64_t size) {
+	constexpr uint64_t Large = uint64_t {64} << 20u;
+	if (size > Large) return (size + Large - 1) / Large * Large;
 	return std::max<uint64_t>(uint64_t {1} << 16u, std::bit_ceil(size));
 }
 
