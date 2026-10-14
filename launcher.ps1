@@ -18,7 +18,7 @@ $qualities = 'Standard (PS5)', 'Low', 'Lowest'
 $frameGens = 'Off', '2x', '3x', '4x', '5x', '6x'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0 }
+	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0; hud = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -79,6 +79,8 @@ function Get-PlayCommand {
 	if ([int]$settings.render -gt 0 -and [int]$settings.render -ne 1440) { $arguments += @('-RenderHeight', [int]$settings.render) }
 	if ($settings.quality -in 'low', 'lowest') { $arguments += @('-Quality', $settings.quality) }
 	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { $arguments += @('-FrameGen', ([int]$settings.framegen - 1)) }
+	# The emulator's frame rate panel (KYTY_FPS_HUD), top right of the game image.
+	if ($settings.hud) { $arguments += @('-Set', 'KYTY_FPS_HUD=1') }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
@@ -184,6 +186,8 @@ $vsync = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'VSync (no
 Add-Row '' @($vsync)
 $hdr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'HDR (turn on "Use HDR" in Windows display settings first)'; AutoSize = $true; Checked = [bool]$settings.hdr }
 Add-Row '' @($hdr)
+$hud = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Show the frame rate (top right of the game image)'; AutoSize = $true; Checked = [bool]$settings.hud }
+Add-Row '' @($hud)
 $render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120 }
 $render.Items.AddRange($renderHeights)
 $render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string][int]$settings.render } | Select-Object -First 1)
@@ -231,6 +235,7 @@ function Read-Form {
 	$settings.fps120     = $fps120.Checked
 	$settings.vsync      = $vsync.Checked
 	$settings.hdr        = $hdr.Checked
+	$settings.hud        = $hud.Checked
 	$settings.render     = [int](([string]$render.SelectedItem -split ' ')[0])
 	$settings.quality    = ([string]$quality.SelectedItem -split ' ')[0].ToLowerInvariant()
 	# (Kept as it was where the DLLs are missing.)
