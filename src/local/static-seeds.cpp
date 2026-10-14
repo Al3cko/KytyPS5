@@ -1313,6 +1313,24 @@ std::filesystem::path FindStates() {
 	return {};
 }
 
+// Windows: a path of MAX_PATH (260) characters or more opens only in the extended-length form (\\?\, \\?\UNC\ for a
+// share): a game folder deep in a user's documents put a material at 265 characters (issue #13: "cannot read"), and
+// directories past the limit were left out unlisted. The game folder takes that form, and every path made below it.
+fs::path ExtendedLength(const fs::path& path) {
+#if defined(_WIN32)
+	if (Common::IsArchivePath(path)) return path;
+	std::error_code error;
+	const auto      absolute = fs::absolute(path, error);
+	if (error) return path;
+	const auto text = absolute.lexically_normal().wstring();
+	if (text.starts_with(L"\\\\?\\") || text.starts_with(L"\\\\.\\")) return absolute;
+	if (text.starts_with(L"\\\\")) return fs::path(L"\\\\?\\UNC\\" + text.substr(2));
+	return fs::path(L"\\\\?\\" + text);
+#else
+	return path;
+#endif
+}
+
 // precompile.py cmd_seeds.
 int Make(const Options& options) {
 	try {
@@ -1320,7 +1338,7 @@ int Make(const Options& options) {
 		const auto states_file = options.states.empty() ? FindStates() : options.states;
 		if (states_file.empty()) throw Fatal("no tools/local/static-precompile/pass-states.json (--states <file>)");
 		const auto      states = LoadStates(states_file);
-		const Inventory inventory(options.game);
+		const Inventory inventory(ExtendedLength(options.game));
 		if (inventory.bundles.empty()) {
 			std::fprintf(stderr, "no shader bundles (*.csdr) under %s\n", Utf8(options.game).c_str());
 		}
