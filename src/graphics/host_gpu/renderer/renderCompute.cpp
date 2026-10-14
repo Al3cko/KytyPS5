@@ -54,6 +54,8 @@
 #include <unordered_map>
 #include <vector>
 
+extern volatile std::atomic<uint32_t> kyty_local_fill_clear_mode; // (textureCache.cpp)
+
 namespace Libs::Graphics {
 
 // KYTY_DISPATCH_TIMING=<hash>[,<hash>...] (or ;): the GPU time of those programs' normal-path dispatches, from
@@ -462,6 +464,19 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			LOGF("GraphicsRenderDispatchDirect: metadata fill shader=0x%016" PRIx64
 			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
 			     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
+		}
+		// A fill over images whose ranges it does not match (the game clears render targets in 4 MiB pieces and in spans
+		// of several): the same fill on the buffer cache's buffer, and the images over it note the value - one all of whose
+		// buffer writes were such fills is cleared instead of uploaded (TextureCache::InitializeImage).
+		const auto base = descriptor.Base48();
+		if (kyty_local_fill_clear_mode.load(std::memory_order_relaxed) != 0 && Spec::Current() == nullptr &&
+		    ((base | size) & 3u) == 0 && cache.HasTrackedDataOverlap(base, size)) {
+			const auto [buffer, offset] = m_context.GetBufferCache().ObtainBuffer(base, size, true, true);
+			if (buffer != nullptr && (offset & 3u) == 0) {
+				buffer->Fill(offset, size, packed_clear);
+				cache.InvalidateMemoryFromGPU(base, size, "fill", &packed_clear);
+				return true;
+			}
 		}
 		return false;
 	}

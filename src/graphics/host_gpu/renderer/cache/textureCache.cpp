@@ -45,6 +45,12 @@
 // 0: an image GPU buffer writes covered parts of is uploaded whole, not only the subresources over them (InitializeImage;
 // on by default, 0 for an A/B).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_ranges_mode {1};
+// 0: a compute fill over images it does not match runs as the dispatch, and the images are uploaded after it, not cleared
+// (TryConsumeComputeImageClear, InitializeImage; on by default, 0 for an A/B; KYTY_FILL_CLEAR=0 from the start).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_fill_clear_mode {[] {
+	const char* value = std::getenv("KYTY_FILL_CLEAR");
+	return value != nullptr && value[0] == '0' ? 0u : 1u;
+}()};
 
 namespace Libs::Graphics {
 
@@ -1915,6 +1921,37 @@ void TextureCache::InitializeImage(ImageId id) {
 				image.staged_ring = nullptr;
 			}
 		}
+		// GPU buffer writes that only filled all of it with one 32-bit value since its last upload (compute fills over
+		// it, TryConsumeComputeImageClear): a clear to that value, as an upload of those bytes would leave it. The game
+		// clears render targets that way in 4 MiB pieces: at Stonefang every frame four 720p RGBA16F, a 1440p R32 array
+		// of 4 and a 1440p target - 105 MiB of detiles of zeros a frame (10-14).
+		if (!uploaded && image.IsBufferModified() && !image.IsCpuDirty() && !image.info.IsDepth() && !image.depth_id &&
+		    !image.info.IsVolume() && image.backing.image != nullptr &&
+		    kyty_local_fill_clear_mode.load(std::memory_order_relaxed) != 0) {
+			vk::ClearValue clear {};
+			if (const auto value = image.BufferFilledWith();
+			    value.has_value() && DecodeFilledColorClear(image.info.pixel_format, *value, clear.color)) {
+				m_scheduler.EndRendering();
+				const auto command = m_scheduler.Current().Handle();
+				image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+				const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, VK_REMAINING_MIP_LEVELS, 0,
+				                                       VK_REMAINING_ARRAY_LAYERS};
+				command.clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear.color, 1, &range);
+				image.Transit(vk::ImageLayout::eGeneral,
+				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+				uploaded          = true;
+				image.staged_ring = nullptr;
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::printf("TextureCache: image filled by compute fills cleared to 0x%08x instead of uploaded: addr=0x%llx "
+					            "size=0x%llx fmt=%u %ux%u layers=%u\n",
+					            *value, static_cast<unsigned long long>(image.info.data.address),
+					            static_cast<unsigned long long>(image.info.data.size),
+					            static_cast<uint32_t>(image.info.guest_format), image.info.extent.width,
+					            image.info.extent.height, image.info.resources.layers);
+				}
+			}
+		}
 		// GPU buffer writes over known parts of it and no CPU write: the subresources over those parts alone, from the
 		// buffers holding them. At Boletaria every frame a compute shader writes two 15 MiB buffers in memory shared with
 		// render targets - a 1440p R32 array, 720p RGBA16F ones - and each of them was uploaded whole again: 105 MiB of
@@ -2285,6 +2322,17 @@ bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<
 	if (only != nullptr) {
 		LiveCounters::Add(LiveCounters::PartialUploads);
 		LiveCounters::Add(LiveCounters::PartialUploadBytes, uploaded);
+		static const bool log_uploads = std::getenv("KYTY_UPLOAD_LOG") != nullptr;
+		if (log_uploads) {
+			std::printf("[tsc %llu] UPLOAD-RANGES addr=0x%llx size=0x%llx fmt=%u %ux%u layers=%u levels=%u tile=%u ranges=%zu "
+			            "pieces=%llu gpu=%llu bytes=0x%llx serial=%llu\n",
+			            static_cast<unsigned long long>(__rdtsc()), static_cast<unsigned long long>(base),
+			            static_cast<unsigned long long>(info.data.size), static_cast<uint32_t>(info.guest_format),
+			            info.extent.width, info.extent.height, info.resources.layers, info.resources.levels,
+			            static_cast<uint32_t>(info.tile_mode), only->size(), static_cast<unsigned long long>(pieces),
+			            static_cast<unsigned long long>(gpu_pieces), static_cast<unsigned long long>(uploaded),
+			            static_cast<unsigned long long>(image.serial));
+		}
 		return true;
 	}
 	LiveCounters::Add(LiveCounters::FullUploads);
@@ -3599,7 +3647,7 @@ void TextureCache::TouchSpeculated(Image& image, uint64_t serial) {
 	TouchImage(image);
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source) {
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source, const uint32_t* fill) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -3636,8 +3684,12 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, cons
 			image.ClearGpuModified();
 		}
 		// (The written bytes of it: InitializeImage uploads only the subresources over them.)
-		image.MarkBufferModified(std::max(address, image.info.data.address),
-		                         std::min(address + size, image.info.data.End()));
+		const auto begin = std::max(address, image.info.data.address), end = std::min(address + size, image.info.data.End());
+		if (fill != nullptr) {
+			image.MarkBufferFilled(begin, end, *fill);
+		} else {
+			image.MarkBufferModified(begin, end);
+		}
 	}
 }
 

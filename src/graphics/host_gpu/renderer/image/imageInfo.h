@@ -522,6 +522,11 @@ IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
 		case vk::Format::eR16G16B16A16Uint:
 			clear.uint32 = std::array {word & 0xffffu, word >> 16u, word & 0xffffu, word >> 16u};
 			return true;
+		case vk::Format::eR16G16Sfloat:
+			if ((word & 0x7c00u) == 0x7c00u || (word & 0x7c000000u) == 0x7c000000u) return false;
+			clear.float32 = std::array {half(word), half(word >> 16u), 0.0f, 0.0f};
+			return true;
+		case vk::Format::eR16G16Uint: clear.uint32 = std::array {word & 0xffffu, word >> 16u, 0u, 0u}; return true;
 		case vk::Format::eR32G32Sfloat:
 		case vk::Format::eR32G32B32A32Sfloat:
 			if ((word & 0x7f800000u) == 0x7f800000u) return false;

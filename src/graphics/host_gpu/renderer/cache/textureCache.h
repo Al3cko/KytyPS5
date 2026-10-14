@@ -115,7 +115,10 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "");
+	// `fill`: the GPU wrote the range with that one 32-bit value (a compute fill): the images over it note it
+	// (Image::MarkBufferFilled).
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "",
+	                                           const uint32_t* fill = nullptr);
 	[[nodiscard]] bool HasTrackedDataOverlap(uint64_t address, uint64_t size);
 	// An image over the range holds data the GPU wrote to it (a download of the range must come
 	// from the image, not from the buffer).

@@ -265,10 +265,44 @@ public:
 		m_buffer_modified = true;
 		m_buffer_whole    = true;
 		m_buffer_ranges.clear();
+		m_buffer_fill     = BufferFill::Mixed;
 		++validity;
 		MoveImageStateEpoch();
 	}
 	void MarkBufferModified(uint64_t begin, uint64_t end) {
+		AddBufferRange(begin, end);
+		m_buffer_fill = BufferFill::Mixed;
+	}
+	// The same from a compute fill of one 32-bit value: while every buffer write since the last upload was a fill of that
+	// value and they cover all of the image, BufferFilledWith gives the value (InitializeImage clears to it).
+	void MarkBufferFilled(uint64_t begin, uint64_t end, uint32_t value) {
+		const bool first = !m_buffer_modified;
+		AddBufferRange(begin, end);
+		if (first) {
+			m_buffer_fill       = BufferFill::Value;
+			m_buffer_fill_value = value;
+		} else if (m_buffer_fill != BufferFill::Value || m_buffer_fill_value != value) {
+			m_buffer_fill = BufferFill::Mixed;
+		}
+	}
+	[[nodiscard]] std::optional<uint32_t> BufferFilledWith() const noexcept {
+		if (!m_buffer_modified || m_buffer_fill != BufferFill::Value || m_buffer_whole || m_buffer_ranges.size() != 1 ||
+		    m_buffer_ranges.front().first > info.data.address || m_buffer_ranges.front().second < info.data.End())
+			return std::nullopt;
+		return m_buffer_fill_value;
+	}
+	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& BufferModifiedRanges() const noexcept {
+		return m_buffer_ranges;
+	}
+	void ClearBufferModified() noexcept {
+		m_buffer_modified = false;
+		m_buffer_whole    = false;
+		m_buffer_ranges.clear();
+		m_buffer_fill = BufferFill::None;
+	}
+
+private:
+	void AddBufferRange(uint64_t begin, uint64_t end) {
 		if (!m_buffer_modified) {
 			m_buffer_whole = false;
 			m_buffer_ranges.clear();
@@ -294,15 +328,8 @@ public:
 		++validity;
 		MoveImageStateEpoch();
 	}
-	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& BufferModifiedRanges() const noexcept {
-		return m_buffer_ranges;
-	}
-	void ClearBufferModified() noexcept {
-		m_buffer_modified = false;
-		m_buffer_whole    = false;
-		m_buffer_ranges.clear();
-	}
 
+public:
 	[[nodiscard]] bool IsStencilModified() const noexcept { return m_stencil_modified; }
 	void               MarkStencilModified() noexcept {
 		m_stencil_modified = true;
@@ -398,6 +425,9 @@ private:
 	bool              m_buffer_modified  = false;
 	bool              m_buffer_whole     = false; // (with m_buffer_modified: where is not known)
 	std::vector<std::pair<uint64_t, uint64_t>> m_buffer_ranges;
+	enum class BufferFill : uint8_t { None, Value, Mixed };
+	BufferFill        m_buffer_fill       = BufferFill::None;
+	uint32_t          m_buffer_fill_value = 0;
 	bool              m_stencil_modified  = false;
 	bool              m_partial_dirty     = false;
 	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
