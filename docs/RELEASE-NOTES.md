@@ -1,45 +1,36 @@
 ## New in this build
 
-- **Voices that were silent now play**: much of the story dialogue, many NPC lines and the cutscene voices were
-  silent. The game keeps 1,330 of its sound files as 16-channel "3D audio" (ambisonics) streams, which the emulator
-  could not decode. It now does.
-- **NPC speech is easier to hear**: the game's 3D audio is now mixed so that a sound straight ahead of you (usually
-  the person you are talking to) plays at full level; before, it came out 3 dB below sounds from the sides. If
-  speech is still too quiet for your speakers or headphones, the game's own Settings > Audio > Midnight Mode makes
-  it about 5 dB louder again.
-- **Character creation faces are right**: faces no longer look dirty, and switching presets no longer keeps the
-  previous preset's makeup.
-- **Render height option** for slower GPUs: the launcher's "Render height" (or `run-windows.ps1 -RenderHeight 1080`)
-  renders the game's 3D at a lower height (720 to 1440) while the output and the menus stay 4K. On a laptop RTX 3080
-  at 1080: standing 20.7 -> 24.8 fps.
-- **Faster start-up**, above all on PCs with fewer CPU cores:
-  - The game's start-up file reads no longer wait on a slow system call (laptop: from launch to the game 108-111 s
-    -> 63-64 s).
-  - The background shader preparation no longer competes with the game's loading for CPU cores, and keeps its
-    temporary data compressed (4.5 GB -> 1.3 GB of RAM).
-- **Shader precompile**:
-  - It no longer compiles the same pipelines several times over; on the test laptop the full precompile took about
-    3.5 hours before.
-  - On drivers without pipeline binaries (NVIDIA before 570, AMD, Intel), the precompiled shaders are read one at a
-    time when needed instead of loaded whole, about 4 GB less RAM in use.
-- **Fewer hitches while walking on GPUs with less than 12 GB of video memory**: the shaders this PC has recorded are
-  prepared at start-up there too, within 1/16 of the video memory, and pipelines share their layouts (a laptop's
-  1-1 walk: no frame of 90 ms or more, before 200-900 ms hitches).
-- **Less video memory on GPUs with less than 12 GB**: a texture the game has so far streamed in only from its smaller
-  levels now takes only the memory of those levels (an 8 GB laptop at 1-1: textures 4.2 -> 2.6 GB, so the game fits
-  in video memory instead of being paged in and out; walking about 8% faster).
+- **Less memory, and it no longer creeps up the longer you play**:
+  - After a save loads the emulator takes about 2 GB less RAM: the shader programs it keeps no longer have a second
+    copy inside the graphics driver (on NVIDIA that copy alone was about 1.8 GB), and its shader preparation keeps
+    more of its data compressed or on disk. On PCs with 16 GB of RAM it now needs about 14 GB after a save loads
+    (it was about 20 GB).
+  - Every trip to another world or area left about 25 MB behind for good, so long sessions kept growing. That is
+    now released (tested with four rounds of travel through all five worlds and the Nexus: memory stays level after
+    the first round, which still adds what the newly seen shaders need).
+- **HDR output**: the launcher's "HDR" checkbox (or `run-windows.ps1 -Hdr` / `--hdr`) outputs HDR10 on an HDR display.
+- **VSync option**: the launcher's "VSync" checkbox removes screen tearing (issue #12).
+- **Fixes**:
+  - Game version 1.05 crashed after about 10 minutes in Boletaria 1-1 (issue #10).
+  - On GPUs with 8 GB of video memory, some very large textures could fail to load (issue #5).
+  - A game folder with a very long path (for example deep inside OneDrive) could not be opened by the emulator or the
+    shader precompile (issue #13).
+  - A crash when travelling to the Tower of Latria by archstone.
+- **Shader precompile**: the shader list now includes tours of every map, so more of the shaders a first visit needs
+  are ready before you play.
+- **Linux**: a Linux package is built with each release too (experimental, contributed in PR #3).
 
 ## 本版本的变化
 
-- **原本没有声音的语音现在有了**：大部分剧情对话、很多 NPC 台词和过场动画的人声之前都是静音的。游戏里有 1330 个音频文件是 16 声道的"3D 音频"（Ambisonics）格式，模拟器之前无法解码，现在可以了。
-- **NPC 说话更容易听清**：重新调整了游戏 3D 音频的混音方式，正前方的声音（通常就是你在对话的人）现在以完整音量播放；之前比两侧的声音低 3 dB。如果在你的音箱或耳机上说话声仍然偏小，可以打开游戏自带的 设置 > 音频 > Midnight Mode（午夜模式），说话声会再大约 5 dB。
-- **捏脸时的脸恢复正常**：脸不再显得脏，切换预设时也不会残留上一个预设的妆容。
-- **新增渲染高度选项**，适合较慢的显卡：启动器里的"Render height"（或 `run-windows.ps1 -RenderHeight 1080`）可以让游戏的 3D 画面以较低高度渲染（720 到 1440），输出画面和菜单仍保持 4K。笔记本 RTX 3080 设为 1080 时：站立 20.7 -> 24.8 fps。
-- **启动更快**，CPU 核心较少的电脑尤其明显：
-  - 游戏启动时读取文件不再被一个很慢的系统调用拖住（笔记本：从启动到进入游戏 108-111 秒 -> 63-64 秒）。
-  - 后台的着色器准备不再和游戏加载抢 CPU 核心，临时数据也改为压缩存放（内存占用 4.5 GB -> 1.3 GB）。
-- **着色器预编译**：
-  - 不再把同一批管线重复编译好几遍；测试笔记本上之前完整预编译约需 3.5 小时。
-  - 在不支持 pipeline binary 的驱动上（570 之前的 NVIDIA 驱动、AMD、Intel），预编译结果改为用到时逐个读取，不再一次全部载入，约少占 4 GB 内存。
-- **显存小于 12 GB 的显卡走动时卡顿更少**：这类显卡现在也会在启动时准备本机已记录的着色器（占用不超过显存的 1/16），管线之间也共享布局（笔记本 1-1 走动：没有超过 90 ms 的帧，之前有 200-900 ms 的卡顿）。
-- **显存小于 12 GB 的显卡占用更少显存**：游戏目前只流式载入了较小几级 mipmap 的纹理，现在只占用这几级的显存（8 GB 笔记本在 1-1：纹理 4.2 -> 2.6 GB，游戏能放进显存，不再被换入换出；走动约快 8%）。
+- **内存占用更少，玩得越久也不再越涨越多**：
+  - 读档后模拟器少占约 2 GB 内存：模拟器保存的着色器程序不再在显卡驱动里另存一份（NVIDIA 上光这一份就约 1.8 GB），着色器准备的数据也更多地压缩存放或放在磁盘上。16 GB 内存的电脑上，读档后现在约需 14 GB（之前约 20 GB）。
+  - 之前每去一次别的世界或区域都会永久留下约 25 MB 的内存，所以玩得越久占用越大。现在这些都会被释放（测试：用石碑在五个世界和大厅之间来回走了四轮，第一轮之后内存不再增长；第一轮仍会增加新见到的着色器所需的内存）。
+- **HDR 输出**：启动器里勾选"HDR"（或 `run-windows.ps1 -Hdr` / `--hdr`），在 HDR 显示器上输出 HDR10。
+- **垂直同步选项**：启动器里勾选"VSync"可以消除画面撕裂（issue #12）。
+- **修正**：
+  - 游戏 1.05 版在波雷塔利亚 1-1 玩约 10 分钟后会崩溃（issue #10）。
+  - 8 GB 显存的显卡上，部分特别大的纹理可能载入失败（issue #5）。
+  - 游戏文件夹路径很长时（例如放在 OneDrive 很深的目录里），模拟器和着色器预编译打不开（issue #13）。
+  - 用石碑前往拉特利亚之塔时崩溃。
+- **着色器预编译**：着色器列表加入了所有地图的巡游记录，第一次进入各区域时需要的着色器更多地会提前准备好。
+- **Linux**：每次发布也会附带 Linux 版本（实验性，来自 PR #3）。
