@@ -137,7 +137,9 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
+	const auto start = __rdtsc();
 	GetGpuResources().MapMemory(vaddr, size);
+	LiveCounters::Add(LiveCounters::GpuMapKt, (__rdtsc() - start) >> 10u);
 }
 
 // `releasing`: the range is unmapped or decommitted right after (GpuResourceManager::UnmapMemory).
@@ -145,7 +147,9 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size, bool releasing = false)
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
+	const auto start = __rdtsc();
 	GetGpuResources().UnmapMemory(vaddr, size, releasing);
+	LiveCounters::Add(LiveCounters::GpuUnmapKt, (__rdtsc() - start) >> 10u);
 }
 
 // A releasing UnmapGpuRange left the pages' host protection to the unmap; when the unmap fails

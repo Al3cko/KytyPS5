@@ -23,9 +23,17 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// (A placeholder split or coalesce, counted with its time: placeholder_calls, placeholder_kt.)
+static bool PlaceholderFree(void* vaddr, uint64_t size, DWORD type) {
+	const auto start = __rdtsc();
+	const bool done  = VirtualFree(vaddr, size, type) != 0;
+	LiveCounters::Add(LiveCounters::PlaceholderCalls);
+	LiveCounters::Add(LiveCounters::PlaceholderKt, (__rdtsc() - start) >> 10u);
+	return done;
+}
+
 static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
-	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
-	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
+	return size != 0 && PlaceholderFree(reinterpret_cast<void*>(vaddr), size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
 }
 #endif
 
@@ -1598,11 +1606,12 @@ public:
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
 		LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapBacking, vaddr, size);
+		FreeSplit                  split;
 		{
 			ExclusiveLock lock(m_mutex);
 			// (Guest maps and unmaps run one at a time: another one over the range is only waited for here.)
 			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size); });
-			if (!ConsumeUnlocked(vaddr, size)) {
+			if (!ConsumeDeferredUnlocked(vaddr, size, &split)) {
 				if (failure_reason != nullptr) {
 					*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
 				}
@@ -1611,16 +1620,18 @@ public:
 			m_busy.emplace_back(vaddr, vaddr + size);
 		}
 		// The system calls without the lock (BusyUnlocked): the trackers' protections of other ranges go on.
-		const auto host_mode = VirtualMemory::IsExecute(mode)
-		                           ? VirtualMemory::Mode::ExecuteReadWrite
-		                           : VirtualMemory::Mode::ReadWrite;
-		const bool mapped = m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode, failure_reason);
+		const bool split_done = SplitPlaceholders(split, vaddr, size);
+		const auto host_mode  = VirtualMemory::IsExecute(mode)
+		                            ? VirtualMemory::Mode::ExecuteReadWrite
+		                            : VirtualMemory::Mode::ReadWrite;
+		const bool mapped =
+		    split_done && m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode, failure_reason);
 		{
 			ExclusiveLock lock(m_mutex);
 			if (mapped) {
 				EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
 			} else {
-				AddFreeUnlocked(vaddr, size);
+				RestoreSplitUnlocked(split, vaddr, size);
 			}
 			EraseBusyUnlocked(vaddr, vaddr + size);
 		}
@@ -1641,6 +1652,7 @@ public:
 			// view held it for milliseconds (4.5 ms for a 52 MiB one, 1.5-5 ms a call late in a laptop session), every
 			// protection of the GPU trackers anywhere waiting behind it.
 			uint64_t busy_begin = vaddr, busy_end = vaddr + size;
+			uint64_t merge_begin = 0, merge_end = 0;
 			bool     contained  = false;
 			{
 				ExclusiveLock lock(m_mutex);
@@ -1665,12 +1677,18 @@ public:
 					ExclusiveLock lock(m_mutex);
 					if (done) {
 						EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
-						AddFreeUnlocked(vaddr, size);
+						std::tie(merge_begin, merge_end) = AddFreeDeferredUnlocked(vaddr, size);
 						unmapped = true;
 					}
 					EraseBusyUnlocked(busy_begin, busy_end);
 				}
 				m_busy_done.notify_all();
+				// (The free placeholders around it made one without the lock: guest maps and unmaps, the only users of
+				// the free list, run one at a time.)
+				if (merge_end - merge_begin > size && CoalesceFreePlaceholders(merge_begin, merge_end)) {
+					ExclusiveLock lock(m_mutex);
+					MergeFreeUnlocked(merge_begin, merge_end);
+				}
 			}
 		}
 		if (g_remapped_count != 0) {
@@ -1895,6 +1913,84 @@ private:
 			}
 		}
 		return true;
+	}
+
+	// A free entry consumed with its placeholder split later (SplitPlaceholders, outside the lock).
+	struct FreeSplit {
+		uint64_t base = 0, end = 0; // the free entry
+	};
+
+	// ConsumeUnlocked's free-list change without its system calls: the remainders become free entries now.
+	bool ConsumeDeferredUnlocked(uint64_t vaddr, uint64_t size, FreeSplit* split) {
+		auto it = FindContaining(vaddr, size);
+		if (it == m_free.end()) {
+			return false;
+		}
+		split->base = it->first;
+		split->end  = it->first + it->second;
+		m_free.erase(it);
+		if (split->base != vaddr) m_free.emplace(split->base, vaddr - split->base);
+		if (vaddr + size != split->end) m_free.emplace(vaddr + size, split->end - (vaddr + size));
+		return true;
+	}
+
+	// The placeholder of a consumed free entry split around [vaddr, vaddr + size) (SplitUnlocked's calls). False when
+	// a split failed (RestoreSplitUnlocked).
+	static bool SplitPlaceholders(const FreeSplit& split, uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (split.base != vaddr &&
+		    !PlaceholderFree(reinterpret_cast<void*>(split.base), vaddr - split.base, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+			return false;
+		if (vaddr + size != split.end &&
+		    !PlaceholderFree(reinterpret_cast<void*>(vaddr), size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+			return false;
+#else
+		(void)split, (void)vaddr, (void)size;
+#endif
+		return true;
+	}
+
+	// A map that failed gives its free entry back whole, its placeholders (the ones split) made one again.
+	void RestoreSplitUnlocked(const FreeSplit& split, uint64_t vaddr, uint64_t size) {
+		m_free.erase(m_free.lower_bound(split.base), m_free.lower_bound(split.end));
+		(void)vaddr, (void)size;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// (A coalesce of one placeholder fails: nothing was split then.)
+		(void)CoalescePlaceholders(split.base, split.end - split.base);
+#endif
+		m_free.emplace(split.base, split.end - split.base);
+	}
+
+	// AddFreeUnlocked's free-list change without its system call: the range joins the list as its own entry; the span
+	// it makes with the free entries next to it is returned, to be coalesced outside the lock (CoalesceFreePlaceholders,
+	// then MergeFreeUnlocked).
+	std::pair<uint64_t, uint64_t> AddFreeDeferredUnlocked(uint64_t vaddr, uint64_t size) {
+		auto [it, inserted] = m_free.emplace(vaddr, size);
+		if (!inserted) it->second = size;
+		uint64_t base = it->first, end = it->first + it->second;
+		for (auto first = it; first != m_free.begin();) {
+			const auto prev = std::prev(first);
+			if (prev->first + prev->second != base) break;
+			base  = prev->first;
+			first = prev;
+		}
+		for (auto last = std::next(it); last != m_free.end() && last->first == end; ++last) end = last->first + last->second;
+		return {base, end};
+	}
+
+	static bool CoalesceFreePlaceholders(uint64_t begin, uint64_t end) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		return CoalescePlaceholders(begin, end - begin);
+#else
+		(void)begin, (void)end;
+		return true;
+#endif
+	}
+
+	// The free entries of [begin, end) made one (their placeholders were: CoalesceFreePlaceholders).
+	void MergeFreeUnlocked(uint64_t begin, uint64_t end) {
+		m_free.erase(m_free.lower_bound(begin), m_free.lower_bound(end));
+		m_free.emplace(begin, end - begin);
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
@@ -2188,8 +2284,7 @@ private:
 		if (base != vaddr) {
 			const auto left_size = vaddr - base;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (VirtualFree(reinterpret_cast<void*>(base), left_size,
-			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+			if (!PlaceholderFree(reinterpret_cast<void*>(base), left_size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t guest placeholder split failed: base=0x%016" PRIx64
 				           " size=0x%016" PRIx64 " requested=0x%016" PRIx64
@@ -2204,8 +2299,7 @@ private:
 
 		if (it->second != size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (VirtualFree(reinterpret_cast<void*>(it->first), size,
-			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+			if (!PlaceholderFree(reinterpret_cast<void*>(it->first), size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t guest placeholder split failed: base=0x%016" PRIx64
 				           " size=0x%016" PRIx64 " requested=0x%016" PRIx64
