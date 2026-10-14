@@ -761,8 +761,18 @@ public:
 		auto           lock = MapReadLock();
 		const uint64_t end  = vaddr + size;
 		for (uint64_t at = vaddr; at < end;) {
-			MapEntry entry {};
-			if (!FindContainingUnlocked(at, 1, &entry)) return false;
+			// (Each mapping through this thread's translations, held under the lock: a search of m_maps per mapping, ten
+			// of them for the 4 MiB copies, was 0.9% of the render thread at Latria.)
+			auto&      cached = HostReadTranslationOf(at);
+			const auto epoch  = RegionEpoch(at);
+			MapEntry   entry {};
+			if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, at, 1)) {
+				entry = cached.entry;
+			} else if (FindContainingUnlocked(at, 1, &entry)) {
+				cached = {entry, epoch};
+			} else {
+				return false;
+			}
 			const uint64_t piece    = std::min(end, entry.vaddr + entry.size) - at;
 			const uint64_t physical = entry.backing_offset + at - entry.vaddr;
 			if (!CoverageUnique(physical, physical + piece)) return false;
