@@ -8,6 +8,8 @@
 #   .\run-windows.ps1 -NoRedZone             without guest red-zone protection
 #   .\run-windows.ps1 -Patch <cheat.json>    apply an etaHEN-style game patch
 #   .\run-windows.ps1 -Fullscreen -AspectFit keep the game's 16:9 (black bars) instead of stretching
+#   .\run-windows.ps1 -Hdr                   HDR10 output when Windows HDR is on for the display (the game is
+#                                            told the TV takes HDR and outputs it; SDR otherwise)
 #   .\run-windows.ps1 -Language 11           the console language (0-29 as the PS5 numbers them: 1 English (US),
 #                                            11 Chinese (Simplified); default: the config's)
 #   .\run-windows.ps1 -Set KEY=VALUE         override a switch of the config (KEY= removes it)
@@ -38,6 +40,7 @@ param(
 	[int]$Width = 0,
 	[int]$Height = 0,
 	[switch]$Fullscreen,
+	[switch]$Hdr,
 	[switch]$Baseline,
 	[switch]$Precompile,
 	[int]$Threads = 0,
@@ -182,6 +185,7 @@ function Set-Option([string]$name, [string]$value) {
 if ($Width -gt 0) { Set-Option '--screen-width' "$Width" }
 if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }
 if ($Fullscreen) { $options.Add('--fullscreen') }
+if ($Hdr) { $options.Add('--hdr') }
 if ($PresentMode) { Set-Option '--present-mode' $PresentMode }
 if ($Language -ge 0) { Set-Option '--console-language' "$Language" }
 # The flip queue, one flip per vblank, is what caps the game's frame rate: it never waits for a

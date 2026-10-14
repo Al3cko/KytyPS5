@@ -58,6 +58,7 @@ static void PrintUsage() {
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
@@ -162,6 +163,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--fullscreen") {
 			options.config.fullscreen_enabled = true;
+			continue;
+		}
+
+		if (arg == "--hdr") {
+			options.config.hdr_enabled = true;
 			continue;
 		}
 

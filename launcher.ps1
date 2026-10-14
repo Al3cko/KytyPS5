@@ -14,7 +14,7 @@ $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
 $renderHeights = '1440 (PS5)', '1296', '1152', '1080', '900'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; render = 1440; vsync = $false }
+	ecores = $false; fps120 = $false; render = 1440; vsync = $false; hdr = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -65,6 +65,8 @@ function Get-PlayCommand {
 	if ($settings.fps120) { $arguments += '-Fps120' }
 	# Presents wait for the display's refresh (Vulkan FIFO): no tearing, and G-SYNC/FreeSync displays keep adapting.
 	if ($settings.vsync) { $arguments += @('-PresentMode', 'Fifo') }
+	# HDR10 output when Windows HDR is on for the display; SDR otherwise.
+	if ($settings.hdr) { $arguments += '-Hdr' }
 	if ([int]$settings.render -gt 0 -and [int]$settings.render -ne 1440) { $arguments += @('-RenderHeight', [int]$settings.render) }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
@@ -168,6 +170,8 @@ $fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 12
 Add-Row '' @($fps120)
 $vsync = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'VSync (no screen tearing; adaptive sync displays keep it)'; AutoSize = $true; Checked = [bool]$settings.vsync }
 Add-Row '' @($vsync)
+$hdr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'HDR (turn on "Use HDR" in Windows display settings first)'; AutoSize = $true; Checked = [bool]$settings.hdr }
+Add-Row '' @($hdr)
 $render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120 }
 $render.Items.AddRange($renderHeights)
 $render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string][int]$settings.render } | Select-Object -First 1)
@@ -201,6 +205,7 @@ function Read-Form {
 	$settings.redzone    = $redzone.Checked
 	$settings.fps120     = $fps120.Checked
 	$settings.vsync      = $vsync.Checked
+	$settings.hdr        = $hdr.Checked
 	$settings.render     = [int](([string]$render.SelectedItem -split ' ')[0])
 	$settings.ecores     = $ecores.Checked
 	Save-Settings

@@ -23,9 +23,12 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <list>
 #include <thread>
@@ -262,6 +265,7 @@ public:
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
 	Graphics::RenderContext& Renderer() const noexcept { return m_renderer; }
+	bool                     IsHdrSupported() const noexcept { return m_presenter.IsHdrSupported(); }
 
 	void VblankBegin();
 	void VblankEnd();
@@ -993,6 +997,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	uint32_t            width   = 0;
 	uint32_t            height  = 0;
 	bool                current = false;
+	bool                hdr     = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
 		current = cfg->opened && !cfg->closing && cfg->generation == generation;
@@ -1013,7 +1018,9 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 					     " index=%d group=%d\n",
 					     request_id, index, surface.group_index);
 				}
-				source_info = cfg->groups[surface.group_index].ImageInfo(surface);
+				const auto& group = cfg->groups[surface.group_index];
+				source_info       = group.ImageInfo(surface);
+				hdr               = Graphics::IsHdrVideoOutPixelFormat(group.attribute.pixel_format);
 			}
 		}
 	}
@@ -1027,12 +1034,17 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
+	static std::atomic_flag hdr_warned;
+	if (hdr && !m_presenter.IsHdrSupported() && !hdr_warned.test_and_set(std::memory_order_relaxed)) {
+		std::printf("warning: the game outputs HDR (PQ) frames without an HDR10 swapchain; shown unconverted\n");
+		std::fflush(stdout);
+	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr);
 	}
 
 	Common::LockGuard lock(m_mutex);
@@ -1696,9 +1708,14 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
+	// HDR when the title declares it (param ATTRIBUTE bit 29) and --hdr found an HDR10 display:
+	// the game then flips BT.2100 PQ buffers, which the HDR10 swapchain shows as they are.
+	int32_t    attribute   = 0;
+	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
+	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
 	status->resolution   = (ctx->width >= 3840 || ctx->height >= 2160 ? 2u : 1u);
-	status->dynamicRange = 1;
+	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
 	         ? VIDEO_OUT_REFRESH_RATE_119_88HZ

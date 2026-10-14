@@ -20,7 +20,9 @@ public:
 	~Presenter();
 	KYTY_CLASS_NO_COPY(Presenter);
 
-	[[nodiscard]] Frame&         PrepareFrame(CommandBuffer& command, const ImageInfo& info);
+	// `hdr`: the guest buffer holds BT.2100 PQ pixels (shown on an HDR10 swapchain when there is one).
+	[[nodiscard]] Frame&         PrepareFrame(CommandBuffer& command, const ImageInfo& info,
+	                                         bool hdr = false);
 	[[nodiscard]] Frame&         PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
 	                                               CommandBuffer* producer = nullptr);
 	[[nodiscard]] Frame*         PrepareLastFrame();
@@ -28,6 +30,8 @@ public:
 	// refresh of the one before) if nothing newer replaced it and the display can take it now.
 	bool                         PresentSkippedIfDue();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
+	// --hdr and the display takes HDR10: the game is told it may output HDR.
+	[[nodiscard]] bool           IsHdrSupported() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
 	// KYTY_FLIP_RATE caps the frame's flip. With frame generation only frames carrying its inputs

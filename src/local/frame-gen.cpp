@@ -218,6 +218,7 @@ uint32_t         g_frame_index = 0;
 bool             g_options_set = false;
 vk::Extent2D     g_options_backbuffer {};
 vk::Extent2D     g_options_render {};
+vk::Format       g_options_format = vk::Format::eUndefined; // SDR or HDR10 swapchain
 uint64_t         g_presents = 0;
 
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
@@ -526,8 +527,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	const sl::ViewportHandle viewport {0};
 	const bool               usable = inputs != nullptr && inputs->valid;
 	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.
-	if (!g_options_set || (usable && (g_options_backbuffer != backbuffer ||
-	                                  g_options_render != inputs->render_extent))) {
+	if (!g_options_set || g_options_format != format ||
+	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
 		sl::DLSSGOptions options {};
 		options.mode                = sl::DLSSGMode::eOn;
 		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
@@ -547,6 +548,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		}
 		g_options_set        = true;
 		g_options_backbuffer = backbuffer;
+		g_options_format     = format;
 	}
 
 	++g_frame_index;

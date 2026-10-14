@@ -1,6 +1,6 @@
 param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [switch]$NoAot, [string[]]$Extra = @(),
       [switch]$KeepRunning, [string]$PresentMode = '', [int]$Vblank = 0, [string[]]$Set = @(),
-      [string]$Patch = '', [switch]$Fullscreen, [switch]$ShotOnly, [switch]$NoWalk,
+      [string]$Patch = '', [switch]$Fullscreen, [switch]$Hdr, [switch]$ShotOnly, [switch]$NoWalk,
       [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '',
       [string]$Game = '')
 # End to end: fresh baseline save, launch, skip to the game, walk the fixed path once the HUD
@@ -137,6 +137,7 @@ if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
 if ($Set.Count) { $params['Set'] = $Set }
 if ($Patch) { $params['Patch'] = $Patch }
 if ($Fullscreen) { $params['Fullscreen'] = $true }
+if ($Hdr) { $params['Hdr'] = $true }
 if ($Config) { $params['Config'] = $Config } # another launch config (run-windows.ps1 -Config)
 # -Game <folder>: another game (version) for this run; game-path.txt keeps the folder remembered before
 # it (run-windows.ps1 remembers a -Game).
