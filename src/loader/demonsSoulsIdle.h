@@ -31,8 +31,9 @@ inline constexpr std::string_view PollPrologue = "55 48 89 e5 41 57 41 56 41 55 
 
 // The wait for work the idle loop calls before its poll: it scans the job queues, then `pause`, reads the TSC (a helper
 // call) and goes round again until the worker has been idle for twice the TSC frequency (2 s) before it blocks. Work
-// comes every frame, so a worker spins at ~98% of a CPU all through play (01.007.000: eboot+0x83b6fd). The pause, the
-// load of the worker's last activity time, the helper call (SpinCallAt: the call's offset), the elapsed-time test.
+// comes every frame, so a worker spins at ~98% of a CPU all through play (01.007.000: eboot+0x83b6fd); the helper call
+// then sleeps first (KYTY_SPIN_BACKOFF_US, default 50 us). The pause, the load of the worker's last activity time, the
+// helper call (SpinCallAt: the call's offset), the elapsed-time test.
 inline constexpr std::string_view SpinCall   = "f3 90 4e 8b bc f3 10 0e 00 00 e8 ?? ?? ?? ?? 4c 29 f8 48 85 c0 0f 8e";
 inline constexpr size_t           SpinCallAt = 10;
 // The TSC helper it calls: rdtsc; shl rdx, 32; or rax, rdx; ret.

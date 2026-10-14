@@ -14,12 +14,14 @@
 #include <cstdlib>
 #include <cstring>
 
-// KYTY_SPIN_BACKOFF_US=<n> (live kyty_local_spin_backoff_us): microseconds the job workers' wait for work sleeps at
-// each round of its spin (0: it spins as the game does, for 2 s of idleness before it blocks).
+// KYTY_SPIN_BACKOFF_US=<n> (live kyty_local_spin_backoff_us, default 50): microseconds the job workers' wait for work
+// sleeps at each round of its spin (0: it spins as the game does, for 2 s of idleness before it blocks). Same process,
+// standing at Boletaria 1-1: a laptop Ryzen 9 5900HX 40.2 -> 41.0 fps (render 18.8 -> 18.0 ms), the 22-thread desktop
+// with an RTX 5090 58.6 / 58.4 (noise).
 extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_spin_backoff_us {[] {
 	const char* value = std::getenv("KYTY_SPIN_BACKOFF_US");
-	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	return value != nullptr && value[0] != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 50u;
 }()};
 }
 
@@ -97,8 +99,8 @@ void Install(Program* program) {
 	Xbyak::CodeGenerator code(PageSize, reinterpret_cast<void*>(allocated));
 	EmitThunk(code, reinterpret_cast<const void*>(poll),
 	          reinterpret_cast<const void*>(&WaitForWork));
-	// The wait for work's backoff, beside it (installed only with KYTY_SPIN_BACKOFF_US set, 0 included: under test).
-	const uint64_t spin_call  = std::getenv("KYTY_SPIN_BACKOFF_US") != nullptr ? FindSpinCall(*program) : 0;
+	// The wait for work's backoff, beside it.
+	const uint64_t spin_call  = FindSpinCall(*program);
 	uint64_t       spin_thunk = 0;
 	if (spin_call != 0) {
 		code.align(16);
