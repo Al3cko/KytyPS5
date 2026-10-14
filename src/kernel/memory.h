@@ -121,6 +121,8 @@ bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t
 // The backing bytes of a guest range inside one mapping (readable regardless of the guest
 // range's protection), or null.
 const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);
+// The end of the backing mapping `vaddr` is in (0: none): a range up to it has one backing pointer.
+uint64_t               BackingMappingEnd(uint64_t vaddr);
 // The same for a range that spans mappings: one (pointer, bytes) piece per mapping, in order.
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
 bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size);

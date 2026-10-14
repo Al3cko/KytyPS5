@@ -1928,6 +1928,18 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	uint64_t                    last_dirty = 0;
 	vk::Buffer                  source;
 	const Buffer*               ring = nullptr; // (the staging ring the copies read)
+	// The backing mapping the last run piece was in, from its address to its end: runs mostly lie in one mapping, which
+	// nothing unmaps meanwhile (a guest unmap waits for this thread). Found through the backing store's translations, which
+	// TryGetBackingPointer then finds it in. (The guest ranges' MappingEnd for every run was 1.6% of the render thread at
+	// Latria, more as the game's direct memory gets cut finer at every level load.)
+	uint64_t mapping_from = 0, mapping_end = 0;
+	const auto mapping_end_of = [&](uint64_t address) {
+		if (address < mapping_from || address >= mapping_end) {
+			mapping_from = address;
+			mapping_end  = LibKernel::Memory::BackingMappingEnd(address);
+		}
+		return mapping_end;
+	};
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -1936,7 +1948,7 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    // protections (UploadCopies); one copy over a boundary had none, and all of the upload's bytes were read and
 		    // its pages protected on this thread (Latria standing: ReapplyProtection 6% of the render thread).
 		    for (uint64_t at = 0; at < bytes;) {
-			    const uint64_t end   = LibKernel::Memory::MappingEnd(address + at);
+			    const uint64_t end   = mapping_end_of(address + at);
 			    const uint64_t piece = end > address + at ? std::min(bytes - at, end - (address + at)) : bytes - at;
 			    copies.emplace_back(total_size, buffer.Offset(address + at), piece);
 			    total_size += piece;
