@@ -17,6 +17,9 @@ constexpr bool IsSupportedTitle(std::string_view title) {
 	return title == "PPSA01340" || title == "PPSA01341";
 }
 bool IsSupportedGame();
+// Chains of dispatches with no barrier between them until the guest's own wait or cache action (these titles only).
+// KYTY_COMPUTE_CHAIN=0 (live kyty_local_compute_chain_mode): barriers around every dispatch, as for other games.
+bool ComputeChains();
 // The registers of a dispatch the linear copy shader reads: its user data, workgroup and thread-group inputs.
 struct LinearCopyDispatch {
 	std::span<const uint32_t> user_data;

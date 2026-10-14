@@ -11,8 +11,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+
+// KYTY_COMPUTE_CHAIN=0: no chains (10-14, the 8 GB laptop's GPU hangs at 2-2, a TDR in ~half of the 10-minute tours
+// with chains: none in 8 tours without them, at ~25% less fps there). Fencing only the culling, list-building or atomic
+// programs, a chain length cap of 8, or barriers for every V#, image and BDA read overlap did not stop them.
+extern "C" {
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_compute_chain_mode {[] {
+	const char* value = std::getenv("KYTY_COMPUTE_CHAIN");
+	return value != nullptr && value[0] == '0' ? 0u : 1u;
+}()};
+}
 
 namespace Libs::Graphics::DemonsSouls {
 bool IsSupportedGame() {
@@ -22,6 +35,16 @@ bool IsSupportedGame() {
 		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title) && IsSupportedTitle(title);
 	}();
 	return supported;
+}
+
+bool ComputeChains() {
+	static const bool reported = [] {
+		if (kyty_local_compute_chain_mode.load(std::memory_order_relaxed) == 0)
+			std::printf("Compute chains: off (KYTY_COMPUTE_CHAIN=0)\n");
+		return true;
+	}();
+	(void)reported;
+	return IsSupportedGame() && kyty_local_compute_chain_mode.load(std::memory_order_relaxed) != 0;
 }
 
 // The engine's cs_memset32 shader (coredata/enginesupport/shaders/_ps5/cs_memset32) as the builds seen have it:
