@@ -1006,7 +1006,7 @@ bool PipelineCache::StaticInputsCurrent(GraphicContext& graphics, const std::fil
 
 // The store and its shards' files (or only the shards': prune), into a new store; the shard files are
 // removed once merged. Their data is copied from the files when the new one is written.
-bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune) {
+bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune, bool keep_shards) {
 	const auto                                     path      = StaticBinariesPath();
 	const auto                                     signature = StaticBinariesSignature(graphics);
 	PipelineBinaryWriter                           writer(graphics.device);
@@ -1038,7 +1038,7 @@ bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune) {
 	sources.clear(); // closes the files: the store may be replaced
 	if (saved) std::filesystem::rename(temporary, path, error);
 	const bool merged = saved && !error;
-	if (merged) {
+	if (merged && !keep_shards) {
 		for (const auto& file: files) std::filesystem::remove(file, error);
 	}
 	PipelineCacheLog("Static pipeline binaries: merged {} shards{}, {} pipelines{}", files.size(),
@@ -1048,7 +1048,7 @@ bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune) {
 
 // The blobs and their shards' files (or only the shards': prune) into new blobs; the shard files are removed once
 // merged. Their data is copied from the files when the new one is written.
-static bool MergeBlobShards(GraphicContext& graphics, bool prune) {
+static bool MergeBlobShards(GraphicContext& graphics, bool prune, bool keep_shards) {
 	const auto                                       path      = StaticBlobsPath();
 	const auto                                       signature = StaticBlobsSignature(graphics.GetPhysicalDeviceProperties());
 	PipelineCacheBlobWriter                          writer;
@@ -1080,7 +1080,7 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune) {
 	sources.clear(); // closes the files: the blobs may be replaced
 	if (saved) std::filesystem::rename(temporary, path, error);
 	const bool merged = saved && !error;
-	if (merged) {
+	if (merged && !keep_shards) {
 		for (const auto& file: files) std::filesystem::remove(file, error);
 	}
 	PipelineCacheLog("Static pipeline blobs: merged {} shards{}, {} pipelines{}", files.size(), prune ? " (pruned)" : "",
@@ -1089,9 +1089,9 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune) {
 }
 
 // The shard files are removed once merged.
-bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune) {
-	if (graphics.pipeline_binaries_enabled) return MergeBinaryShards(graphics, prune);
-	if (StaticBlobsMode(graphics)) return MergeBlobShards(graphics, prune);
+bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards) {
+	if (graphics.pipeline_binaries_enabled) return MergeBinaryShards(graphics, prune, keep_shards);
+	if (StaticBlobsMode(graphics)) return MergeBlobShards(graphics, prune, keep_shards);
 	PipelineCache cache(graphics);
 	if (cache.m_static_cache == nullptr) cache.InitializeStaticCache(true);
 	if (cache.m_static_cache == nullptr) return false;
@@ -1116,7 +1116,7 @@ bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune) 
 	                    (graphics.device.mergePipelineCaches(cache.m_static_cache, static_cast<uint32_t>(shards.size()),
 	                                                         shards.data()) == vk::Result::eSuccess &&
 	                     cache.SaveStaticCache(cache.m_static_cache, path));
-	if (merged) {
+	if (merged && !keep_shards) {
 		for (const auto& file: files) std::filesystem::remove(file, error);
 	}
 	for (const auto shard: shards) graphics.device.destroyPipelineCache(shard, nullptr);

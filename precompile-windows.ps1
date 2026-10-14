@@ -8,6 +8,11 @@
 #                                         each pipeline's own pipeline cache data, <title>_<version>.blobs, read
 #                                         alike (a .bin made before them stays in use, and a run adds to it)
 #   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
+#   .\precompile-windows.ps1 -Quick       only the shaders as recorded play used them (this PC's recording, else the
+#                                         release's hints): about half of a full run, what the places played so far
+#                                         need. A full run compiles those first too, and the game can start once
+#                                         "ready to play" shows; the rest (every other shader the game ships, for
+#                                         places not recorded) follows.
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
@@ -45,6 +50,7 @@ param(
 	[int]$Shards = 512,
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
+	[switch]$Quick,
 	[switch]$InputsOnly,
 	[string]$Exe = $(if (Test-Path "$PSScriptRoot\kyty_shader_precompile.exe") { "$PSScriptRoot\kyty_shader_precompile.exe" } else { "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe" })
 )
@@ -213,17 +219,26 @@ Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
 # fifths of their pipelines were made by another work item too (the same modules and state: a recipe's table and
 # native variants, a recorded specialization the seeds guessed), each compiled again in every shard that had one.
 $plan = "$logs\plan.bin"
-Wait-Precompile (Start-Precompile 'plan-seeds' @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus")) 'plan'
-if ($Recorded -and (Test-Path $Recorded)) {
+# Two tiers: the specializations of recorded play first (planned first: a pipeline the seeds make too is theirs; 1.07
+# here: 44k of 93k pipelines, 46% of the compile time), then every shader the game ships (-Quick: not those).
+$hasRecorded = $Recorded -and (Test-Path $Recorded)
+if ($Quick -and !$hasRecorded) { throw "-Quick needs the specializations of recorded play (a recording or the release's hints)" }
+if ($hasRecorded) {
 	Wait-Precompile (Start-Precompile 'plan-recorded' @('--seeds', "`"$Recorded`"", '--dry-run', '--plan', "`"$plan`"",
 		'--threads', "$cpus")) 'plan'
 }
-$pending = [System.Collections.Generic.Queue[object]]::new()
-for ($i = 0; $i -lt $Shards; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
-if ($Recorded -and (Test-Path $Recorded)) {
+if (!$Quick) {
+	Wait-Precompile (Start-Precompile 'plan-seeds' @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus")) 'plan'
+}
+$first  = [System.Collections.Generic.Queue[object]]::new()
+$second = [System.Collections.Generic.Queue[object]]::new()
+if ($hasRecorded) {
 	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
 	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
-	for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Recorded, "$i/$count")) }
+	for ($i = 0; $i -lt $count; $i++) { $first.Enqueue(@($Recorded, "$i/$count")) }
+}
+if (!$Quick) {
+	for ($i = 0; $i -lt $Shards; $i++) { $second.Enqueue(@($Seeds, "$i/$Shards")) }
 }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
@@ -232,8 +247,26 @@ $running = @{}
 $finished = 0
 $split = 0
 $shown = Get-Date
-while ($pending.Count -or $running.Count) {
-	while ($pending.Count -and $running.Count -lt $Jobs) {
+$tierMerged = $first.Count -eq 0
+while ($first.Count -or $second.Count -or $running.Count) {
+	# The first tier done (its shards and their halves; no shard runs then: the merge replaces the file they read):
+	# merged into the static cache and kept for the final merge, so the game can use it while the rest compiles.
+	if (!$tierMerged -and !$first.Count -and !$running.Count) {
+		$tierMerged = $true
+		if ($second.Count) {
+			# (Without the claims: a merge copying the store would claim every pipeline in it, and the second tier's shards
+			# would leave them all to others.)
+			$claims = $env:KYTY_PRECOMPILE_CLAIMS
+			$env:KYTY_PRECOMPILE_CLAIMS = $null
+			Wait-Precompile (Start-Precompile 'merge-recorded' @('--merge', '--keep-shards')) 'merge'
+			$env:KYTY_PRECOMPILE_CLAIMS = $claims
+			Write-Host ("  {0:hh\:mm\:ss} ready to play: the shaders of recorded play are in the static cache; the game's other shaders follow" -f ((Get-Date) - $begin))
+		}
+	}
+	# (Assigned in the branches: an if expression would unroll the queue.)
+	$pending = $null
+	if ($first.Count) { $pending = $first } elseif ($tierMerged) { $pending = $second }
+	while ($pending -and $pending.Count -and $running.Count -lt $Jobs) {
 		$seedFile, $shard = $pending.Dequeue()
 		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
 		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard,
@@ -248,8 +281,10 @@ while ($pending.Count -or $running.Count) {
 		if ($process.ExitCode -eq 3) {
 			$i, $n = [int[]]($shard -split '/')
 			if ($n -ge 65536) { throw "$name cannot be split further; logs: $logName" }
-			$pending.Enqueue(@($seedFile, "$i/$(2 * $n)"))
-			$pending.Enqueue(@($seedFile, "$($i + $n)/$(2 * $n)"))
+			$queue = $second
+			if ($seedFile -eq $Recorded) { $queue = $first }
+			$queue.Enqueue(@($seedFile, "$i/$(2 * $n)"))
+			$queue.Enqueue(@($seedFile, "$($i + $n)/$(2 * $n)"))
 			$split++
 		} elseif ($process.ExitCode -ne 0) {
 			throw "$name failed; logs: $logName"
@@ -260,11 +295,14 @@ while ($pending.Count -or $running.Count) {
 	if (((Get-Date) - $shown).TotalSeconds -ge 60) {
 		$shown = Get-Date
 		Write-Host ("  {0:hh\:mm\:ss} shards: {1} done, {2} running, {3} waiting ({4} split)" -f ((Get-Date) - $begin), $finished,
-			$running.Count, $pending.Count, $split)
+			$running.Count, ($first.Count + $second.Count), $split)
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
-Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
+# (-Quick: what the store held of the other shaders stays.)
+$mergeArguments = @('--merge')
+if (!$Quick) { $mergeArguments += '--prune' }
+Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries",
 	"$PSScriptRoot\_PipelineCache\static\$gameId.blobs" -ErrorAction SilentlyContinue |

@@ -160,7 +160,8 @@ public:
 	// The caches the shards of a precompile saved next to the static cache, merged into it. With
 	// pipeline binaries and `prune`, the store becomes the shards' pipelines only (a whole run's: what
 	// older runs left that no seed makes any more is dropped).
-	static bool MergePrecompileShards(GraphicContext& graphics, bool prune);
+	// `keep_shards`: the shard files stay (a merge in the middle of a run, which its final pruning merge counts).
+	static bool MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards = false);
 #endif
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
@@ -425,7 +426,7 @@ private:
 	void WarmPipelines(uint64_t compute_video = UINT64_MAX);
 #ifdef KYTY_STATIC_PRECOMPILE
 	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
-	static bool MergeBinaryShards(GraphicContext& graphics, bool prune);
+	static bool MergeBinaryShards(GraphicContext& graphics, bool prune, bool keep_shards);
 	bool WarmSeeds(const PrecompileOptions& options, size_t& left_out);
 #endif
 };
