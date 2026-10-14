@@ -14,5 +14,7 @@ namespace JitArena {
 // The code's copy (16-byte aligned) for the life of the process; null where the host has no such mapping (the caller
 // keeps its own buffer) or when no more memory can be mapped.
 const void* Copy(const void* code, size_t size);
+// Bytes copied so far (diagnostics).
+size_t Used();
 
 } // namespace JitArena

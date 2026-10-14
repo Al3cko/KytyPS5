@@ -179,6 +179,9 @@ inline void (*g_vma_report)(const char* path) = nullptr;
 inline void (*g_image_report)(const char* path) = nullptr;
 // Live "buffers <path>": the buffer cache's buffers as a tab-separated table (BufferCache::WriteBufferReport).
 inline void (*g_buffer_report)(const char* path) = nullptr;
+// Live "objects": counts of what the pipeline cache keeps for the session (PipelineCache), and shader modules alive.
+inline void (*g_objects_report)(uint64_t id) = nullptr;
+inline std::atomic<int64_t> g_shader_modules {0};
 // Live "sync": the GPU timelines, deferred submissions and pending guest readbacks (BufferCache::PrintSyncState):
 // where a stalled GPU thread waits.
 inline void (*g_sync_report)() = nullptr;

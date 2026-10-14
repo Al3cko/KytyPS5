@@ -82,6 +82,17 @@ struct MemoryUse {
 };
 MemoryUse ProcessMemory();
 uint64_t  PhysicalMemory();
+// Diagnostics: the busy blocks of every heap of the process by size ("size<TAB>count<TAB>bytes" lines to `path`, the
+// heaps locked while walked: a pause of a second or so), by size and first qword (<path>.sig.tsv: SPIR-V, a vtable as
+// module+offset, zero, data) and the committed private allocations (<path>.vm.tsv, the heaps' marked); false where
+// the host cannot list them.
+bool WriteHeapHistogram(const char* path);
+// Diagnostics: the stacks of live heap blocks of the given sizes ("2848,5151,16-256"): StartAllocTrace hooks the process
+// heap calls of every loaded module (their imports of RtlAllocateHeap/RtlFreeHeap/RtlReAllocateHeap) and records each
+// such block from then on; WriteAllocTrace writes the live ones by stack ("count<TAB>bytes<TAB>size<TAB>frames" lines,
+// a frame as module+offset). false where there is no such hook.
+bool StartAllocTrace(const char* sizes);
+bool WriteAllocTrace(const char* path);
 
 // Windows' own figures for this process's video memory on the GPU with this LUID (Vulkan's deviceLUID, 8 bytes): in
 // use (what Task Manager shows as its dedicated GPU memory) and the budget Windows gives the process (DXGI). NVIDIA's

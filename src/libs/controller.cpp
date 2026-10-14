@@ -11,6 +11,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "loader/demonsSoulsWarp.h"
 
 #include <algorithm>
 #include <array>
@@ -738,6 +739,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
+	Loader::DemonsSoulsWarp::RunQueuedCommand(); // (live `gamecmd`: on the game's own thread)
 
 	if (handle != 1) {
 		return PAD_ERROR_INVALID_HANDLE;

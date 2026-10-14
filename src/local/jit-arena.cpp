@@ -27,6 +27,7 @@ struct Chunk {
 std::mutex g_mutex;
 Chunk      g_chunk;
 bool       g_failed = false;
+size_t     g_used   = 0;
 
 bool MapChunk(Chunk& chunk) {
 	HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0,
@@ -69,16 +70,26 @@ const void* Copy(const void* code, size_t size) {
 		write = g_chunk.write + g_chunk.used;
 		run   = g_chunk.run + g_chunk.used;
 		g_chunk.used += aligned;
+		g_used += aligned;
 	}
 	std::memcpy(write, code, size);
 	FlushInstructionCache(GetCurrentProcess(), run, size);
 	return run;
 }
 
+size_t Used() {
+	std::lock_guard lock(g_mutex);
+	return g_used;
+}
+
 #else
 
 const void* Copy(const void*, size_t) {
 	return nullptr;
+}
+
+size_t Used() {
+	return 0;
 }
 
 #endif

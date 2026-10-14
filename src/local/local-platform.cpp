@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <map>
+#include <set>
+#include <tuple>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -718,6 +721,468 @@ uint64_t OpenFileForReading(const char* path) {
 	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
 }
 
+bool WriteHeapHistogram(const char* path) {
+	std::vector<HANDLE> heaps(256);
+	const DWORD         count = GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data());
+	if (count == 0 || count > heaps.size()) return false;
+	// Nothing is allocated from a heap while it is walked: blocks under 16 bytes are counted by size in arrays made
+	// before, larger ones are recorded (size, first qword) in pages of their own and grouped after.
+	constexpr uint64_t Small = 16;
+	struct Block {
+		uint32_t heap;
+		uint64_t size;
+		uint64_t first;
+	};
+	constexpr size_t Capacity = size_t {16} << 20u;
+	auto* blocks = static_cast<Block*>(VirtualAlloc(nullptr, Capacity * sizeof(Block), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	if (blocks == nullptr) return false;
+	std::vector<std::pair<uint64_t, uint64_t>> by_size(static_cast<size_t>(count) * Small); // heap, size -> blocks, bytes
+	size_t recorded = 0, dropped = 0;
+	// Where the heaps' memory lies: their regions (segments) and blocks of a megabyte or more (each its own
+	// allocation): the private allocations of <path>.vm.tsv that are the heaps'.
+	constexpr size_t      MaxPlaces = 65536;
+	std::vector<uint64_t> places(MaxPlaces);
+	size_t                place_count = 0;
+	for (DWORD i = 0; i < count; ++i) {
+		if (!HeapLock(heaps[i])) continue;
+		PROCESS_HEAP_ENTRY entry {};
+		while (HeapWalk(heaps[i], &entry)) {
+			if ((entry.wFlags & PROCESS_HEAP_REGION) != 0 && place_count < MaxPlaces)
+				places[place_count++] = reinterpret_cast<uint64_t>(entry.lpData);
+			if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) == 0) continue;
+			if (entry.cbData >= (uint64_t {1} << 20u) && place_count < MaxPlaces)
+				places[place_count++] = reinterpret_cast<uint64_t>(entry.lpData);
+			if (entry.cbData < Small) {
+				auto& use = by_size[i * Small + entry.cbData];
+				use.first++;
+				use.second += entry.cbData;
+			} else if (recorded < Capacity) {
+				uint64_t first = 0;
+				std::memcpy(&first, entry.lpData, sizeof(first));
+				blocks[recorded++] = {i, entry.cbData, first};
+			} else {
+				dropped++;
+			}
+		}
+		HeapUnlock(heaps[i]);
+	}
+	std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> sizes; // block size -> blocks, bytes
+	for (size_t i = 0; i < by_size.size(); i++) {
+		if (by_size[i].first == 0) continue;
+		auto& use = sizes[i % Small];
+		use.first += by_size[i].first;
+		use.second += by_size[i].second;
+	}
+	for (size_t i = 0; i < recorded; i++) {
+		auto& use = sizes[blocks[i].size];
+		use.first++;
+		use.second += blocks[i].size;
+	}
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) {
+		VirtualFree(blocks, 0, MEM_RELEASE);
+		return false;
+	}
+	std::fprintf(file, "size\tcount\tbytes\n");
+	for (const auto& [size, use]: sizes)
+		std::fprintf(file, "%llu\t%llu\t%llu\n", static_cast<unsigned long long>(size),
+		             static_cast<unsigned long long>(use.first), static_cast<unsigned long long>(use.second));
+	std::fclose(file);
+	// What the blocks are, per heap: <path>.sig.tsv groups blocks of 16 bytes or more by size and first qword: SPIR-V's
+	// magic, an address in a module (a vtable: module+offset), zero, else data; groups under 64 KiB and 16 blocks go
+	// to "rest" per heap.
+	struct Module {
+		uint64_t    begin;
+		uint64_t    end;
+		std::string name;
+	};
+	std::vector<Module>  modules;
+	std::vector<HMODULE> handles(2048);
+	DWORD                needed = 0;
+	if (EnumProcessModules(GetCurrentProcess(), handles.data(), static_cast<DWORD>(handles.size() * sizeof(HMODULE)),
+	                       &needed) != 0) {
+		handles.resize(std::min<size_t>(handles.size(), needed / sizeof(HMODULE)));
+		for (HMODULE handle: handles) {
+			MODULEINFO module {};
+			char       name[MAX_PATH] {};
+			if (GetModuleInformation(GetCurrentProcess(), handle, &module, sizeof(module)) != 0 &&
+			    GetModuleBaseNameA(GetCurrentProcess(), handle, name, MAX_PATH) != 0) {
+				const auto begin = reinterpret_cast<uint64_t>(module.lpBaseOfDll);
+				modules.push_back({begin, begin + module.SizeOfImage, name});
+			}
+		}
+	}
+	std::sort(modules.begin(), modules.end(), [](const Module& a, const Module& b) { return a.begin < b.begin; });
+	constexpr int64_t Data = -1, Spirv = -2, Zero = -3;
+	// heap, size, kind (module index or Data/Spirv/Zero), offset in the module -> blocks, bytes
+	std::map<std::tuple<uint32_t, uint64_t, int64_t, uint64_t>, std::pair<uint64_t, uint64_t>> groups;
+	for (size_t i = 0; i < recorded; i++) {
+		const uint64_t first  = blocks[i].first;
+		int64_t        kind   = Data;
+		uint64_t       offset = 0;
+		if (static_cast<uint32_t>(first) == 0x07230203u) {
+			kind = Spirv;
+		} else if (first == 0) {
+			kind = Zero;
+		} else {
+			auto module = std::upper_bound(modules.begin(), modules.end(), first,
+			                               [](uint64_t value, const Module& m) { return value < m.begin; });
+			if (module != modules.begin() && first < std::prev(module)->end) {
+				kind   = std::prev(module) - modules.begin();
+				offset = first - std::prev(module)->begin;
+			}
+		}
+		auto& use = groups[{blocks[i].heap, blocks[i].size, kind, offset}];
+		use.first++;
+		use.second += blocks[i].size;
+	}
+	VirtualFree(blocks, 0, MEM_RELEASE);
+	const std::string sig_path = std::string(path) + ".sig.tsv";
+	file                       = std::fopen(sig_path.c_str(), "w");
+	if (file == nullptr) return false;
+	std::fprintf(file, "heap\tsize\tkind\tcount\tbytes\n");
+	std::vector<std::pair<uint64_t, uint64_t>> rest(count); // per heap: blocks, bytes
+	for (const auto& [key, use]: groups) {
+		const auto& [heap, size, kind, offset] = key;
+		if (use.first < 16 && use.second < (uint64_t {64} << 10u)) {
+			rest[heap].first += use.first;
+			rest[heap].second += use.second;
+			continue;
+		}
+		char text[320];
+		if (kind >= 0) {
+			std::snprintf(text, sizeof(text), "%s+0x%llx", modules[kind].name.c_str(), static_cast<unsigned long long>(offset));
+		} else {
+			std::snprintf(text, sizeof(text), "%s", kind == Spirv ? "spirv" : kind == Zero ? "zero" : "data");
+		}
+		std::fprintf(file, "%lu\t%llu\t%s\t%llu\t%llu\n", static_cast<unsigned long>(heap), static_cast<unsigned long long>(size),
+		             text, static_cast<unsigned long long>(use.first), static_cast<unsigned long long>(use.second));
+	}
+	for (DWORD i = 0; i < count; ++i) {
+		uint64_t blocks_small = 0, bytes_small = 0;
+		for (uint64_t size = 0; size < Small; size++) {
+			blocks_small += by_size[i * Small + size].first;
+			bytes_small += by_size[i * Small + size].second;
+		}
+		if (rest[i].first != 0)
+			std::fprintf(file, "%lu\t0\trest\t%llu\t%llu\n", static_cast<unsigned long>(i),
+			             static_cast<unsigned long long>(rest[i].first), static_cast<unsigned long long>(rest[i].second));
+		if (blocks_small != 0)
+			std::fprintf(file, "%lu\t0\tsmall\t%llu\t%llu\n", static_cast<unsigned long>(i),
+			             static_cast<unsigned long long>(blocks_small), static_cast<unsigned long long>(bytes_small));
+	}
+	if (dropped != 0) std::fprintf(file, "-1\t0\tdropped\t%llu\t0\n", static_cast<unsigned long long>(dropped));
+	std::fclose(file);
+	// Committed private memory per allocation (VirtualAlloc'd pools, heap segments, driver memory): <path>.vm.tsv.
+	const std::string vm_path = std::string(path) + ".vm.tsv";
+	file                      = std::fopen(vm_path.c_str(), "w");
+	if (file == nullptr) return false;
+	std::fprintf(file, "base\tcommitted\tregions\theap\n");
+	std::set<uint64_t> heap_bases;
+	for (size_t i = 0; i < place_count; i++) {
+		MEMORY_BASIC_INFORMATION place {};
+		if (VirtualQuery(reinterpret_cast<void*>(places[i]), &place, sizeof(place)) == sizeof(place))
+			heap_bases.insert(reinterpret_cast<uint64_t>(place.AllocationBase));
+	}
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> bases; // allocation base -> committed bytes, regions
+	MEMORY_BASIC_INFORMATION                          info {};
+	for (uint64_t address = 0x10000; VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == sizeof(info);) {
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
+			auto& base = bases[reinterpret_cast<uint64_t>(info.AllocationBase)];
+			base.first += info.RegionSize;
+			base.second++;
+		}
+		const uint64_t next = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		if (next <= address) break;
+		address = next;
+	}
+	for (const auto& [base, use]: bases)
+		std::fprintf(file, "%llx\t%llu\t%llu\t%d\n", static_cast<unsigned long long>(base),
+		             static_cast<unsigned long long>(use.first), static_cast<unsigned long long>(use.second),
+		             heap_bases.contains(base) ? 1 : 0);
+	std::fclose(file);
+	return true;
+}
+
+namespace AllocTrace {
+
+// Live blocks of the traced sizes: open addressing by address (tombstones on free), stacks interned by hash. All in
+// pages of their own: the hooks never allocate from a heap.
+constexpr size_t   MaxSize    = 1u << 20u;
+constexpr size_t   BlockSlots = size_t {1} << 22u;
+constexpr size_t   StackSlots = size_t {1} << 18u;
+constexpr int      Frames     = 20;
+constexpr uint64_t Empty = 0, Tombstone = 1;
+
+struct BlockSlot {
+	uint64_t address;
+	uint32_t stack;
+	uint32_t size;
+};
+struct StackSlot {
+	uint64_t hash;
+	void*    frames[Frames];
+	uint32_t count;
+};
+
+using Allocate   = void*(NTAPI*)(void*, ULONG, SIZE_T);
+using Free       = BOOLEAN(NTAPI*)(void*, ULONG, void*);
+using Reallocate = void*(NTAPI*)(void*, ULONG, void*, SIZE_T);
+
+std::atomic_flag  g_lock       = ATOMIC_FLAG_INIT;
+uint8_t*          g_sizes      = nullptr; // MaxSize flags
+BlockSlot*        g_blocks     = nullptr;
+BlockSlot*        g_scratch    = nullptr; // a rehash's copy of the live blocks
+size_t            g_used       = 0;       // slots not empty (live and tombstones)
+size_t            g_live       = 0;
+StackSlot*        g_stacks     = nullptr;
+Allocate          g_allocate   = nullptr;
+Free              g_free       = nullptr;
+Reallocate        g_reallocate = nullptr;
+std::atomic<bool> g_full {false};
+
+struct Guard {
+	Guard() {
+		while (g_lock.test_and_set(std::memory_order_acquire)) YieldProcessor();
+	}
+	~Guard() { g_lock.clear(std::memory_order_release); }
+};
+
+uint64_t Mix(uint64_t value) {
+	value ^= value >> 33u;
+	value *= 0xff51afd7ed558ccdull;
+	value ^= value >> 33u;
+	return value;
+}
+
+void Record(void* block, size_t size) {
+	void*      frames[Frames] {};
+	const auto captured = RtlCaptureStackBackTrace(2, Frames, frames, nullptr);
+	uint64_t   hash     = size;
+	for (USHORT i = 0; i < captured; i++) hash = Mix(hash ^ reinterpret_cast<uint64_t>(frames[i]));
+	if (hash <= Tombstone) hash += 2;
+	Guard    guard;
+	uint32_t stack = 0;
+	for (size_t i = hash % StackSlots, probes = 0; probes < StackSlots; i = (i + 1) % StackSlots, probes++) {
+		if (g_stacks[i].hash == hash) {
+			stack = static_cast<uint32_t>(i);
+			break;
+		}
+		if (g_stacks[i].hash == Empty) {
+			g_stacks[i].hash = hash;
+			std::memcpy(g_stacks[i].frames, frames, sizeof(frames));
+			stack = static_cast<uint32_t>(i);
+			break;
+		}
+	}
+	g_stacks[stack].count++;
+	// Half the slots used (tombstones of freed blocks mostly): the live blocks go in again from scratch. (A free racing
+	// with it may miss its block's record and leave it listed.)
+	if ((g_used + 1) * 2 > BlockSlots) {
+		size_t live = 0;
+		for (size_t i = 0; i < BlockSlots; i++)
+			if (g_blocks[i].address > Tombstone) g_scratch[live++] = g_blocks[i];
+		std::memset(g_blocks, 0, BlockSlots * sizeof(BlockSlot));
+		for (size_t k = 0; k < live; k++) {
+			size_t i = Mix(g_scratch[k].address) % BlockSlots;
+			while (g_blocks[i].address != Empty) i = (i + 1) % BlockSlots;
+			g_blocks[i] = g_scratch[k];
+		}
+		g_used = g_live = live;
+	}
+	const uint64_t address = reinterpret_cast<uint64_t>(block);
+	for (size_t i = Mix(address) % BlockSlots, probes = 0; probes < BlockSlots; i = (i + 1) % BlockSlots, probes++) {
+		if (g_blocks[i].address <= Tombstone) {
+			if (g_blocks[i].address == Empty) g_used++;
+			g_live++;
+			g_blocks[i] = {address, stack, static_cast<uint32_t>(size)};
+			return;
+		}
+	}
+	g_full = true;
+}
+
+void Forget(void* block) {
+	const uint64_t address = reinterpret_cast<uint64_t>(block);
+	// Most blocks freed were never traced: an empty first slot says so without the lock (slots never become empty
+	// again, and a traced block's record was written before the block could be freed).
+	if (std::atomic_ref<uint64_t>(g_blocks[Mix(address) % BlockSlots].address).load(std::memory_order_relaxed) == Empty)
+		return;
+	Guard guard;
+	for (size_t i = Mix(address) % BlockSlots, probes = 0; probes < BlockSlots; i = (i + 1) % BlockSlots, probes++) {
+		if (g_blocks[i].address == address) {
+			g_stacks[g_blocks[i].stack].count--;
+			g_blocks[i].address = Tombstone;
+			g_live--;
+			return;
+		}
+		if (g_blocks[i].address == Empty) return;
+	}
+}
+
+void* NTAPI HookAllocate(void* heap, ULONG flags, SIZE_T size) {
+	void* block = g_allocate(heap, flags, size);
+	if (block != nullptr && size < MaxSize && g_sizes[size] != 0) Record(block, size);
+	return block;
+}
+
+BOOLEAN NTAPI HookFree(void* heap, ULONG flags, void* block) {
+	if (block != nullptr) Forget(block);
+	return g_free(heap, flags, block);
+}
+
+void* NTAPI HookReallocate(void* heap, ULONG flags, void* block, SIZE_T size) {
+	void* result = g_reallocate(heap, flags, block, size);
+	if (result != nullptr) {
+		if (block != nullptr) Forget(block);
+		if (size < MaxSize && g_sizes[size] != 0) Record(result, size);
+	}
+	return result;
+}
+
+// Every loaded module's import slots that hold `from` now hold `to`.
+int Patch(void* from, void* to) {
+	std::vector<HMODULE> handles(2048);
+	DWORD                needed = 0;
+	if (EnumProcessModules(GetCurrentProcess(), handles.data(), static_cast<DWORD>(handles.size() * sizeof(HMODULE)),
+	                       &needed) == 0)
+		return 0;
+	handles.resize(std::min<size_t>(handles.size(), needed / sizeof(HMODULE)));
+	int patched = 0;
+	for (HMODULE handle: handles) {
+		auto*       base = reinterpret_cast<uint8_t*>(handle);
+		const auto* dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) continue;
+		const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+		if (dir.VirtualAddress == 0 || dir.Size == 0) continue;
+		auto* slots = reinterpret_cast<void**>(base + dir.VirtualAddress);
+		for (size_t i = 0; i < dir.Size / sizeof(void*); i++) {
+			if (slots[i] != from) continue;
+			DWORD old = 0;
+			if (VirtualProtect(&slots[i], sizeof(void*), PAGE_READWRITE, &old) == 0) continue;
+			slots[i] = to;
+			VirtualProtect(&slots[i], sizeof(void*), old, &old);
+			patched++;
+		}
+	}
+	return patched;
+}
+
+} // namespace AllocTrace
+
+bool StartAllocTrace(const char* sizes) {
+	using namespace AllocTrace;
+	if (g_sizes == nullptr) {
+		HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+		g_allocate    = reinterpret_cast<Allocate>(GetProcAddress(ntdll, "RtlAllocateHeap"));
+		g_free        = reinterpret_cast<Free>(GetProcAddress(ntdll, "RtlFreeHeap"));
+		g_reallocate  = reinterpret_cast<Reallocate>(GetProcAddress(ntdll, "RtlReAllocateHeap"));
+		if (g_allocate == nullptr || g_free == nullptr || g_reallocate == nullptr) return false;
+		const auto reserve = [](size_t bytes) {
+			return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		};
+		g_sizes  = static_cast<uint8_t*>(reserve(MaxSize));
+		g_blocks  = static_cast<BlockSlot*>(reserve(BlockSlots * sizeof(BlockSlot)));
+		g_scratch = static_cast<BlockSlot*>(reserve(BlockSlots * sizeof(BlockSlot)));
+		g_stacks = static_cast<StackSlot*>(reserve(StackSlots * sizeof(StackSlot)));
+		if (g_sizes == nullptr || g_blocks == nullptr || g_scratch == nullptr || g_stacks == nullptr) return false;
+	}
+	for (const char* text = sizes; *text != '\0';) {
+		char*      end  = nullptr;
+		const auto size = std::strtoull(text, &end, 10);
+		if (end == text) break;
+		auto last = size; // "first-last": a range
+		if (*end == '-') {
+			text = end + 1;
+			last = std::strtoull(text, &end, 10);
+		}
+		for (auto at = size; at <= last && at < MaxSize; at++) g_sizes[at] = 1;
+		text = *end == ',' ? end + 1 : end;
+	}
+	// Frees first: a block traced from here on is forgotten whichever module frees it.
+	const int patched = Patch(reinterpret_cast<void*>(g_free), reinterpret_cast<void*>(&HookFree)) +
+	                    Patch(reinterpret_cast<void*>(g_reallocate), reinterpret_cast<void*>(&HookReallocate)) +
+	                    Patch(reinterpret_cast<void*>(g_allocate), reinterpret_cast<void*>(&HookAllocate));
+	std::printf("Alloc trace: %d import slots hooked\n", patched);
+	std::fflush(stdout);
+	return patched != 0;
+}
+
+bool WriteAllocTrace(const char* path) {
+	using namespace AllocTrace;
+	if (g_stacks == nullptr) return false;
+	struct Module {
+		uint64_t    begin;
+		uint64_t    end;
+		std::string name;
+	};
+	std::vector<Module>  modules;
+	std::vector<HMODULE> handles(2048);
+	DWORD                needed = 0;
+	if (EnumProcessModules(GetCurrentProcess(), handles.data(), static_cast<DWORD>(handles.size() * sizeof(HMODULE)),
+	                       &needed) != 0) {
+		handles.resize(std::min<size_t>(handles.size(), needed / sizeof(HMODULE)));
+		for (HMODULE handle: handles) {
+			MODULEINFO module {};
+			char       name[MAX_PATH] {};
+			if (GetModuleInformation(GetCurrentProcess(), handle, &module, sizeof(module)) != 0 &&
+			    GetModuleBaseNameA(GetCurrentProcess(), handle, name, MAX_PATH) != 0) {
+				const auto begin = reinterpret_cast<uint64_t>(module.lpBaseOfDll);
+				modules.push_back({begin, begin + module.SizeOfImage, name});
+			}
+		}
+	}
+	// The live stacks with their blocks' bytes, copied under the lock (no allocation there), written after.
+	struct Live {
+		uint32_t stack;
+		uint64_t count;
+		uint64_t bytes;
+		uint32_t size;
+	};
+	std::vector<uint64_t> bytes(StackSlots), counts(StackSlots), sizes(StackSlots);
+	std::vector<void*>    frames(StackSlots * Frames);
+	{
+		Guard guard;
+		for (size_t i = 0; i < BlockSlots; i++) {
+			if (g_blocks[i].address <= Tombstone) continue;
+			bytes[g_blocks[i].stack] += g_blocks[i].size;
+			counts[g_blocks[i].stack]++;
+			sizes[g_blocks[i].stack] = g_blocks[i].size;
+		}
+		for (size_t i = 0; i < StackSlots; i++)
+			if (counts[i] != 0) std::memcpy(&frames[i * Frames], g_stacks[i].frames, sizeof(g_stacks[i].frames));
+	}
+	std::vector<Live> live;
+	for (uint32_t i = 0; i < StackSlots; i++)
+		if (counts[i] != 0) live.push_back({i, counts[i], bytes[i], static_cast<uint32_t>(sizes[i])});
+	std::sort(live.begin(), live.end(), [](const Live& a, const Live& b) { return a.bytes > b.bytes; });
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) return false;
+	std::fprintf(file, "count\tbytes\tsize\tframes%s\n", g_full ? " (table full: some blocks missing)" : "");
+	for (const auto& entry: live) {
+		std::fprintf(file, "%llu\t%llu\t%u\t", static_cast<unsigned long long>(entry.count),
+		             static_cast<unsigned long long>(entry.bytes), entry.size);
+		for (int f = 0; f < Frames; f++) {
+			const auto address = reinterpret_cast<uint64_t>(frames[static_cast<size_t>(entry.stack) * Frames + f]);
+			if (address == 0) break;
+			const Module* found = nullptr;
+			for (const auto& module: modules)
+				if (address >= module.begin && address < module.end) found = &module;
+			if (found != nullptr) {
+				std::fprintf(file, "%s%s+0x%llx", f == 0 ? "" : " ", found->name.c_str(),
+				             static_cast<unsigned long long>(address - found->begin));
+			} else {
+				std::fprintf(file, "%s0x%llx", f == 0 ? "" : " ", static_cast<unsigned long long>(address));
+			}
+		}
+		std::fprintf(file, "\n");
+	}
+	std::fclose(file);
+	return true;
+}
+
 MemoryUse ProcessMemory() {
 	PROCESS_MEMORY_COUNTERS_EX counters {};
 	counters.cb = sizeof(counters);
@@ -963,6 +1428,18 @@ void CloseScratchFile(uint64_t file) {
 uint64_t OpenFileForReading(const char* path) {
 	const int fd = open(path, O_RDONLY | O_CLOEXEC);
 	return fd < 0 ? 0 : static_cast<uint64_t>(fd) + 1;
+}
+
+bool WriteHeapHistogram(const char*) {
+	return false;
+}
+
+bool StartAllocTrace(const char*) {
+	return false;
+}
+
+bool WriteAllocTrace(const char*) {
+	return false;
 }
 
 MemoryUse ProcessMemory() {

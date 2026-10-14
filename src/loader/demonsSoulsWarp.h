@@ -34,6 +34,14 @@ uint32_t RecordedWaypoints();
 // game's warp request each 16 ms, facing the way it goes; returns the seconds it takes (-1: no player, another build).
 double Glide(float x, float y, float z, float speed);
 
+// Live `gamecmd TEXT` (01.007.000, test runs with KYTY_LIVE_FILE): an engine console command, e.g.
+// "+cp11_unlockAllArchstones" or "+cp11_loadLevel 2 1" (world, level), run on the game's pad-reading thread the next time it
+// reads the pad, through the engine's own command entry (the one its debug "golden path" helper calls). False: another
+// build (nothing queued).
+bool QueueCommand(std::string_view text);
+// The pad read (libs/controller.cpp): runs a queued command.
+void RunQueuedCommand();
+
 bool        Arm(std::string_view map, std::string_view spawn);
 void        Disarm();
 void        Select(int step);    // F9/F10: the spawn point an F8 arms

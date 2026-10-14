@@ -561,10 +561,33 @@ inline void Run(uint64_t id, const std::string& line) {
 		// buffers <path>: the buffer cache's buffers, one tab-separated row each (what stays registered).
 		if (LiveCounters::g_buffer_report != nullptr) LiveCounters::g_buffer_report(arg1);
 		std::printf("LIVE_BUFFERS id=%" PRIu64 " path=%s written=%d\n", id, arg1, LiveCounters::g_buffer_report != nullptr ? 1 : 0);
+	} else if (cmd == "heapstats" && n >= 2) {
+		// heapstats <path>: the process heaps' busy blocks by size (LocalPlatform::WriteHeapHistogram).
+		const auto begin = std::chrono::steady_clock::now();
+		const bool ok    = LocalPlatform::WriteHeapHistogram(arg1);
+		std::printf("LIVE_HEAPSTATS id=%" PRIu64 " path=%s written=%d ms=%.0f\n", id, arg1, ok ? 1 : 0,
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	} else if (cmd == "alloctrace" && n >= 2) {
+		// alloctrace start <sizes,...> | dump <path>: live heap blocks of those sizes by stack (LocalPlatform::StartAllocTrace).
+		const bool start = std::string_view(arg1) == "start";
+		const bool ok    = n >= 3 && (start ? LocalPlatform::StartAllocTrace(arg2) : LocalPlatform::WriteAllocTrace(arg2));
+		std::printf("LIVE_ALLOCTRACE id=%" PRIu64 " %s ok=%d\n", id, start ? "start" : "dump", ok ? 1 : 0);
+	} else if (cmd == "objects") {
+		// objects: what the pipeline cache keeps (pipelines, unoptimized ones replaced, programs) and modules alive.
+		if (LiveCounters::g_objects_report != nullptr) LiveCounters::g_objects_report(id);
+		std::printf("LIVE_OBJECTS id=%" PRIu64 " shader_modules=%" PRId64 "\n", id, LiveCounters::g_shader_modules.load());
 	} else if (cmd == "sync") {
 		// sync: GPU timelines, deferred submissions and pending guest readbacks (a stalled GPU thread).
 		if (LiveCounters::g_sync_report != nullptr) LiveCounters::g_sync_report();
 		std::printf("LIVE_SYNC id=%" PRIu64 "\n", id);
+	} else if (cmd == "gamecmd" && n >= 2) {
+		// gamecmd <text>: an engine console command on the game's pad-reading thread (loader/demonsSoulsWarp.h), e.g.
+		// gamecmd +cp11_unlockAllArchstones, gamecmd +cp11_loadLevel 2 1 (world, level: what archstone travel runs).
+		auto text = line.substr(line.find("gamecmd") + 7);
+		text.erase(0, text.find_first_not_of(' '));
+		while (!text.empty() && (text.back() == '\r' || text.back() == ' ')) text.pop_back();
+		const bool ok = Loader::DemonsSoulsWarp::QueueCommand(text);
+		std::printf("LIVE_GAMECMD id=%" PRIu64 " queued=%d text=%s\n", id, ok ? 1 : 0, text.c_str());
 	} else if (cmd == "warp" && n >= 2) {
 		// warp <map> <spawn> | warp off: the debug warp (loader/demonsSoulsWarp.h).
 		const bool off = std::string_view(arg1) == "off";

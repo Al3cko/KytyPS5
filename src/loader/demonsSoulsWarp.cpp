@@ -1,5 +1,6 @@
 #include "loader/demonsSoulsWarp.h"
 
+#include "common/abi.h"
 #include "common/file.h"
 #include "common/guardedCopy.h"
 #include "common/stringUtils.h"
@@ -270,6 +271,24 @@ bool IsPlayerBuild() {
 	return Peek(0x90032adb0, &code) && std::memcmp(code, IsLocalPlayer, sizeof(code)) == 0;
 }
 
+// 01.007.000's engine command entry: console = [0x902ee4ee8], Execute(console, "+name args") at 0x90081a990, called so
+// by the debug helper at 0x900780bc0 ("+cp11_unlockArchstone 1 2 true", "+cp11_playerLoad ..."); its first call site
+// (0x900780bd2: e8 rel32) identifies the build.
+constexpr uint64_t CommandEntry    = 0x90081a990;
+constexpr uint64_t CommandConsole  = 0x902ee4ee8;
+constexpr uint64_t CommandCallSite = 0x900780bd2;
+bool               IsCommandBuild() {
+	uint8_t code[5] {};
+	if (!Peek(CommandCallSite, &code) || code[0] != 0xe8) return false;
+	int32_t relative = 0;
+	std::memcpy(&relative, code + 1, sizeof(relative));
+	return CommandCallSite + 5 + static_cast<int64_t>(relative) == CommandEntry;
+}
+
+std::mutex        g_command_mutex;
+std::string       g_command;
+std::atomic<bool> g_command_pending {false};
+
 // The player's ChrIns +0x38 is its ChrCtrl, that +0x20 its physics body: angles at +0x10, position at +0x20 (y up, the
 // MSB and save coordinates). ChrCtrl +0xfc is a warp request the game applies the next frame (and clears): position
 // at +0x100, angles at +0x110, the request byte written last.
@@ -321,6 +340,40 @@ void GlideThread() {
 
 } // namespace
 #endif
+
+bool QueueCommand(std::string_view text) {
+#if defined(_WIN32)
+	if (text.empty() || !IsCommandBuild()) return false;
+	std::lock_guard lock(g_command_mutex);
+	g_command = text;
+	g_command_pending.store(true, std::memory_order_release);
+	return true;
+#else
+	(void)text;
+	return false;
+#endif
+}
+
+void RunQueuedCommand() {
+#if defined(_WIN32)
+	if (!g_command_pending.load(std::memory_order_acquire)) return;
+	std::string text;
+	{
+		std::lock_guard lock(g_command_mutex);
+		text = std::move(g_command);
+		g_command_pending.store(false, std::memory_order_relaxed);
+	}
+	uint64_t console = 0;
+	if (!IsCommandBuild() || !Peek(CommandConsole, &console) || console == 0) {
+		std::printf("Game command not run (no console): %s\n", text.c_str());
+		return;
+	}
+	using Execute = KYTY_SYSV_ABI uint64_t (*)(uint64_t console, const char* text);
+	std::printf("Game command: %s\n", text.c_str());
+	std::fflush(stdout);
+	(void)reinterpret_cast<Execute>(CommandEntry)(console, text.c_str());
+#endif
+}
 
 double Glide(float x, float y, float z, float speed) {
 #if defined(_WIN32)
