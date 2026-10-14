@@ -16,7 +16,9 @@ namespace {
 
 constexpr uint32_t Magic = 0x4e4c5052u; // "RPLN"
 
-// A field added to one of these types must be added here too (Save, Load and Same).
+// A field added to one of these types must be added here too (Save, Load and Same). The sizes are the 64-bit Windows
+// build's (Microsoft's STL; libstdc++'s containers have other sizes: the Linux build checks nothing here).
+#if defined(_MSC_VER) || defined(_WIN32)
 static_assert(sizeof(void*) != 8 || sizeof(IR::ResourcePlan) == 496, "ResourcePlan changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ShaderInfo) == 192, "ShaderInfo changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ImageResource) == 80, "ImageResource changed: update resource-plan-serial");
@@ -25,6 +27,7 @@ static_assert(sizeof(void*) != 8 || sizeof(IR::StageOutput) == 48, "StageOutput 
 static_assert(sizeof(void*) != 8 || sizeof(IR::DescriptorSource) == 184, "DescriptorSource changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ResourceBlock) == 64, "ResourceBlock changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::UniformFillPlan) == 96, "UniformFillPlan changed: update resource-plan-serial");
+#endif
 static_assert(std::is_trivially_copyable_v<IR::MemoryInfo>);
 static_assert(std::is_trivially_copyable_v<IR::BufferResource>);
 static_assert(std::is_trivially_copyable_v<IR::SamplerResource>);
