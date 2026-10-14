@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "live-counters.h"
+#include "local-platform.h"
 #include "native-resource-state.h"
 
 #include <algorithm>
@@ -4099,15 +4100,21 @@ void TextureCache::RunGarbageCollector() {
 			m_trigger_gc_memory = trigger;
 		}
 	}
-	// A GPU short of video memory: a log line on where it goes when its use moved by 256 MiB (checked every 60 flips).
-	if (uint64_t video = 0, budget = 0; m_graphics.small_video_memory && tick % 60 == 0 &&
-	                                    m_graphics.QueryLocalVideoMemory(&video, &budget) &&
-	                                    (video > m_logged_video_memory + (uint64_t {256} << 20u) ||
-	                                     video + (uint64_t {256} << 20u) < m_logged_video_memory)) {
-		m_logged_video_memory = video;
-		char label[32];
-		std::snprintf(label, sizeof(label), "flip %llu", static_cast<unsigned long long>(tick));
-		m_graphics.LogVideoMemory(label);
+	// A log line on where the GPU's memory goes when its use moved (checked every 60 flips): on a GPU short of video
+	// memory by 256 MiB of video memory, on others by 1 GiB of video or GPU system memory (issue #14: an RX 9070 XT held
+	// 16 GB of the game's GPU memory in system memory with video memory to spare, and nothing in its log said when).
+	if (uint64_t video = 0, budget = 0, shared = 0; tick % 60 == 0 && m_graphics.QueryLocalVideoMemory(&video, &budget) &&
+	                                                LocalPlatform::QuerySharedGpuMemory(&shared)) {
+		const bool     short_of_video = m_graphics.small_video_memory;
+		const uint64_t step           = short_of_video ? uint64_t {256} << 20u : uint64_t {1} << 30u;
+		const auto moved = [&](uint64_t now, uint64_t logged) { return now > logged + step || now + step < logged; };
+		if (moved(video, m_logged_video_memory) || (!short_of_video && moved(shared, m_logged_shared_memory))) {
+			m_logged_video_memory  = video;
+			m_logged_shared_memory = shared;
+			char label[32];
+			std::snprintf(label, sizeof(label), "flip %llu", static_cast<unsigned long long>(tick));
+			m_graphics.LogVideoMemory(label);
+		}
 	}
 	// Over the budget: the images no draw or dispatch used for StaleTicks flips (~10 s), least recently used first, at
 	// most MaxDeletions a flip. What the game stops drawing it stops binding: 1-1 standing, 3.2 GiB of images were used

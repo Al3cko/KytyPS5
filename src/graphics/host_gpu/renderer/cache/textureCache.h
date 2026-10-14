@@ -374,6 +374,7 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_logged_video_memory = 0; // RunGarbageCollector's log line
+	uint64_t                                          m_logged_shared_memory = 0;
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {
