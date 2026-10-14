@@ -227,6 +227,10 @@ struct RenderExecutor::NativeXprDrawState {
 	// TextureCache::ImagesEpoch after the main executor's last table draw emitted the targets (UINT64_MAX: none): they
 	// stay in place while it does not move (RenderExecutor::TableDraw).
 	mutable uint64_t                 emitted_epoch = UINT64_MAX;
+	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
+	mutable uint64_t                 used_frame = 0;
+	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t UsedFrame() const { return std::atomic_ref<uint64_t>(used_frame).load(std::memory_order_relaxed); }
 };
 
 // One object: its resources under the compiled programs it was translated with.
@@ -774,6 +778,12 @@ struct RenderExecutor::NativeXprCache {
 	std::vector<uint32_t> use_key;
 	size_t                suffix_at = 0; // where the words the try added start (tried_suffix)
 	uint64_t                                swept_frame = UINT64_MAX;
+	// Draw states leave when no draw used them for StateKeepFrames (NativeXprCollect: every StateSweepFrames, past
+	// StatesKept): their keys hold the render targets' addresses, and entering an area made a few thousand that were
+	// never used again (~3 KB each, ~25 MB a world change with what they hold).
+	static constexpr uint64_t StateSweepFrames = 600, StateKeepFrames = 3600;
+	static constexpr size_t   StatesKept       = 2048;
+	uint64_t                  states_swept_frame = UINT64_MAX;
 	// Draw-state key of the latest draw (native or normal), for clean draws.
 	uint64_t state_key       = 0;
 	bool     state_key_valid = false;
@@ -979,6 +989,29 @@ void RenderExecutor::ResolvePendingTicks(uint64_t pending, uint64_t tick) {
 		if (item.tick == pending) item.tick = tick;
 }
 
+// The draw states no draw used for StateKeepFrames leave. What holds one by its address forgets it: this executor's
+// emission and lookup, its table's last draw and its image sets' transits (TableXpr::epoch moves). Not while another
+// executor reads this catalog (a speculation's): it holds them across draws too.
+void RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame) {
+	if (Role() != 0 || m_catalog_readers.load(std::memory_order_relaxed) != 0 ||
+	    cache.states.size() <= NativeXprCache::StatesKept)
+		return;
+	const auto   write  = CatalogWrite();
+	const size_t before = cache.states.size();
+	std::erase_if(cache.states, [&](const auto& item) {
+		return item.second->UsedFrame() + NativeXprCache::StateKeepFrames < frame;
+	});
+	if (cache.states.size() == before) return;
+	cache.emit           = {};
+	cache.last_state     = nullptr;
+	cache.last_state_key = 0;
+	m_native_xpr_verify  = {};
+	TableForgetStates();
+	if (SlowLog::HitchThreshold() > 0.0)
+		std::printf("[tsc %llu] XPR draw states %zu -> %zu\n", static_cast<unsigned long long>(__rdtsc()), before,
+		            cache.states.size());
+}
+
 // Once per frame: the retired sets the GPU is done with are kept for reuse or freed, one call per
 // pool.
 void RenderExecutor::NativeXprCollect() {
@@ -1012,6 +1045,10 @@ void RenderExecutor::NativeXprCollect() {
 			NativeXprRetire(std::move(it->second), false);
 			it = cache.records.erase(it);
 		}
+	}
+	if (frame - cache.states_swept_frame >= NativeXprCache::StateSweepFrames) {
+		cache.states_swept_frame = frame;
+		NativeXprSweepStates(cache, frame);
 	}
 	if (cache.collected_frame == frame || cache.retired.empty()) return;
 	cache.collected_frame = frame;
@@ -1717,6 +1754,7 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	auto&      slot  = cache.states[state_key];
 	if (!slot) slot = std::make_unique<NativeXprDrawState>();
 	*slot = std::move(draw_state);
+	slot->Use(m_context.FrameNumber());
 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
 }
 
@@ -3173,6 +3211,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
 	emit.pipeline    = &pipeline;
+	draw_state.Use(m_context.FrameNumber());
 	emit.index_base  = index_base;
 	emit.index_bytes = index_bytes;
 	emit.index_type  = index_type;

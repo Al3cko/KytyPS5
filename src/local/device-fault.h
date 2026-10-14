@@ -39,6 +39,11 @@ struct Registry {
 	PFN_vkGetDeviceFaultInfoEXT            get = nullptr;
 	std::mutex                             mutex;
 	std::multimap<uint64_t, BufferSpan>    buffers; // by device address (an address reused after a free: both)
+	// Past this many the older half of the destroyed ones leave (the limit then twice what is left, at least
+	// BufferHistory): a report wants the recent ones, and a world change destroys ~10000 (72 bytes each, kept by the
+	// million before).
+	static constexpr size_t                BufferHistory = size_t {1} << 16u;
+	size_t                                 buffer_limit  = BufferHistory;
 	std::atomic<int>                       report_state {0}; // 0 none, 1 being written, 2 written
 };
 inline Registry g_registry;
@@ -173,9 +178,21 @@ inline void NoteDiscard(VkCommandBuffer command) {
 inline void NoteCreated(uint64_t device, uint64_t size, uint64_t cpu) {
 	if (device == 0 || g_registry.device.load(std::memory_order_relaxed) == VK_NULL_HANDLE) return;
 	std::lock_guard lock(g_registry.mutex);
-	// (Bounded: the destroyed ones leave first.)
-	if (g_registry.buffers.size() >= (size_t {1} << 20u))
-		std::erase_if(g_registry.buffers, [](const auto& item) { return item.second.destroyed_ns != 0; });
+	if (g_registry.buffers.size() >= g_registry.buffer_limit) {
+		// The older half of the destroyed ones leave.
+		std::vector<uint64_t> destroyed;
+		for (const auto& [address, span]: g_registry.buffers)
+			if (span.destroyed_ns != 0) destroyed.push_back(span.destroyed_ns);
+		if (!destroyed.empty()) {
+			const auto middle = destroyed.begin() + static_cast<std::ptrdiff_t>(destroyed.size() / 2);
+			std::nth_element(destroyed.begin(), middle, destroyed.end());
+			const uint64_t cutoff = *middle;
+			std::erase_if(g_registry.buffers, [&](const auto& item) {
+				return item.second.destroyed_ns != 0 && item.second.destroyed_ns <= cutoff;
+			});
+		}
+		g_registry.buffer_limit = std::max(Registry::BufferHistory, g_registry.buffers.size() * 2);
+	}
 	g_registry.buffers.emplace(device, BufferSpan {size, cpu, NowNs(), 0});
 }
 

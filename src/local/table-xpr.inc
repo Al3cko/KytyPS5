@@ -161,6 +161,8 @@ struct RenderExecutor::TablePair {
 	// A dispatch's: the pair of the table dispatch that came after this one's the last time (the main executor's):
 	// TablePrefetchNext loads its lines while this one is made.
 	TablePair* next = nullptr;
+	// The frame the main executor last looked it up (TableSweepPairs lets one go that none used for a while).
+	uint64_t used_frame = 0;
 };
 
 struct RenderExecutor::TableXpr {
@@ -168,7 +170,13 @@ struct RenderExecutor::TableXpr {
 	using Variant = TableVariant;
 	std::unordered_map<uint64_t, Pair, HashedKey> pairs;      // by shader addresses
 	std::unordered_map<uint64_t, Pair, HashedKey> dispatches; // by the compute stage's registers (TableDispatchKey)
-	// The pairs found last, direct-mapped by key (pairs are never erased and do not move: a pointer stays valid).
+	// Pairs no draw or dispatch used for PairKeepFrames leave (TableSweepPairs: every PairSweepFrames, past PairsKept):
+	// they are keyed by the shaders' addresses, and a world change loaded its shaders elsewhere (~1000 new pairs, ~8 KB
+	// each with their runs). Pairs do not move: a pointer stays valid until then, when every one held is dropped.
+	static constexpr uint64_t PairSweepFrames = 600, PairKeepFrames = 3600;
+	static constexpr size_t   PairsKept       = 2048;
+	uint64_t                  pairs_swept     = 0;
+	// The pairs found last, direct-mapped by key.
 	static constexpr size_t PairCacheEntries = 256;
 	std::array<std::pair<uint64_t, Pair*>, PairCacheEntries> pair_cache {};
 	// The pair TableTry found last, by its key (consecutive draws mostly keep their shaders: no hash of the key, ~0.6% of
@@ -286,6 +294,67 @@ void RenderExecutor::TableReset(TablePair& pair) {
 	        .sightings = pair.sightings, .portable = pair.portable};
 }
 
+// Draw states left (NativeXprSweepStates): the last table draw's and the image sets' transits under one are forgotten,
+// and the executors reading this catalog drop what they hold of it (epoch).
+void RenderExecutor::TableForgetStates() {
+	auto* table = m_table_xpr.get();
+	if (table == nullptr) return;
+	table->last_pair  = nullptr;
+	table->last_state = nullptr;
+	table->last_set   = nullptr;
+	++table->epoch;
+	for (auto* pairs: {&table->pairs, &table->dispatches})
+		for (auto& [key, pair]: *pairs)
+			for (auto& [words, set]: pair.sets)
+				if (set->transit_state != nullptr) {
+					set->transit_state = nullptr;
+					set->transit_epoch = UINT64_MAX;
+				}
+}
+
+// The pairs and dispatches no draw or dispatch looked up for PairKeepFrames leave, their image sets retired. Every
+// pointer to a pair goes too: the lookups' (pair_cache, found_*), the last draw's and dispatch's, the store request,
+// the gather and the prefetch chain (next). Only the catalog's owner, with no executor reading its catalog, and only at
+// the start of a table draw or dispatch (no pair is held then).
+void RenderExecutor::TableSweepPairs() {
+	auto* table = m_table_xpr.get();
+	if (table == nullptr || Role() != 0) return;
+	const auto frame = m_context.FrameNumber();
+	if (frame - table->pairs_swept < TableXpr::PairSweepFrames) return;
+	table->pairs_swept = frame;
+	if (m_catalog_readers.load(std::memory_order_relaxed) != 0 ||
+	    table->pairs.size() + table->dispatches.size() <= TableXpr::PairsKept)
+		return;
+	const auto   write  = CatalogWrite();
+	const size_t before = table->pairs.size() + table->dispatches.size();
+	for (auto* pairs: {&table->pairs, &table->dispatches})
+		std::erase_if(*pairs, [&](auto& item) {
+			auto& pair = item.second;
+			// (A translation or compile it waits for keeps it.)
+			if (pair.used_frame + TableXpr::PairKeepFrames >= frame || pair.waiting) return false;
+			for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
+			return true;
+		});
+	const size_t after = table->pairs.size() + table->dispatches.size();
+	if (after == before) return;
+	table->pair_cache         = {};
+	table->found_key          = {};
+	table->found_pair         = nullptr;
+	table->found_dispatch_key = {};
+	table->found_dispatch     = nullptr;
+	table->previous_dispatch  = nullptr;
+	table->store              = nullptr;
+	table->gathered           = nullptr;
+	table->last_pair          = nullptr;
+	table->last_state         = nullptr;
+	table->last_set           = nullptr;
+	++table->epoch;
+	for (auto* pairs: {&table->pairs, &table->dispatches})
+		for (auto& [key, pair]: *pairs) pair.next = nullptr;
+	if (SlowLog::HitchThreshold() > 0.0)
+		std::printf("[tsc %llu] table pairs %zu -> %zu\n", static_cast<unsigned long long>(__rdtsc()), before, after);
+}
+
 RenderExecutor::TableXpr& RenderExecutor::OwnTable() {
 	if (!m_table_xpr) m_table_xpr = std::make_shared<TableXpr>();
 	return *m_table_xpr;
@@ -364,6 +433,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
+	TableSweepPairs();
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 0); // census: the table path's phases (b)
 	auto*       catalog = CatalogTable();
 	auto&       cache   = *m_native_xpr;
@@ -404,6 +474,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	}
 	auto& pair = *known;
 	TablePrefetchPair(pair);
+	if (Role() == 0) pair.used_frame = frame;
 	if (pair.vs != vs_address || pair.ps != ps_address || pair.start_instance != vs.start_instance_user_sgpr)
 		return Spec::Refuse("table: pair key"), TableResult::Native;
 	if (const auto generation = ShaderMapGeneration(); generation != pair.generation[Role()]) {
@@ -2005,6 +2076,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
 	emit.pipeline    = &pipeline;
+	draw_state.Use(m_context.FrameNumber());
 	if (indexed) {
 		emit.index_base  = index_base;
 		emit.index_bytes = index_bytes;
@@ -2223,6 +2295,7 @@ void RenderExecutor::TableDispatchSeen(const HW::ComputeShaderInfo& cs, const ch
 		}
 	}
 	++it->second.sightings;
+	it->second.used_frame = m_context.FrameNumber();
 }
 
 bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
@@ -2233,11 +2306,12 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
+	TableSweepPairs();
 	const auto& sh    = buffer.GetShaders();
 	const auto& cs    = sh.GetCs();
 	const auto  words = TableDispatchWords(cs, thread_dimensions);
-	// (The pair found last again without its hash or lookup: runs of dispatches keep their program. Pairs are never
-	// erased, a pointer stays valid; the main executor's own catalog only.)
+	// (The pair found last again without its hash or lookup: runs of dispatches keep their program. A pointer stays
+	// valid until TableSweepPairs, which drops this one; the main executor's own catalog only.)
 	const bool own   = Role() == 0 && catalog == m_table_xpr.get();
 	auto*      known = own && catalog->found_dispatch_key == words ? catalog->found_dispatch : nullptr;
 	if (known == nullptr) {
@@ -2255,6 +2329,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	if ((Role() == 0 && known->sightings < 2) || known->vs != cs.cs_regs.data_addr) return false;
 	auto& pair = *known;
 	TablePrefetchPair(pair);
+	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1f, 0); // census: the dispatches' phases (b)
 	// The dispatch executor's sets retire here too (NativeXprTry collects only the draw executor's): without it they

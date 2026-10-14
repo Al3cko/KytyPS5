@@ -344,6 +344,7 @@ private:
 	                                        std::span<const std::pair<uint32_t, uint32_t>> images,
 	                                        std::span<const std::pair<uint32_t, uint32_t>> buffers);
 	void NativeXprCollect();
+	void NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
 	// A draw state's dynamic state, only what differs from what the emissions recorded in the command buffer.
 	static void NativeXprEmitDynamic(NativeXprCache& cache, vk::CommandBuffer vk_buffer, const NativeXprDrawState& draw_state,
 	                                 bool same_command);
@@ -408,6 +409,7 @@ public:
 	void ReadCatalogOf(RenderExecutor& owner, uint32_t role) noexcept {
 		m_catalog = &owner;
 		m_role    = role;
+		owner.m_catalog_readers.fetch_add(1, std::memory_order_relaxed);
 	}
 	static constexpr uint32_t Roles = 9;
 
@@ -425,6 +427,8 @@ private:
 	// it across draws is dropped when the owner changed it (TableXpr::epoch).
 	RenderExecutor* m_catalog = nullptr;
 	uint32_t        m_role    = 0;
+	// Executors that read this one's catalog (ReadCatalogOf): its draw states stay while there are any.
+	std::atomic<uint32_t> m_catalog_readers {0};
 	[[nodiscard]] RenderExecutor& Catalog() noexcept { return m_catalog != nullptr ? *m_catalog : *this; }
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
@@ -436,6 +440,8 @@ private:
 	[[nodiscard]] TableXpr*       CatalogTable() noexcept { return Catalog().m_table_xpr.get(); }
 	TableXpr&                     OwnTable();
 	void                          DropStaleCatalog();
+	void                          TableForgetStates();
+	void                          TableSweepPairs();
 	// The linear copy shader the normal path last copied with (DemonsSouls::TryLinearCopy), the shader map generation
 	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
 	std::atomic<uint64_t> m_linear_copy_shader {0}, m_linear_copy_generation {0};
