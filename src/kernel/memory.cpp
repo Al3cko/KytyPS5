@@ -28,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -1369,7 +1370,7 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* s
 		if (!done && !part.private_memory && g_guest_address_space != nullptr) {
 			// A partial unmap of the part's view (Windows) takes the mapping entries of its other parts away until they
 			// are mapped again, under the address-space lock: written once that change is done.
-			g_guest_address_space->WaitForChanges();
+			g_guest_address_space->WaitForChanges(part.address, part.size);
 			done = TryWriteBacking(part.address, source, part.size);
 			if (done) LiveCounters::Add(LiveCounters::WriteBackRetries);
 		}
