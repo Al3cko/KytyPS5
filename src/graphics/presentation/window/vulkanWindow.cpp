@@ -105,14 +105,21 @@ static bool HasExtension(const std::vector<const char*>& extensions, const char*
 
 // VK_KHR_pipeline_binary for the static precompile's pipelines (pipelineBinaries.h), with maintenance5
 // for the pipeline creation flags it needs. KYTY_PIPELINE_BINARIES=0: the static pipeline cache instead.
+// Without the binaries, maintenance5 alone where the driver has it: pipelines take their SPIR-V inline,
+// so the shader modules are kept as SPIR-V instead of driver objects (ModuleStore: a driver without the
+// binaries, e.g. NVIDIA 566 on a laptop, otherwise holds a copy of every module's SPIR-V in its heap,
+// 1.5-2 GB of RAM). KYTY_MODULE_STORE=0: driver objects.
 static void AddPipelineBinaryExtensions(const std::vector<vk::ExtensionProperties>& available,
                                         std::vector<const char*>&                   extensions) {
-	const char* setting = std::getenv("KYTY_PIPELINE_BINARIES");
+	const char* setting      = std::getenv("KYTY_PIPELINE_BINARIES");
+	const char* store        = std::getenv("KYTY_MODULE_STORE");
+	const bool  maintenance5 = HasExtension(available, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 	if ((setting == nullptr || std::string_view(setting) != "0") &&
-	    HasExtension(available, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) &&
-	    HasExtension(available, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+	    HasExtension(available, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) && maintenance5) {
 		extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 		extensions.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	} else if (maintenance5 && (store == nullptr || std::string_view(store) != "0")) {
+		extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 	}
 }
 
@@ -751,13 +758,17 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	vk::PhysicalDeviceShaderDrawParametersFeatures supported_draw_parameters {};
 	supported_draw_parameters.pNext = supported_features2.pNext;
 	supported_features2.pNext       = &supported_draw_parameters;
-	const bool binary_extensions = HasExtension(device_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	const bool binary_extensions       = HasExtension(device_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	const bool maintenance5_extension  = HasExtension(device_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 	vk::PhysicalDevicePipelineBinaryFeaturesKHR supported_binaries {};
 	vk::PhysicalDeviceMaintenance5FeaturesKHR   supported_maintenance5 {};
-	if (binary_extensions) {
+	if (maintenance5_extension) {
 		supported_maintenance5.pNext = supported_features2.pNext;
-		supported_binaries.pNext     = &supported_maintenance5;
-		supported_features2.pNext    = &supported_binaries;
+		supported_features2.pNext    = &supported_maintenance5;
+	}
+	if (binary_extensions) {
+		supported_binaries.pNext  = supported_features2.pNext;
+		supported_features2.pNext = &supported_binaries;
 	}
 	const bool copy_indirect_extension = HasExtension(device_extensions, VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
 	vk::PhysicalDeviceCopyMemoryIndirectFeaturesNV supported_copy_indirect {};
@@ -768,10 +779,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	physical_device.getFeatures2(&supported_features2);
 	graphics.copy_memory_indirect_enabled = copy_indirect_extension && supported_copy_indirect.indirectCopy;
 	LOGF("Vulkan indirect memory copies: %s\n", graphics.copy_memory_indirect_enabled ? "true" : "false");
-	graphics.pipeline_binaries_enabled =
-	    binary_extensions && supported_binaries.pipelineBinaries && supported_maintenance5.maintenance5;
-	// (maintenance5 is enabled with the binaries: pipelines take SPIR-V inline.)
-	ModuleStore::Enable(graphics.pipeline_binaries_enabled);
+	graphics.maintenance5_enabled      = maintenance5_extension && supported_maintenance5.maintenance5;
+	graphics.pipeline_binaries_enabled = binary_extensions && supported_binaries.pipelineBinaries && graphics.maintenance5_enabled;
+	// (With maintenance5, with or without the binaries, pipelines take SPIR-V inline.)
+	ModuleStore::Enable(graphics.maintenance5_enabled);
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
@@ -941,11 +952,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	vk::PhysicalDevicePipelineBinaryFeaturesKHR     binaries {};
 	vk::PhysicalDeviceMaintenance5FeaturesKHR       maintenance5 {};
 	vk::DevicePipelineBinaryInternalCacheControlKHR internal_cache {};
-	if (graphics.pipeline_binaries_enabled) {
+	if (graphics.maintenance5_enabled) {
 		maintenance5.maintenance5 = VK_TRUE;
 		maintenance5.pNext        = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &maintenance5;
+	}
+	if (graphics.pipeline_binaries_enabled) {
 		binaries.pipelineBinaries = VK_TRUE;
-		binaries.pNext            = &maintenance5;
+		binaries.pNext            = const_cast<void*>(create_info.pNext);
 		create_info.pNext         = &binaries;
 		vk::PhysicalDevicePipelineBinaryPropertiesKHR binary_properties {};
 		vk::PhysicalDeviceProperties2                 properties {};

@@ -50,6 +50,9 @@ struct GraphicContext {
 	// VK_KHR_pipeline_binary (and maintenance5's create flags) is enabled: the static precompile's
 	// pipelines are its binaries instead (pipelineBinaries.h); in the precompile, its output.
 	bool                               pipeline_binaries_enabled             = false;
+	// VK_KHR_maintenance5 is enabled (with the binaries, or alone): pipelines can take SPIR-V inline,
+	// so shader modules are kept as SPIR-V instead of driver objects (ModuleStore).
+	bool                               maintenance5_enabled                  = false;
 	// VK_NV_copy_memory_indirect: an upload prologue's copies are one command (BufferCache::UploadDirtyRanges).
 	bool                               copy_memory_indirect_enabled          = false;
 	// False (the emulator): the driver keeps no copy of its own of the pipelines it makes (the
