@@ -10,6 +10,7 @@
 #include <xbyak/xbyak.h>
 #endif
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "jit-arena.h"
 
 #include <algorithm>
 #include <bit>
@@ -683,6 +684,12 @@ public:
 			return false;
 		}
 		result.function = c.getCode<LinearSrtPlan::Function>();
+		// Its code alone, in the shared executable memory (jit-arena.h: calls go through a register, jumps to its own
+		// labels); the generator and its page-aligned buffer go.
+		if (const void* copy = JitArena::Copy(c.getCode(), c.getSize())) {
+			result.function = reinterpret_cast<LinearSrtPlan::Function>(const_cast<void*>(copy));
+			result.code.reset();
+		}
 		return true;
 	}
 	static bool KYTY_SYSV_ABI ReadUser(const SrtRuntime* runtime, uint64_t index,

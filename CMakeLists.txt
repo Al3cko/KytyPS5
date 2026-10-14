@@ -367,6 +367,10 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
+	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.h"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
@@ -489,6 +493,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
@@ -555,6 +560,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 )
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
@@ -566,6 +572,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/WaterfallDescriptor.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
@@ -778,6 +785,7 @@ if(LINUX)
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/tiler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+		"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/shader/shader.cpp"
 		"${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
 		"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
