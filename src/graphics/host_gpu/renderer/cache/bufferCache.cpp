@@ -61,7 +61,6 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <string>
 #include <memory>
 #include <mutex>
-#include <unordered_set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -2220,18 +2219,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		{
 			const std::unique_lock lock(m_gpu_modified_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
-		}
-		if (LiveCounters::Watched(vaddr, size)) {
-			// (Diagnostic: each written range over the watch range once, with the shader that writes it.)
-			static std::mutex                   watch_mutex;
-			static std::unordered_set<uint64_t> watch_seen;
-			std::lock_guard                     lock(watch_mutex);
-			if (watch_seen.size() < 4096 && watch_seen.insert(vaddr * 0x9e3779b97f4a7c15ull ^ size).second)
-				std::printf("[tsc %llu] WATCH shader-write 0x%llx+0x%llx shader=0x%llx srt=0x%llx texel=%d\n",
-				            static_cast<unsigned long long>(__rdtsc()), static_cast<unsigned long long>(vaddr),
-				            static_cast<unsigned long long>(size),
-				            static_cast<unsigned long long>(LiveCounters::g_last_dispatch_shader),
-				            static_cast<unsigned long long>(Libs::LibKernel::Memory::g_srt_shader_hash), is_texel_buffer ? 1 : 0);
 		}
 		NoteGpuWrite(vaddr, size);
 		Spec::NoteGpuWrite(vaddr, size);
