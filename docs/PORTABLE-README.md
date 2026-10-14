@@ -79,9 +79,12 @@ help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing
 Standard, 25.5 at Low, 25.8 at Lowest; 28.8 at Lowest with render height 1080).
 "Frame generation" (DLSS, 2x to 6x) needs NVIDIA's Streamline libraries, which this package does not
 include: it stays greyed out here.
-"Show the frame rate" puts the frames per second at the top right of the game image (the emulator's own
-small panel; detailed overlays with CPU and graphics card readings, as seen in videos, come from separate
-tools such as MSI Afterburner's RivaTuner Statistics Server).
+"Overlay" (Off by default) shows the emulator's own panel at the top right of the game image: "Frame rate"
+the frames per second and a graph of the last frames' times (60 and 30 fps lines, hitches in red, the 1% low
+and the longest frame of the last 10 seconds); "Detailed" adds the render thread's time in each frame (orange),
+the graphics card (load, clock, temperature, power and video memory on NVIDIA cards), the processor's load
+with a bar for each core, and the memory in use. (The overlays seen in videos with temperatures and voltages
+of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.)
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 

@@ -367,6 +367,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
+	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.h"

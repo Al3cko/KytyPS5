@@ -17,6 +17,7 @@
 #include "vulkan-recording.h"
 #endif
 #include "frame-gen.h"
+#include "perf-overlay.h"
 
 #include <algorithm>
 #include <array>
@@ -385,10 +386,67 @@ struct Presenter::Impl {
 	FramePool             frames;
 	std::atomic<uint64_t> presented_overlay_revision {0};
 	// KYTY_FPS_HUD: the frame rate panel, its numbers refreshed once a second (the game's presented
-	// frames times the frames DLSS-G shows for each).
+	// frames times the frames DLSS-G shows for each), its frame-time graph with every present; 2: the GPU,
+	// processor and memory rows too (PerfOverlay's sampling thread).
 	SystemOverlayHud                      hud;
 	std::chrono::steady_clock::time_point hud_window {};
-	uint32_t                              hud_frames = 0;
+	uint32_t                              hud_frames      = 0;
+	bool                                  machine_started = false;
+
+	// The detailed panel's rows from the machine's last sample.
+	void UpdateMachineRows() {
+		const auto machine = PerfOverlay::LatestMachine();
+		auto&      perf    = hud.perf;
+		perf.rows.clear();
+		perf.core_load.clear();
+		perf.core_note.clear();
+		if (!machine.valid) return;
+		constexpr double Gb   = 1024.0 * 1024.0 * 1024.0;
+		const auto       text = [](const char* format, auto... values) {
+            std::array<char, 160> line {};
+            std::snprintf(line.data(), line.size(), format, values...);
+            return std::string(line.data());
+		};
+		std::string gpu = machine.gpu_name;
+		if (machine.gpu_valid)
+			gpu += text("   %u%%   %u MHz   %u\xC2\xB0" "C   %u W", machine.gpu_load, machine.gpu_clock,
+			            machine.gpu_temperature, machine.gpu_power);
+		perf.rows.push_back({"GPU", gpu});
+		std::string video;
+		if (machine.video_usage != 0) video = text("emulator %.1f GB", static_cast<double>(machine.video_usage) / Gb);
+		if (machine.gpu_memory_total != 0)
+			video += text("%sGPU %.1f / %.1f GB", video.empty() ? "" : "   |   ",
+			              static_cast<double>(machine.gpu_memory_used) / Gb, static_cast<double>(machine.gpu_memory_total) / Gb);
+		else if (machine.video_budget != 0)
+			video += text("  of %.1f GB", static_cast<double>(machine.video_budget) / Gb);
+		if (!video.empty()) perf.rows.push_back({"VRAM", video});
+		perf.rows.push_back({"CPU", machine.cpu_name + (machine.core_load.empty() ? std::string()
+		                                                                          : text("   %.0f%%", machine.cpu_load * 100.0f))});
+		perf.core_load = machine.core_load;
+		// A hybrid processor's performance cores (the higher efficiency class) apart from its efficiency cores.
+		const auto top = machine.core_class.empty() ? 0 : *std::max_element(machine.core_class.begin(), machine.core_class.end());
+		const bool hybrid = std::any_of(machine.core_class.begin(), machine.core_class.end(), [&](uint8_t c) { return c != top; });
+		perf.core_fast.assign(perf.core_load.size(), 0);
+		double   mhz[2] {};
+		uint32_t cores[2] {};
+		for (size_t i = 0; i < perf.core_load.size(); ++i) {
+			const bool fast = hybrid && i < machine.core_class.size() && machine.core_class[i] == top;
+			perf.core_fast[i] = fast ? 1 : 0;
+			if (i < machine.core_clock.size() && machine.core_clock[i] != 0) {
+				mhz[fast ? 1 : 0] += machine.core_clock[i];
+				cores[fast ? 1 : 0]++;
+			}
+		}
+		if (hybrid && cores[0] != 0 && cores[1] != 0)
+			perf.core_note = text("P-cores %.2f GHz   |   E-cores %.2f GHz", mhz[1] / cores[1] / 1000.0, mhz[0] / cores[0] / 1000.0);
+		else if (cores[0] + cores[1] != 0)
+			perf.core_note = text("%.2f GHz", (mhz[0] + mhz[1]) / (cores[0] + cores[1]) / 1000.0);
+		perf.rows.push_back({"Emulator", text("%.1f cores   |   render thread %.0f%%   |   RAM %.1f GB", machine.process_cores,
+		                                      machine.render_thread * 100.0f, static_cast<double>(machine.process_memory) / Gb)});
+		if (machine.ram_total != 0)
+			perf.rows.push_back({"RAM", text("%.1f / %.1f GB", static_cast<double>(machine.ram_used) / Gb,
+			                                 static_cast<double>(machine.ram_total) / Gb)});
+	}
 
 	// The shader prefetch's progress line while it runs, and for a few seconds after.
 	std::chrono::steady_clock::time_point prefetch_finished {};
@@ -416,20 +474,30 @@ struct Presenter::Impl {
 	}
 
 	[[nodiscard]] SystemOverlayHud* UpdateHud(bool reuse) {
-		static const bool enabled = [] {
-			const char* value = std::getenv("KYTY_FPS_HUD");
-			return value != nullptr && *value != '\0' && std::string_view(value) != "0";
-		}();
-		const auto now = std::chrono::steady_clock::now();
+		const int  level = PerfOverlay::Level();
+		const auto now   = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
-		if (!enabled) {
+		if (level == 0) {
 			return hud.status.empty() && hud.notice.empty() ? nullptr : PlaceHud();
+		}
+		if (level >= 2 && !machine_started) {
+			// The GPU NVML reports on: the Vulkan device's.
+			machine_started = true;
+			vk::PhysicalDeviceIDProperties id {};
+			vk::PhysicalDeviceProperties2  properties {};
+			properties.pNext = &id;
+			window.graphic_ctx.physical_device.getProperties2(&properties);
+			std::string name = properties.properties.deviceName.data();
+			if (name.rfind("NVIDIA ", 0) == 0) name.erase(0, 7);
+			PerfOverlay::StartMachine(id.deviceUUID.data(), name);
 		}
 		if (hud_window == std::chrono::steady_clock::time_point {}) {
 			hud_window = now;
 		}
 		hud_frames += reuse ? 0u : 1u;
+		// The graph: the last 300 frames (5 seconds at 60 fps).
+		PerfOverlay::RecentFrames(300, &hud.perf.frame_ms, level >= 2 ? &hud.perf.busy_ms : nullptr);
 		const double seconds = std::chrono::duration<double>(now - hud_window).count();
 		if (seconds >= 1.0) {
 			const double   game  = hud_frames / seconds;
@@ -445,6 +513,23 @@ struct Presenter::Impl {
 			}
 			hud.title  = title.data();
 			hud.detail = detail.data();
+			// The last 10 seconds' frames: their average time, the render thread's busy part, the worst 1% as
+			// fps and the longest.
+			const auto summary = PerfOverlay::Summarize(10.0);
+			std::array<char, 160> note {};
+			if (summary.fps <= 0) {
+				note[0] = '\0';
+			} else if (level >= 2 && !hud.perf.busy_ms.empty()) {
+				double busy = 0;
+				for (const float ms: hud.perf.busy_ms) busy += ms;
+				std::snprintf(note.data(), note.size(), "frame %.1f ms   |   render thread %.1f ms   |   1%% low %.0f fps   |   max %.0f ms",
+				              1000.0 / summary.fps, busy / static_cast<double>(hud.perf.busy_ms.size()), summary.low1, summary.max_ms);
+			} else {
+				std::snprintf(note.data(), note.size(), "frame %.1f ms   |   1%% low %.0f fps   |   max %.0f ms",
+				              1000.0 / summary.fps, summary.low1, summary.max_ms);
+			}
+			hud.perf.graph_note = note.data();
+			if (level >= 2) UpdateMachineRows();
 			hud_window = now;
 			hud_frames = 0;
 		}

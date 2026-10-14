@@ -16,9 +16,11 @@ $renderHeights = '1440 (PS5)', '1296', '1152', '1080', '900'
 $qualities = 'Standard (PS5)', 'Low', 'Lowest'
 # DLSS frame generation (run-windows.ps1 -FrameGen: the generated frames per rendered one, the multiplier less one).
 $frameGens = 'Off', '2x', '3x', '4x', '5x', '6x'
+# The emulator's own panel at the top right of the game image (KYTY_FPS_HUD 0, 1, 2).
+$overlays = 'Off', 'Frame rate', 'Detailed'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0; hud = $false }
+	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0; hud = 0 }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -79,8 +81,9 @@ function Get-PlayCommand {
 	if ([int]$settings.render -gt 0 -and [int]$settings.render -ne 1440) { $arguments += @('-RenderHeight', [int]$settings.render) }
 	if ($settings.quality -in 'low', 'lowest') { $arguments += @('-Quality', $settings.quality) }
 	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { $arguments += @('-FrameGen', ([int]$settings.framegen - 1)) }
-	# The emulator's frame rate panel (KYTY_FPS_HUD), top right of the game image.
-	if ($settings.hud) { $arguments += @('-Set', 'KYTY_FPS_HUD=1') }
+	# The emulator's panel (KYTY_FPS_HUD) at the top right of the game image: the frame rate and frame times, or with
+	# the GPU, processor and memory too.
+	if ([int]$settings.hud -ge 1) { $arguments += @('-Set', "KYTY_FPS_HUD=$([Math]::Min([int]$settings.hud, 2))") }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
@@ -186,8 +189,6 @@ $vsync = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'VSync (no
 Add-Row '' @($vsync)
 $hdr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'HDR (turn on "Use HDR" in Windows display settings first)'; AutoSize = $true; Checked = [bool]$settings.hdr }
 Add-Row '' @($hdr)
-$hud = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Show the frame rate (top right of the game image)'; AutoSize = $true; Checked = [bool]$settings.hud }
-Add-Row '' @($hud)
 $render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
 $render.Items.AddRange($renderHeights)
 $render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string][int]$settings.render } | Select-Object -First 1)
@@ -207,6 +208,12 @@ if ($frameGen.SelectedIndex -lt 0) { $frameGen.SelectedIndex = 0 }
 $frameGenNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0'
 	Text = $(if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' } else { 'needs NVIDIA''s Streamline DLLs (a local build with the Streamline SDK)' }) }
 Add-Row 'Frame generation' @($frameGen, $frameGenNote)
+$hud = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
+$hud.Items.AddRange($overlays)
+# (An older launcher saved true for the frame rate.)
+$hud.SelectedIndex = [Math]::Max(0, [Math]::Min($overlays.Count - 1, [int]$settings.hud))
+$hudNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'top right: frame rate and frame times; detailed: GPU, CPU, memory'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+Add-Row 'Overlay' @($hud, $hudNote)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -235,7 +242,7 @@ function Read-Form {
 	$settings.fps120     = $fps120.Checked
 	$settings.vsync      = $vsync.Checked
 	$settings.hdr        = $hdr.Checked
-	$settings.hud        = $hud.Checked
+	$settings.hud        = $hud.SelectedIndex
 	$settings.render     = [int](([string]$render.SelectedItem -split ' ')[0])
 	$settings.quality    = ([string]$quality.SelectedItem -split ' ')[0].ToLowerInvariant()
 	# (Kept as it was where the DLLs are missing.)
