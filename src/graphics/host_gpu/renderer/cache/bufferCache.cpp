@@ -25,6 +25,8 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 // 1: RangeSet fast paths (rangeSet.h) for the GPU-modified range set.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
+// Live switch (same-process A/B): ObtainBuffer's memo of repeated shader writes.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_memo_mode {1};
 // 1: a guest readback whose window meets an image falls back to the request's own pages.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode {0};
 // KYTY_READBACK_QUEUE (readback-queue.h): 1: readbacks whose bytes no in-flight GPU work writes
@@ -728,6 +730,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.SubtractSorted(request->parts);
+		++m_gpu_coverage_epoch;
 	}
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
@@ -935,6 +938,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.SubtractSorted(copies);
+		++m_gpu_coverage_epoch;
 	}
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
 	// are never published from the snapshot. Any later upload/GPU write invalidates it.
@@ -1233,6 +1237,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.SubtractSorted(copies);
+		++m_gpu_coverage_epoch;
 	}
 }
 
@@ -1526,6 +1531,7 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.ForEachIntersection(first, last - first, [&](RangeSet::Range range) { dropped += range.size; });
 		m_gpu_modified_ranges.Subtract(first, last - first);
+		++m_gpu_coverage_epoch;
 	}
 	LiveCounters::Add(LiveCounters::DiscardedGpuBytes, dropped);
 	InvalidateCopyFeedback(first, last - first);
@@ -2217,6 +2223,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	// A range written again with nothing changed since (m_write_memo): no lookup, synchronization or range Add. (The
+	// light-loop chains write the same few shared blocks in every dispatch: ~2100 of ~3200 shader-written ranges a frame
+	// at Latria were repeats, each a page-table lookup, a coverage query and a range Add; ~57% of them hit, Stonefang
+	// standing 9.11 -> 8.91 ms render in the same process.)
+	auto& memo = m_write_memo[((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull >> 40u)) % m_write_memo.size()];
+	if (is_written && memo.vaddr == vaddr && memo.size == size && memo.texel == is_texel_buffer &&
+	    memo.registration == RegistrationEpoch() && memo.coverage == m_gpu_coverage_epoch &&
+	    kyty_local_write_memo_mode.load(std::memory_order_relaxed) != 0) {
+		if (auto* buffer = m_slot_buffers.try_get(memo.id); buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(vaddr, size)) {
+			TouchBuffer(*buffer);
+			InvalidateCopyFeedback(vaddr, size);
+			NoteGpuWrite(vaddr, size);
+			Spec::NoteGpuWrite(vaddr, size);
+			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
+			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+			return {buffer, buffer->Offset(vaddr)};
+		}
+	}
+
 	auto* buffer = m_slot_buffers.try_get(id);
 	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
 		id     = FindBuffer(vaddr, size);
@@ -2236,6 +2261,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		Spec::NoteGpuWrite(vaddr, size);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+		memo = {vaddr, size, RegistrationEpoch(), m_gpu_coverage_epoch, id, is_texel_buffer};
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }
