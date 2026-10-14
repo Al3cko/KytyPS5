@@ -14,9 +14,11 @@ $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
 $renderHeights = '1440 (PS5)', '1296', '1152', '1080', '900'
 # Demon's Souls' own settings for what a frame draws (run-windows.ps1 -Quality): simpler shadows and distant detail.
 $qualities = 'Standard (PS5)', 'Low', 'Lowest'
+# DLSS frame generation (run-windows.ps1 -FrameGen: the generated frames per rendered one, the multiplier less one).
+$frameGens = 'Off', '2x', '3x', '4x', '5x', '6x'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false }
+	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0 }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -57,6 +59,11 @@ public static int[] Query() {
 	return $mask
 }
 $efficiencyMask = Get-EfficiencyMask
+# Frame generation needs NVIDIA's Streamline DLLs, which the emulator loads from KYTY_STREAMLINE_DIR or from
+# deps\streamline\sdk\bin\x64 above its folder (a local build with the Streamline SDK: _Build\deps\streamline).
+$exe = if (Test-Path "$root\kyty_emulator.exe") { "$root\kyty_emulator.exe" } else { "$root\_Build\windows\kyty_emulator.exe" }
+$streamline = if ($env:KYTY_STREAMLINE_DIR) { $env:KYTY_STREAMLINE_DIR } else { Join-Path (Split-Path (Split-Path $exe)) 'deps\streamline\sdk\bin\x64' }
+$frameGenAvailable = Test-Path (Join-Path $streamline 'sl.interposer.dll')
 
 function Get-PlayCommand {
 	$size = $settings.resolution -split 'x'
@@ -71,6 +78,7 @@ function Get-PlayCommand {
 	if ($settings.hdr) { $arguments += '-Hdr' }
 	if ([int]$settings.render -gt 0 -and [int]$settings.render -ne 1440) { $arguments += @('-RenderHeight', [int]$settings.render) }
 	if ($settings.quality -in 'low', 'lowest') { $arguments += @('-Quality', $settings.quality) }
+	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { $arguments += @('-FrameGen', ([int]$settings.framegen - 1)) }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
@@ -86,6 +94,7 @@ if ($DryRun) {
 	"play:       cmd /v:on /s /c `"$(Get-PlayCommand)`""
 	"precompile: cmd /s /c `"$(Get-PrecompileCommand)`""
 	"efficiency cores: 0x{0:X}" -f $efficiencyMask
+	"frame generation: $(if ($frameGenAvailable) { 'available' } else { 'no Streamline DLLs' }) ($streamline)"
 	return
 }
 
@@ -187,6 +196,13 @@ $quality.SelectedItem = ($qualities | Where-Object { ($_ -split ' ')[0] -eq [str
 if ($quality.SelectedIndex -lt 0) { $quality.SelectedIndex = 0 }
 $qualityNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'simpler shadows and distant detail; faster where the CPU limits'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
 Add-Row 'Graphics' @($quality, $qualityNote)
+$frameGen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120; Enabled = $frameGenAvailable }
+$frameGen.Items.AddRange($frameGens)
+$frameGen.SelectedItem = if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { "$([int]$settings.framegen)x" } else { 'Off' }
+if ($frameGen.SelectedIndex -lt 0) { $frameGen.SelectedIndex = 0 }
+$frameGenNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0'
+	Text = $(if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' } else { 'needs NVIDIA''s Streamline DLLs (a local build with the Streamline SDK)' }) }
+Add-Row 'Frame generation' @($frameGen, $frameGenNote)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -217,6 +233,8 @@ function Read-Form {
 	$settings.hdr        = $hdr.Checked
 	$settings.render     = [int](([string]$render.SelectedItem -split ' ')[0])
 	$settings.quality    = ([string]$quality.SelectedItem -split ' ')[0].ToLowerInvariant()
+	# (Kept as it was where the DLLs are missing.)
+	if ($frameGenAvailable) { $settings.framegen = if ($frameGen.SelectedIndex -gt 0) { $frameGen.SelectedIndex + 1 } else { 0 } }
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }

@@ -534,6 +534,11 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		TableReset(pair);
 	}
 	if (pair.refused) return Spec::Refuse("table: pair refused"), TableResult::Native;
+	// KYTY_FRAMEGEN: the frame's first G-buffer draw goes the normal way (or a native record's), whose hook reads the
+	// camera from its constants (a speculation's thread leaves them all to the GPU thread's).
+	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
+	    FrameGen::IsGbufferVertexShader(pair.programs[0]->shader_hash) && (Role() != 0 || FrameGen::WantsCamera()))
+		return Spec::Refuse("table: frame generation camera"), TableResult::Native;
 	// A store at most once a frame per pair and draw state, within the frame's budget (kyty_local_table_store_budget):
 	// while its programs and pipeline compile, the pair's draws take the normal path (Deferred). (Once a frame per pair
 	// kept its other states' draws on the native path, storing native records, until a later frame.) Those draws
@@ -2426,7 +2431,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
                                    uint64_t indirect_args, bool thread_dimensions) {
 	auto* catalog = CatalogTable();
 	m_dispatch_declined = "dispatch: nothing learned";
-	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled() || FrameGen::Enabled()) return false;
+	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled()) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
@@ -2452,6 +2457,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		return m_dispatch_declined = known->special != nullptr ? known->special : "dispatch: refused", false;
 	if ((Role() == 0 && known->sightings < 2) || known->vs != cs.cs_regs.data_addr) return false;
 	auto& pair = *known;
+	// KYTY_FRAMEGEN: the TAA dispatch goes the normal way, whose hook reads its depth and motion-vector images (all
+	// dispatches did: +3 ms a frame at 1-1).
+	if (FrameGen::Enabled() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
+		return m_dispatch_declined = "dispatch: frame generation inputs", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);

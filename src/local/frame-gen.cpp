@@ -358,6 +358,10 @@ bool Requested() {
 	return g_generate > 0;
 }
 
+bool WantsCamera() {
+	return g_ready && !g_camera.valid;
+}
+
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
@@ -710,6 +714,15 @@ void AfterPresent() {
 		return;
 	}
 	g_presented_frames.store(std::max(state.numFramesActuallyPresented, 1u), std::memory_order_relaxed);
+	// More generated frames asked for than the GPU makes (the launcher's 3x and up): as many as it makes.
+	if (state.numFramesToGenerateMax != 0 && static_cast<uint32_t>(g_generate) > state.numFramesToGenerateMax) {
+		LOGF("frame generation: %d generated frames asked for, the GPU makes up to %u\n", g_generate,
+		     state.numFramesToGenerateMax);
+		std::printf("Frame generation: %d generated frame(s) asked for, the GPU makes up to %u\n", g_generate,
+		            state.numFramesToGenerateMax);
+		g_generate    = static_cast<int>(state.numFramesToGenerateMax);
+		g_options_set = false;
+	}
 	if (presents % 600 == 1) {
 		LOGF("frame generation: status=0x%x presented=%u max_generated=%u vram=%" PRIu64 " MiB\n",
 		     static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
@@ -734,9 +747,7 @@ void SetStaticRect(float x0, float y0, float x1, float y1) {
 }
 
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
-	if (g_camera.valid || srt.size() < SrtJitter + 2 ||
-	    std::find(GbufferVertexShaders.begin(), GbufferVertexShaders.end(), vs_hash) ==
-	        GbufferVertexShaders.end()) {
+	if (g_camera.valid || srt.size() < SrtJitter + 2 || !IsGbufferVertexShader(vs_hash)) {
 		return;
 	}
 	for (uint32_t i = 0; i < 16; ++i) {

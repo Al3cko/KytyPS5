@@ -14,7 +14,8 @@
 #                                            11 Chinese (Simplified); default: the config's)
 #   .\run-windows.ps1 -Set KEY=VALUE         override a switch of the config (KEY= removes it)
 #   .\run-windows.ps1 -FrameGen 1            DLSS frame generation, 1 generated frame per rendered
-#                                            frame (2x); needs _Build\deps\streamline\sdk
+#                                            frame (2x; up to 5, at most what the GPU makes); needs
+#                                            _Build\deps\streamline\sdk
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
 #                                            virtual vblank; movies play faster)
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)

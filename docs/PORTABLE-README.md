@@ -77,6 +77,8 @@ simpler meshes, picks the level of detail as for a 720-line picture and ends sun
 and the shadows of torches and other lamps. Each thing drawn costs the emulator processor time, so these
 help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing in Latria: 22.6 fps at
 Standard, 25.5 at Low, 25.8 at Lowest; 28.8 at Lowest with render height 1080).
+"Frame generation" (DLSS, 2x to 6x) needs NVIDIA's Streamline libraries, which this package does not
+include: it stays greyed out here.
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 
