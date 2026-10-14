@@ -25,6 +25,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -769,6 +770,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	LOGF("Vulkan indirect memory copies: %s\n", graphics.copy_memory_indirect_enabled ? "true" : "false");
 	graphics.pipeline_binaries_enabled =
 	    binary_extensions && supported_binaries.pipelineBinaries && supported_maintenance5.maintenance5;
+	// (maintenance5 is enabled with the binaries: pipelines take SPIR-V inline.)
+	ModuleStore::Enable(graphics.pipeline_binaries_enabled);
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&

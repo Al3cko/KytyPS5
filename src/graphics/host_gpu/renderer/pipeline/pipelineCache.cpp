@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
+#include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheBlobs.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
@@ -161,11 +162,16 @@ const std::string& PipelineCacheGameId() {
 }
 
 // Reads through a null pointer (a draw the game leaves unset during loads): no guest memory is mapped
-// there, and the GPU reads zeros where the host would fault.
-constexpr uint64_t NullPageEnd = 0x10000;
+// there, and the GPU reads zeros where the host would fault. Likewise past the guest address space (1 TiB, the
+// trackers' range): an in-game world change (archstone travel to Latria) read an SRT pointer of -1.
+constexpr uint64_t NullPageEnd     = 0x10000;
+constexpr uint64_t GuestAddressEnd = uint64_t {1} << 40u;
+[[nodiscard]] constexpr bool NoGuestMemory(uint64_t address, uint64_t size) {
+	return address < NullPageEnd || address >= GuestAddressEnd || GuestAddressEnd - address < size;
+}
 
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	if (value != nullptr && address < NullPageEnd) {
+	if (value != nullptr && NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
 		return true;
 	}
@@ -181,7 +187,7 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// A GPU-written neighbour may protect a clean descriptor on the same page.
 	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
 	// unmapped and untracked addresses retain the original load/fault behavior.
-	if (address < NullPageEnd) {
+	if (NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
 	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
 		LiveCounters::Add(LiveCounters::SrtWatchedReads);
@@ -198,7 +204,7 @@ uint64_t ShaderMappingEnd(void*, uint64_t address) {
 bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
 	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups. The
 	// null page goes word by word (the readers above).
-	return count >= 2 && count <= (clean ? 1024u : 16u) && address >= NullPageEnd &&
+	return count >= 2 && count <= (clean ? 1024u : 16u) && !NoGuestMemory(address, uint64_t {count} * 4u) &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
 }
 
@@ -871,19 +877,24 @@ struct PipelineCache::ProgramCache {
 			            static_cast<unsigned long long>(XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t))));
 		}
 
-		vk::ShaderModuleCreateInfo create_info {};
-		create_info.codeSize    = spirv.size() * sizeof(uint32_t);
-		create_info.pCode       = spirv.data();
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
-		                     "create recompiled shader module");
-		EXIT_IF(module == nullptr);
+		// (The store's, where pipelines take SPIR-V inline: moduleStore.h.)
+		vk::ShaderModule module = ModuleStore::Add(spirv);
+		const bool       stored = module != nullptr;
+		if (!stored) {
+			vk::ShaderModuleCreateInfo create_info {};
+			create_info.codeSize = spirv.size() * sizeof(uint32_t);
+			create_info.pCode    = spirv.data();
+			RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
+			                     "create recompiled shader module");
+			EXIT_IF(module == nullptr);
+		}
+		LiveCounters::g_shader_modules.fetch_add(1, std::memory_order_relaxed);
+		if (InlineKeyCheck()) NoteInlineSpirv(module, spirv);
 		if (ModuleSpirvHashesRecorded()) {
 			NotePipelineKeyModule(module, options.shader_hash, XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)),
 			                      spirv.size() * sizeof(uint32_t));
 		}
-		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
-		                     options.shader_hash);
+		if (!stored) SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name, options.shader_hash);
 		return module;
 	}
 
@@ -935,7 +946,8 @@ struct PipelineCache::ProgramCache {
 			if (!std::ranges::equal(params.code, entry->second.warm_code) ||
 			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
 				for (const auto& p : entry->second.permutations) {
-					device.destroyShaderModule(p.handle.module, nullptr);
+					DestroyShaderModule(device, p.handle.module);
+					if (p.handle.module) LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
 				}
 				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
 				programs.erase(entry);
@@ -1429,7 +1441,8 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				DestroyShaderModule(device, permutation.handle.module);
+				if (permutation.handle.module) LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
 			}
 		}
 	}
@@ -1651,9 +1664,28 @@ static std::filesystem::path StaticInputsPath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".shaders");
 }
 
+// Live "objects" (live-counters.h): container sizes read from the live thread (counts only, no iteration).
+static PipelineCache* g_live_pipeline_cache = nullptr;
+
+void PipelineCache::ReportObjects(uint64_t id) const {
+	const auto store = ModuleStore::Stats();
+	std::printf("LIVE_PIPELINE_OBJECTS id=%llu graphics_pipelines=%zu compute_pipelines=%zu pending_graphics=%zu pending_compute=%zu "
+	            "replaced_unoptimized=%zu optimizing=%zu programs=%zu jit_bytes=%zu stored_modules=%llu stored_spirv_mib=%llu "
+	            "store_file_mib=%llu store_loads=%llu store_load_misses=%llu\n",
+	            static_cast<unsigned long long>(id), m_graphics_pipelines.size(), m_compute_pipelines.size(), m_pending_graphics_pipelines.size(),
+	            m_pending_compute_pipelines.size(), m_replaced_pipelines.size(), m_optimizing.size(),
+	            m_program_cache->programs.size(), JitArena::Used(), static_cast<unsigned long long>(store.modules),
+	            static_cast<unsigned long long>(store.spirv_bytes >> 20u), static_cast<unsigned long long>(store.stored_bytes >> 20u),
+	            static_cast<unsigned long long>(store.loads), static_cast<unsigned long long>(store.load_misses));
+}
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	g_live_pipeline_cache          = this;
+	LiveCounters::g_objects_report = [](uint64_t id) {
+		if (g_live_pipeline_cache != nullptr) g_live_pipeline_cache->ReportObjects(id);
+	};
 	m_program_cache->push_job = [this](std::function<void()> job) { TableWorkers().Push(std::move(job)); };
 	InitializeDriverCache();
 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
@@ -1882,6 +1914,8 @@ void PipelineCache::WarmPipelines(uint64_t compute_video) {
 }
 
 PipelineCache::~PipelineCache() {
+	LiveCounters::g_objects_report = nullptr;
+	g_live_pipeline_cache          = nullptr;
 	FinishCompileWorkers();
 	Save();
 	auto destroy = [this](const auto& pipelines) {

@@ -927,10 +927,10 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		});
 	}
 	for (const auto& permutations: first) {
-		for (const auto& permutation: permutations) m_graphics.device.destroyShaderModule(permutation->handle.module, nullptr);
+		for (const auto& permutation: permutations) DestroyShaderModule(m_graphics.device, permutation->handle.module);
 	}
 	for (const auto& [key, permutations]: vertex) {
-		for (const auto& permutation: permutations) m_graphics.device.destroyShaderModule(permutation->handle.module, nullptr);
+		for (const auto& permutation: permutations) DestroyShaderModule(m_graphics.device, permutation->handle.module);
 	}
 	return saved_pipelines;
 }

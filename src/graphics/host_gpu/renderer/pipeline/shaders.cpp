@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheBlobs.h"
@@ -20,15 +21,23 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "device-fault.h"
+#include "local-platform.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
+#include <string_view>
+#include <type_traits>
+#include <zstd.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -241,6 +250,158 @@ static vk::Result CapturePipelineBinaries(GraphicContext& graphics, PipelineCach
 	return result;
 }
 
+namespace ModuleStore {
+namespace {
+// A stored module's handle: the address of its index's byte here (untouched: no memory).
+constexpr size_t HandleSpace = size_t {1} << 22u;
+alignas(64) uint8_t g_handles[HandleSpace];
+
+struct Entry {
+	uint64_t offset     = 0;
+	uint32_t stored     = 0; // bytes in the file
+	uint32_t words      = 0;
+	bool     compressed = false;
+};
+std::atomic<bool>     g_enabled {false};
+std::once_flag        g_file_once;
+uint64_t              g_file = 0;
+std::atomic<uint64_t> g_end {0};
+std::shared_mutex     g_mutex;
+std::vector<Entry>    g_entries;
+std::atomic<uint64_t> g_live {0}, g_spirv_bytes {0}, g_stored_bytes {0}, g_loads {0}, g_load_misses {0};
+// The last modules loaded: a module's pipelines are mostly made one after another.
+struct Recent {
+	size_t                                       index = SIZE_MAX;
+	std::shared_ptr<const std::vector<uint32_t>> spirv;
+};
+std::mutex               g_recent_mutex;
+std::array<Recent, 16>   g_recent;
+size_t                   g_recent_next = 0;
+
+size_t IndexOf(vk::ShaderModule module) {
+	return reinterpret_cast<const uint8_t*>(static_cast<VkShaderModule>(module)) - g_handles;
+}
+} // namespace
+
+void Enable(bool maintenance5) {
+	const char* setting = std::getenv("KYTY_MODULE_STORE");
+	g_enabled           = maintenance5 && (setting == nullptr || std::string_view(setting) != "0");
+}
+
+bool Enabled() {
+	return g_enabled.load(std::memory_order_relaxed);
+}
+
+vk::ShaderModule Add(const std::vector<uint32_t>& spirv) {
+	if (!Enabled() || spirv.empty()) return nullptr;
+	std::call_once(g_file_once, [] { g_file = LocalPlatform::OpenScratchFile(); });
+	if (g_file == 0) return nullptr;
+	const auto        bytes = spirv.size() * sizeof(uint32_t);
+	std::vector<char> packed(ZSTD_compressBound(bytes));
+	const auto        packed_size = ZSTD_compress(packed.data(), packed.size(), spirv.data(), bytes, 1);
+	const bool        compressed  = !ZSTD_isError(packed_size) && packed_size < bytes;
+	const void*       data        = compressed ? static_cast<const void*>(packed.data()) : spirv.data();
+	const auto        stored      = compressed ? packed_size : bytes;
+	const auto        offset      = g_end.fetch_add(stored, std::memory_order_relaxed);
+	if (stored > UINT32_MAX || !LocalPlatform::WriteScratchFile(g_file, offset, data, stored)) return nullptr;
+	size_t index = 0;
+	{
+		std::unique_lock lock(g_mutex);
+		index = g_entries.size();
+		if (index >= HandleSpace) return nullptr;
+		g_entries.push_back({offset, static_cast<uint32_t>(stored), static_cast<uint32_t>(spirv.size()), compressed});
+	}
+	g_live.fetch_add(1, std::memory_order_relaxed);
+	g_spirv_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	g_stored_bytes.fetch_add(stored, std::memory_order_relaxed);
+	return vk::ShaderModule(reinterpret_cast<VkShaderModule>(&g_handles[index]));
+}
+
+bool Holds(vk::ShaderModule module) {
+	const auto* address = reinterpret_cast<const uint8_t*>(static_cast<VkShaderModule>(module));
+	return address >= g_handles && address < g_handles + HandleSpace;
+}
+
+std::shared_ptr<const std::vector<uint32_t>> Load(vk::ShaderModule module) {
+	if (!Holds(module)) return nullptr;
+	const auto index = IndexOf(module);
+	g_loads.fetch_add(1, std::memory_order_relaxed);
+	{
+		std::lock_guard lock(g_recent_mutex);
+		for (const auto& recent: g_recent)
+			if (recent.index == index) return recent.spirv;
+	}
+	g_load_misses.fetch_add(1, std::memory_order_relaxed);
+	Entry entry;
+	{
+		std::shared_lock lock(g_mutex);
+		if (index >= g_entries.size()) return nullptr;
+		entry = g_entries[index];
+	}
+	auto       spirv = std::make_shared<std::vector<uint32_t>>(entry.words);
+	const auto bytes = spirv->size() * sizeof(uint32_t);
+	if (entry.compressed) {
+		std::vector<char> packed(entry.stored);
+		if (!LocalPlatform::ReadScratchFile(g_file, entry.offset, packed.data(), packed.size()) ||
+		    ZSTD_decompress(spirv->data(), bytes, packed.data(), packed.size()) != bytes)
+			return nullptr;
+	} else if (!LocalPlatform::ReadScratchFile(g_file, entry.offset, spirv->data(), bytes)) {
+		return nullptr;
+	}
+	std::lock_guard lock(g_recent_mutex);
+	g_recent[g_recent_next++ % g_recent.size()] = {index, spirv};
+	return spirv;
+}
+
+void Release(vk::ShaderModule module) {
+	if (!Holds(module)) return;
+	g_live.fetch_sub(1, std::memory_order_relaxed);
+}
+
+Statistics Stats() {
+	return {g_live.load(), g_spirv_bytes.load(), g_stored_bytes.load(), g_loads.load(), g_load_misses.load()};
+}
+} // namespace ModuleStore
+
+void DestroyShaderModule(vk::Device device, vk::ShaderModule module) {
+	if (ModuleStore::Holds(module)) {
+		ModuleStore::Release(module);
+	} else if (module) {
+		device.destroyShaderModule(module, nullptr);
+	}
+}
+
+// Stored modules (ModuleStore) of a pipeline's stages as their SPIR-V inline: the stages and what they point to.
+struct InlineStages {
+	std::array<vk::PipelineShaderStageCreateInfo, 8>                   stages {};
+	std::array<vk::ShaderModuleCreateInfo, 8>                          modules {};
+	std::array<std::shared_ptr<const std::vector<uint32_t>>, 8>         spirv {};
+	// The stage made inline, or false when it holds no stored module.
+	bool Take(vk::PipelineShaderStageCreateInfo& stage, size_t i) {
+		if (!ModuleStore::Holds(stage.module)) return false;
+		spirv[i] = ModuleStore::Load(stage.module);
+		EXIT_IF(spirv[i] == nullptr);
+		modules[i].codeSize = spirv[i]->size() * sizeof(uint32_t);
+		modules[i].pCode    = spirv[i]->data();
+		modules[i].pNext    = stage.pNext;
+		stage.pNext         = &modules[i];
+		stage.module        = nullptr;
+		return true;
+	}
+	void Apply(vk::GraphicsPipelineCreateInfo& info) {
+		if (!ModuleStore::Enabled() || info.stageCount > stages.size()) return;
+		bool any = false;
+		for (uint32_t i = 0; i < info.stageCount; i++) {
+			stages[i] = info.pStages[i];
+			any |= Take(stages[i], i);
+		}
+		if (any) info.pStages = stages.data();
+	}
+	void Apply(vk::ComputePipelineCreateInfo& info) {
+		if (ModuleStore::Enabled()) (void)Take(info.stage, 0);
+	}
+};
+
 bool PipelineKeyLog() {
 	static const bool on = std::getenv("KYTY_PIPELINE_KEY_LOG") != nullptr;
 	return on;
@@ -290,6 +451,62 @@ void LogPipelineKey(const char* what, const PipelineBinaries::Key& key, const In
 
 // (KYTY_PIPELINE_SOURCE_LOG) Each module's SPIR-V size.
 static std::unordered_map<VkShaderModule, size_t> g_module_bytes;
+
+bool InlineKeyCheck() {
+	static const bool on = std::getenv("KYTY_INLINE_KEY_CHECK") != nullptr;
+	return on;
+}
+static std::mutex                                                 g_inline_mutex;
+static std::unordered_map<VkShaderModule, std::vector<uint32_t>> g_inline_spirv;
+void NoteInlineSpirv(vk::ShaderModule module, const std::vector<uint32_t>& spirv) {
+	std::lock_guard lock(g_inline_mutex);
+	g_inline_spirv[static_cast<VkShaderModule>(module)] = spirv;
+}
+
+// (KYTY_INLINE_KEY_CHECK) The key of the pipeline with its stages' SPIR-V inline against `key` (its modules').
+template <typename Info>
+static void CheckInlineKey(vk::Device device, const Info& info, const PipelineBinaries::Key& key) {
+	static std::atomic<uint64_t> same {0}, differ {0}, missing {0};
+	std::vector<vk::PipelineShaderStageCreateInfo> stages;
+	if constexpr (std::is_same_v<Info, vk::GraphicsPipelineCreateInfo>) {
+		stages.assign(info.pStages, info.pStages + info.stageCount);
+	} else {
+		stages.push_back(info.stage);
+	}
+	std::vector<vk::ShaderModuleCreateInfo> modules(stages.size());
+	{
+		std::lock_guard lock(g_inline_mutex);
+		for (size_t i = 0; i < stages.size(); i++) {
+			const auto found = g_inline_spirv.find(static_cast<VkShaderModule>(stages[i].module));
+			if (found == g_inline_spirv.end()) {
+				missing++;
+				return;
+			}
+			modules[i].codeSize = found->second.size() * sizeof(uint32_t);
+			modules[i].pCode    = found->second.data();
+			modules[i].pNext    = stages[i].pNext;
+			stages[i].pNext     = &modules[i];
+			stages[i].module    = nullptr;
+		}
+	}
+	auto inline_info = info;
+	if constexpr (std::is_same_v<Info, vk::GraphicsPipelineCreateInfo>) {
+		inline_info.pStages = stages.data();
+	} else {
+		inline_info.stage = stages[0];
+	}
+	PipelineBinaries::Key inline_key;
+	const bool            ok    = PipelineBinaries::PipelineKey(device, &inline_info, inline_key);
+	const bool            equal = ok && inline_key.size == key.size && std::memcmp(inline_key.bytes.data(), key.bytes.data(), key.size) == 0;
+	const auto            count = (equal ? same : differ).fetch_add(1) + 1;
+	if (!equal && count <= 5)
+		std::printf("Inline key check: DIFFERENT key (%s, %u stages)\n", ok ? "made" : "not made",
+		            static_cast<unsigned>(stages.size()));
+	if ((same + differ) % 100 == 0)
+		std::printf("Inline key check: %llu same, %llu different, %llu without SPIR-V\n",
+		            static_cast<unsigned long long>(same.load()), static_cast<unsigned long long>(differ.load()),
+		            static_cast<unsigned long long>(missing.load()));
+}
 
 void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes) {
 	std::lock_guard lock(g_key_log_mutex);
@@ -467,6 +684,10 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
                                        Create create) {
 	t_static_hit      = false;
 	t_blob_times      = {};
+	// Stored modules go in as their SPIR-V (the key log names the modules).
+	const Info   original = info;
+	InlineStages inlined;
+	inlined.Apply(info);
 	const auto cached = [&](vk::PipelineCache cache) {
 		if (cache == nullptr || !graphics.pipeline_cache_control_enabled) return false;
 		auto lookup = info;
@@ -481,7 +702,8 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	if (build != PipelineBuild::Optimize && (store != nullptr || writer != nullptr)) {
 		PipelineBinaries::Key key;
 		if (PipelineBinaries::PipelineKey(graphics.device, &info, key)) {
-			if (writer != nullptr && PipelineKeyLog()) LogPipelineKey("tool", key, info);
+			if (writer != nullptr && PipelineKeyLog()) LogPipelineKey("tool", key, original);
+			if (InlineKeyCheck()) CheckInlineKey(graphics.device, original, key);
 			// Another shard of this precompile holds it: no pipeline (see CreatePipelineInternal).
 			if (writer != nullptr && writer->Claimed(key)) return vk::Result::ePipelineCompileRequired;
 			if (const auto binaries = store != nullptr ? store->Load(key) : PipelineBinaries::Handles {};
@@ -499,7 +721,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				}
 				pipeline.pipeline = nullptr;
 			}
-			if (writer == nullptr && PipelineKeyLog()) LogPipelineKey("miss", key, info);
+			if (writer == nullptr && PipelineKeyLog()) LogPipelineKey("miss", key, original);
 			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
 		}
 	}
