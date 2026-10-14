@@ -20,6 +20,8 @@
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
 #   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
+#   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: simpler shadows and
+#                                            distant detail): faster where the CPU limits
 #   .\run-windows.ps1 -Game <folder>         the game (the folder with eboot.bin); remembered in
 #                                            game-path.txt, a folder dialog when none is known
 #   .\run-windows.ps1 -Game <file.zar>       the game folder packed into a ZArchive (read without extracting it)
@@ -50,6 +52,7 @@ param(
 	[int]$Vblank = 0,
 	[switch]$Fps120,
 	[int]$RenderHeight = 0,
+	[string]$Quality = '',
 	[string[]]$Set = @(),
 	[string]$Patch = '',
 	[switch]$AspectFit,
@@ -291,6 +294,22 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -e
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
 if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
+# -Quality low|lowest: Demon's Souls engine settings that cut what a frame draws, for PCs whose CPU limits the frame
+# rate (each draw costs the emulator CPU time). low: shadows drawn from simpler meshes, levels of detail chosen as for
+# a 720-line picture (1080), sun shadows to 125 m (250); lowest: detail as for 480 lines, sun shadows to 60 m, no
+# ambient shadowing, no shadows from torches and other spot lights. A laptop Ryzen 9 5900HX + RTX 3080 standing, same
+# process (standard -> low / lowest): Boletaria 1-1 20.0 -> 22.6 / 24.0 fps, Latria 22.6 -> 25.5 / 25.8, Shrine of
+# Storms 25.0 -> 26.6 / 29.0; with -RenderHeight 1080 Latria 25.4 -> 27.8 / 28.8, the Shrine 30.7 -> 34.9 / 35.8.
+$qualityConvars = @{
+	low    = 'r_forceShadowLOD=true;r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125'
+	lowest = 'r_forceShadowLOD=true;r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
+}
+if ($Quality -and $Quality -ne 'standard') {
+	if (!$qualityConvars.Contains($Quality)) { throw "-Quality takes low or lowest (or standard), not '$Quality'" }
+	if ($titleId -match '^PPSA0134[0-2]$') {
+		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars[$Quality]) | Where-Object { $_ }) -join ';'
+	}
+}
 # Memory the game releases (texture pool layers, 64 KiB mappings each) is not unprotected mapping
 # by mapping before its unmap: VirtualProtect was ~15% of the render thread in the open area.
 if (!$environment.Contains('KYTY_UNMAP_PROTECT_SKIP') -and !$Baseline) { $environment['KYTY_UNMAP_PROTECT_SKIP'] = '1' }
