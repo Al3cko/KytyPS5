@@ -360,7 +360,11 @@ inline std::array<DispatchNote, 4096> g_dispatches;
 inline std::atomic<size_t>            g_dispatch_next {0};
 inline void NoteDispatch(uint64_t tick, uint64_t hash, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
 	if (!BreadcrumbsOn()) return;
-	const auto at = g_dispatch_next.fetch_add(1, std::memory_order_relaxed);
+	// (The render thread's: no locked add. A speculation's thread may note one too, which at worst overwrites an entry
+	// of this diagnostic. The add and the entry's store were ~0.6% of the render thread at Latria, ~1250 dispatches a
+	// frame.)
+	const auto at = g_dispatch_next.load(std::memory_order_relaxed);
+	g_dispatch_next.store(at + 1, std::memory_order_relaxed);
 	g_dispatches[at % g_dispatches.size()] = {.tick = tick, .hash = hash, .indirect = indirect, .x = x, .y = y, .z = z};
 }
 
