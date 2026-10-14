@@ -188,19 +188,19 @@ $hdr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'HDR (turn o
 Add-Row '' @($hdr)
 $hud = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Show the frame rate (top right of the game image)'; AutoSize = $true; Checked = [bool]$settings.hud }
 Add-Row '' @($hud)
-$render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120 }
+$render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
 $render.Items.AddRange($renderHeights)
 $render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string][int]$settings.render } | Select-Object -First 1)
 if ($render.SelectedIndex -lt 0) { $render.SelectedIndex = 0 }
 $renderNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'Demon''s Souls 3D; lower = faster, less sharp'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
 Add-Row 'Render height' @($render, $renderNote)
-$quality = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120 }
+$quality = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 205 }
 $quality.Items.AddRange($qualities)
 $quality.SelectedItem = ($qualities | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.quality } | Select-Object -First 1)
 if ($quality.SelectedIndex -lt 0) { $quality.SelectedIndex = 0 }
 $qualityNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'simpler shadows and distant detail; faster where the CPU limits'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
 Add-Row 'Graphics' @($quality, $qualityNote)
-$frameGen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120; Enabled = $frameGenAvailable }
+$frameGen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160; Enabled = $frameGenAvailable }
 $frameGen.Items.AddRange($frameGens)
 $frameGen.SelectedItem = if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { "$([int]$settings.framegen)x" } else { 'Off' }
 if ($frameGen.SelectedIndex -lt 0) { $frameGen.SelectedIndex = 0 }
