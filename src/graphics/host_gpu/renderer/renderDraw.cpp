@@ -42,6 +42,7 @@
 #include "slow-log.h"
 #include "xpr-capture.h"
 #include "speculation-state.h"
+#include "draw-state-observer.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-draw-packet.h"
 #include "vulkan-recording.h"

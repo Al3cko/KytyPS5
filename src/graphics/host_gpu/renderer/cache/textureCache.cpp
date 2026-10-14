@@ -4031,6 +4031,7 @@ void TextureCache::EraseRetired() {
 	std::erase_if(m_retired, [&](const auto& retired) {
 		if (!Spec::PacketsPassed(retired.second)) return false;
 		m_slot_images.erase(retired.first);
+		m_erase_epoch.fetch_add(1, std::memory_order_release);
 		return true;
 	});
 }

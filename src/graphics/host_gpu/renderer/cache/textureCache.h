@@ -71,6 +71,9 @@ public:
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
+	// Moves whenever an image's slot is erased (EraseRetired, the only place): an id allocated when it was E is still
+	// allocated while it is E.
+	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
 	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch);
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
@@ -342,6 +345,7 @@ private:
 	std::atomic<uint64_t>                             m_start_epoch {1};
 	std::vector<std::pair<uint64_t, uint64_t>>        m_start_log; // (epoch, address)
 	std::atomic<uint64_t>                             m_resolution_epoch {1};
+	std::atomic<uint64_t>                             m_erase_epoch {1};
 	// Null textures: a 1x1 image per format and type (1D, 2D or 3D).
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
