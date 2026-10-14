@@ -615,6 +615,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
+	{
+		// (Diagnostic, KYTY_DISPATCH_TRACE_ADDR=<cs address hex>: that shader's dispatch sizes and user data.)
+		static const uint64_t trace = std::getenv("KYTY_DISPATCH_TRACE_ADDR") != nullptr
+		                                  ? std::strtoull(std::getenv("KYTY_DISPATCH_TRACE_ADDR"), nullptr, 16)
+		                                  : 0;
+		static std::atomic<uint32_t> traced {0};
+		if (trace != 0 && sh_ctx.GetCs().cs_regs.data_addr == trace && traced.fetch_add(1) < 400) {
+			const auto& cs = sh_ctx.GetCs();
+			std::printf("DISPATCH-TRACE cs 0x%llx groups %u %u %u indirect 0x%llx threads %u %u %u user",
+			            static_cast<unsigned long long>(trace), thread_group_x, thread_group_y, thread_group_z,
+			            static_cast<unsigned long long>(indirect_args), cs.cs_regs.num_thread_x, cs.cs_regs.num_thread_y,
+			            cs.cs_regs.num_thread_z);
+			for (uint32_t i = 0; i < 16; i++) std::printf(" %08x", cs.cs_user_sgpr.value[i]);
+			std::printf("\n");
+		}
+	}
 	if (FrameCapture::Active()) {
 		FrameCapture::g_call.cs_address = sh_ctx.GetCs().cs_regs.data_addr;
 		FrameCapture::g_call.indirect   = indirect_args;
