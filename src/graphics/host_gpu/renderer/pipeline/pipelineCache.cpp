@@ -2139,9 +2139,13 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	// The launcher keeps one cache across emulator builds: pipelines of changed shaders pile up in it, so past
 	// 1 GiB (one build's warmup is ~130 MB) it starts over. The driver copies a loaded cache whole into the process's
-	// memory (a 0.94 GB and a 0.6 GB one: 1.5 GB of RAM at 1-1): at most 1/64 of the PC's RAM each (256 MiB with 16 GB).
+	// memory (a 0.94 GB and a 0.6 GB one: 1.5 GB of RAM at 1-1): at most 1/64 of the PC's RAM each, but not under
+	// 512 MiB: ordinary play passes 1/64 of 16 GB (256 MiB; 265 MiB after 30 minutes of 1-1, issue #14), and a cache
+	// that starts over at every launch compiles its pipelines in play again.
 	const uint64_t ram       = LocalPlatform::PhysicalMemory();
-	const auto     ram_limit = [ram](uint64_t limit) { return ram != 0 ? std::min(limit, ram / 64u) : limit; };
+	const auto     ram_limit = [ram](uint64_t limit) {
+		return ram != 0 ? std::min(limit, std::max(uint64_t {512} << 20u, ram / 64u)) : limit;
+	};
 	m_driver_cache = LoadDriverCache(m_driver_cache_path, ram_limit(uint64_t {1} << 30u), m_driver_cache_saved_size);
 	if (m_driver_cache == nullptr) return;
 	// Table mode pipelines (src/local/table-xpr.inc) in a cache of their own: the static precompile holds none of
@@ -2203,7 +2207,7 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
 		if (file_size > limit) {
 			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes)", path, file_size);
+			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes, limit {})", path, file_size, limit);
 		} else if (file_size >= signature.size() + sizeof(uint64_t) &&
 		           file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
