@@ -476,9 +476,10 @@ if ($Prompt -and ($offer -or !$tested)) {
 }
 # Memory: Windows ends a program that asks for more than RAM and the page file can hold. The emulator
 # commits about 34 GB (the game's 13.5 GiB of PS5 memory, about 11 GB Windows sets aside to back the
-# video memory in use, the emulator's own) and takes about 20 GB of RAM while a save loads, but uses
-# only about 4 GB of it in play (10-09: emptied after loading, the working set grew back to 3.5 GB in
-# a minute of play at 60 fps): with 16 GB Windows pages the rest out and loading is slower.
+# video memory in use, the emulator's own). Under 24 GB of RAM it compiles no shaders or pipelines at
+# start-up and keeps its pipeline caches small: about 14 GB in use after a save loads at 1-1 (most of it
+# the game's own memory), of which play keeps using only a few GB (10-09: emptied after loading, the
+# working set grew back to 3.5 GB in a minute of play at 60 fps): with 16 GB Windows pages the rest out.
 $os = Get-CimInstance Win32_OperatingSystem
 [double]$ram = $os.TotalVisibleMemorySize * 1KB
 [double]$commit = $os.FreeVirtualMemory * 1KB
@@ -491,8 +492,8 @@ if ((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) {
 }
 $memory = @()
 if ($ram -lt 24GB) {
-	$memory += ("This PC has {0:N0} GB of RAM: the game runs, but loading takes longer (the emulator takes about 20 GB " +
-		"while a save loads and uses about 4 GB in play; 32 GB recommended).") -f ($ram / 1GB)
+	$memory += ("This PC has {0:N0} GB of RAM: the game runs, but loading takes longer (the emulator takes about 14 GB " +
+		"while a save loads and keeps using a few GB in play; 32 GB recommended).") -f ($ram / 1GB)
 }
 if ($commit -lt 34GB) {
 	$memory += ("Windows can give programs only {0:N0} GB more memory (RAM plus page file) and the emulator needs about 34 GB: " +
