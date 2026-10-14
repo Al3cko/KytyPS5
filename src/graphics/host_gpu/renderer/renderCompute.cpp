@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "frame-capture.h"
@@ -70,9 +71,17 @@ struct Totals {
 };
 // A slot's dispatch, for a stall: the one whose start the GPU wrote and whose end it did not is the dispatch it is stuck
 // in.
+// With it, the first bytes of its buffers: as guest memory held them when it was recorded, and as the GPU read them (a
+// copy recorded right before it into `snap`).
+constexpr uint32_t SnapBuffers = 8, SnapBytes = 64;
 struct Record {
 	uint64_t tick = 0, hash = 0, sequence = 0;
 	uint32_t x = 0, y = 0, z = 0;
+	uint32_t                                                     buffers = 0;
+	std::array<uint64_t, SnapBuffers>                            address {};
+	std::array<std::array<uint32_t, SnapBytes / 4>, SnapBuffers> guest {};
+	uint32_t                                                     srt_count = 0; // (the flattened SRT words it was given)
+	std::array<uint32_t, 64>                                     srt {};
 };
 struct State {
 	std::vector<uint64_t>     hashes;
@@ -83,12 +92,21 @@ struct State {
 	uint64_t                  next = 0;
 	std::array<Record, Slots> records {};
 	std::atomic<int64_t>      printed {0};
+	VkBuffer                  snap        = VK_NULL_HANDLE;
+	VmaAllocation             snap_memory = nullptr;
+	VmaAllocator              allocator   = nullptr;
+	const uint8_t*            snap_mapped = nullptr;
+	bool                      all         = false; // (KYTY_DISPATCH_TIMING=*: every normal-path dispatch)
 };
 static void StallDump(uint64_t reached);
 static State& Get() {
 	static State      state;
 	static const bool parsed = [] {
-		for (const char* at = std::getenv("KYTY_DISPATCH_TIMING"); at != nullptr && *at != '\0';) {
+		if (const char* value = std::getenv("KYTY_DISPATCH_TIMING"); value != nullptr && value[0] == '*') {
+			state.all = true;
+			DeviceFault::g_stall_dump.store(&StallDump, std::memory_order_release);
+		}
+		for (const char* at = std::getenv("KYTY_DISPATCH_TIMING"); at != nullptr && *at != '\0' && !state.all;) {
 			char* end = nullptr;
 			state.hashes.push_back(std::strtoull(at, &end, 16));
 			state.totals.emplace_back();
@@ -104,19 +122,54 @@ static State& Get() {
 	return state;
 }
 // Before the dispatch: a slot (UINT32_MAX: not timed).
-static uint32_t Begin(GraphicContext& graphics, vk::CommandBuffer command, uint64_t hash) {
+static uint32_t Begin(GraphicContext& graphics, vk::CommandBuffer command, uint64_t hash,
+                      const PreparedBindings* bindings = nullptr, BufferCache* cache = nullptr,
+                      std::span<const uint32_t> srt = {}) {
 	auto& s = Get();
-	if (s.hashes.empty() || std::ranges::find(s.hashes, hash) == s.hashes.end()) return UINT32_MAX;
+	if (!s.all && (s.hashes.empty() || std::ranges::find(s.hashes, hash) == s.hashes.end())) return UINT32_MAX;
 	if (!s.pool) {
 		vk::QueryPoolCreateInfo info {};
 		info.queryType  = vk::QueryType::eTimestamp;
 		info.queryCount = Slots * 2;
 		if (graphics.device.createQueryPool(&info, nullptr, &s.pool) != vk::Result::eSuccess) return UINT32_MAX;
 		s.device = graphics.device;
+		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		create.size  = uint64_t {Slots} * SnapBuffers * SnapBytes;
+		create.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocate.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo mapped {};
+		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &s.snap, &s.snap_memory, &mapped) == VK_SUCCESS) {
+			s.allocator   = graphics.allocator;
+			s.snap_mapped = static_cast<const uint8_t*>(mapped.pMappedData);
+		}
 	}
 	const uint64_t sequence = s.next++;
 	const uint32_t slot     = static_cast<uint32_t>(sequence % Slots) * 2;
-	s.records[slot / 2]     = {.tick = 0, .hash = hash, .sequence = sequence};
+	auto&          record   = s.records[slot / 2];
+	record                  = {.tick = 0, .hash = hash, .sequence = sequence};
+	record.srt_count        = static_cast<uint32_t>(std::min<size_t>(srt.size(), record.srt.size()));
+	std::copy_n(srt.begin(), record.srt_count, record.srt.begin());
+	(void)cache;
+	if (bindings != nullptr && s.snap_mapped != nullptr && bindings->buffers.size() == bindings->buffer_sources.size()) {
+		// (From the descriptor the dispatch reads: its buffer, or the upload ring's copy of a small range the guest wrote.
+		// The data starts the adjustment past the descriptor's offset: its range is the size plus the adjustment.)
+		for (size_t i = 0; i < bindings->buffers.size() && record.buffers < SnapBuffers; ++i) {
+			const auto&    source     = bindings->buffer_sources[i];
+			const auto&    descriptor = bindings->buffers[i];
+			const uint64_t bytes      = std::min<uint64_t>(source.size, SnapBytes) & ~uint64_t {3};
+			if (source.address == 0 || bytes == 0 || !descriptor.buffer || descriptor.range == VK_WHOLE_SIZE ||
+			    descriptor.range < source.size)
+				continue;
+			const auto index      = record.buffers++;
+			record.address[index] = source.address;
+			(void)Libs::LibKernel::Memory::TryReadBackingToHost(source.address, record.guest[index].data(), bytes);
+			const vk::BufferCopy copy {descriptor.offset + (descriptor.range - source.size),
+			                           (uint64_t {slot / 2} * SnapBuffers + index) * SnapBytes, bytes};
+			command.copyBuffer(descriptor.buffer, s.snap, 1, &copy);
+		}
+	}
 	command.resetQueryPool(s.pool, slot, 2);
 	command.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, s.pool, slot);
 	return slot;
@@ -143,6 +196,12 @@ static void End(GraphicContext& graphics, CommandScheduler& scheduler, vk::Comma
 			return;
 		const auto ns    = static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period);
 		const auto index = static_cast<size_t>(std::ranges::find(s.hashes, hash) - s.hashes.begin());
+		if (index >= s.totals.size()) { // (KYTY_DISPATCH_TIMING=*: the slow ones alone)
+			if (static_cast<double>(ns) / 1e6 >= s.threshold_ms)
+				std::printf("DISPATCH-TIME %016llx %.1f ms tick %llu groups %u x %u x %u\n", static_cast<unsigned long long>(hash),
+				            static_cast<double>(ns) / 1e6, static_cast<unsigned long long>(tick), x, y, z);
+			return;
+		}
 		auto&      t     = s.totals[index];
 		t.count.fetch_add(1, std::memory_order_relaxed);
 		t.ns.fetch_add(ns, std::memory_order_relaxed);
@@ -191,11 +250,41 @@ static void StallDump(uint64_t reached) {
 			++done;
 			continue;
 		}
-		if (shown++ < 12)
+		if (shown++ < 40)
 			std::printf("STALL-TIME tick %llu #%llu %016llx groups %u x %u x %u: %s (%u timed dispatches done before it)\n",
 			            static_cast<unsigned long long>(record->tick), static_cast<unsigned long long>(record->sequence),
 			            static_cast<unsigned long long>(record->hash), record->x, record->y, record->z,
 			            started ? "STARTED, NOT ENDED" : "not started", done);
+		// What the dispatch the GPU is in read: its buffers' first bytes, as guest memory held them when it was recorded and
+		// as the GPU copy right before it read them.
+		if (started && record->srt_count != 0) {
+			std::string words;
+			for (uint32_t w = 0; w < record->srt_count; ++w) {
+				char word[16];
+				std::snprintf(word, sizeof(word), " %08x", record->srt[w]);
+				words += word;
+			}
+			std::printf("STALL-TIME   flattened SRT (%u words):%s\n", record->srt_count, words.c_str());
+		}
+		if (started && s.snap_mapped != nullptr) {
+			(void)vmaInvalidateAllocation(s.allocator, s.snap_memory, 0, VK_WHOLE_SIZE);
+			for (uint32_t i = 0; i < record->buffers; ++i) {
+				const auto* gpu = reinterpret_cast<const uint32_t*>(
+				    s.snap_mapped + (uint64_t {static_cast<uint32_t>(record->sequence % Slots)} * SnapBuffers + i) * SnapBytes);
+				std::string guest_text, gpu_text;
+				for (uint32_t w = 0; w < SnapBytes / 4; ++w) {
+					char word[16];
+					std::snprintf(word, sizeof(word), " %08x", record->guest[i][w]);
+					guest_text += word;
+					std::snprintf(word, sizeof(word), " %08x", gpu[w]);
+					gpu_text += word;
+				}
+				std::printf("STALL-TIME   buffer %u at 0x%llx guest:%s\n", i, static_cast<unsigned long long>(record->address[i]),
+				            guest_text.c_str());
+				std::printf("STALL-TIME   buffer %u at 0x%llx   gpu:%s%s\n", i, static_cast<unsigned long long>(record->address[i]),
+				            gpu_text.c_str(), std::memcmp(gpu, record->guest[i].data(), SnapBytes) != 0 ? "  DIFFERS" : "");
+			}
+		}
 	}
 	std::printf("STALL-TIME %zu timed dispatches past tick %llu, %u done\n", stalled.size(),
 	            static_cast<unsigned long long>(reached), done);
@@ -965,7 +1054,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                    program.shader_hash, 0, 0, 0);
 		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, 0, 0, 0, indirect_args);
 	} else {
-		const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash);
+		const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash, &bindings,
+		                                          &m_context.GetBufferCache(), input_info.stage.resources.flattened_srt);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
 		                    program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
