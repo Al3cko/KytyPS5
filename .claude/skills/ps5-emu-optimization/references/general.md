@@ -73,6 +73,7 @@ fork's `KYTY_*` names; the ideas carry over to any HLE PS5 emulator. Title-speci
 | Render thread pinned alone to one core; strict pinning | 1% lows worse | it cannot escape preemption |
 | Table multi-draw; written-V# obtain memo | 11% eligible; ~1% (built twice) | |
 | Chunked views for partial unmaps; prefault backing on map; keep textures across full unmaps | hold time same; +21 s, +6 GB; no gain | |
+| Faster uploads (parallel or overlapped write-protection calls) | causal slope of frame time to upload waits 0.05-0.27 | the waits sit on the recording worker before submit, off the critical path; VirtualProtect contends across threads (7 threads 2.6x slower per call) |
 | Shader objects, pipeline libraries, DX12 | slower or <=3% | bottleneck is CPU translation |
 | Changing emitted SPIR-V for a speedup (fast format paths, padding) | forbidden | every user's caches miss: cold HUD 56 -> 105-218 s |
 
