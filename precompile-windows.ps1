@@ -223,7 +223,7 @@ if ($Coverage) {
 	return
 }
 # The compiled inputs for the emulator's shader prefetch: the seeds translated as the full run does,
-# without pipelines (half a minute).
+# without pipelines (20 s; a full run's plan of the seeds writes them, the same translation).
 $inputs = @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus", '--static-inputs')
 if ($InputsOnly) {
 	Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
@@ -246,7 +246,9 @@ if ($hasRecorded) {
 		'--threads', "$cpus")) 'plan'
 }
 if (!$Quick) {
-	Wait-Precompile (Start-Precompile 'plan-seeds' @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus")) 'plan'
+	# (With the compiled inputs: the game's shader prefetch has them from the start.)
+	Wait-Precompile (Start-Precompile 'plan-seeds' @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus",
+		'--static-inputs')) 'plan'
 }
 $first  = [System.Collections.Generic.Queue[object]]::new()
 $second = [System.Collections.Generic.Queue[object]]::new()
@@ -321,7 +323,7 @@ $env:KYTY_PRECOMPILE_CLAIMS = $null
 $mergeArguments = @('--merge')
 if (!$Quick) { $mergeArguments += '--prune' }
 Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
-Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
+if ($Quick) { Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs' }
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries",
 	"$PSScriptRoot\_PipelineCache\static\$gameId.blobs" -ErrorAction SilentlyContinue |
 	Sort-Object LastWriteTime | Select-Object -Last 1
