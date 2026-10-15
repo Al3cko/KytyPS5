@@ -102,6 +102,10 @@ bool QueryVideoMemory(uint64_t* usage, uint64_t* budget);
 // The process's system memory the GPU uses (Task Manager's shared GPU memory).
 bool QuerySharedGpuMemory(uint64_t* usage);
 
+// The file's Authenticode signature is valid (no network: revocation not checked) and its signer is NVIDIA
+// Corporation: NVIDIA's DLLs the emulator loads (Streamline for frame generation, DLSS). false elsewhere.
+bool IsNvidiaSigned(const std::wstring& path);
+
 #if defined(_WIN32)
 // With its output in files (run-windows.ps1's logs), the console window a launcher gave the process
 // stays empty, and closing it would end the game: the process leaves it (it closes).

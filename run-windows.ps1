@@ -15,7 +15,10 @@
 #   .\run-windows.ps1 -Set KEY=VALUE         override a switch of the config (KEY= removes it)
 #   .\run-windows.ps1 -FrameGen 1            DLSS frame generation, 1 generated frame per rendered
 #                                            frame (2x; up to 5, at most what the GPU makes); needs
-#                                            _Build\deps\streamline\sdk
+#                                            NVIDIA's Streamline runtime (-StreamlineDir)
+#   .\run-windows.ps1 -StreamlineDir <dir>   where NVIDIA's Streamline runtime is (the Streamline SDK
+#                                            or its bin\x64; default: a "streamline" folder next to
+#                                            the emulator)
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
 #                                            virtual vblank; movies play faster)
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
@@ -59,6 +62,7 @@ param(
 	[switch]$AspectFit,
 	[int]$Language = -1,
 	[int]$FrameGen = 0,
+	[string]$StreamlineDir = '',
 	[string]$Affinity = '',
 	[switch]$Prompt,
 	[switch]$Follow,
@@ -341,6 +345,7 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+if ($StreamlineDir) { $environment['KYTY_STREAMLINE_DIR'] = $StreamlineDir }
 # -Set KEY=VALUE overrides a switch of the config; KEY= drops it. Several: -Set A=1,B=2 (a comma
 # starts a new pair only before KEY=, so values such as 1,2,3,6,7 stay whole).
 foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*=)' })) {

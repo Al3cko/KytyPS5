@@ -20,7 +20,7 @@ $frameGens = 'Off', '2x', '3x', '4x', '5x', '6x'
 $overlays = 'Off', 'Frame rate', 'Detailed'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0; hud = 0 }
+	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0; hud = 0; streamline = '' }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -61,11 +61,37 @@ public static int[] Query() {
 	return $mask
 }
 $efficiencyMask = Get-EfficiencyMask
-# Frame generation needs NVIDIA's Streamline DLLs, which the emulator loads from KYTY_STREAMLINE_DIR or from
-# deps\streamline\sdk\bin\x64 above its folder (a local build with the Streamline SDK: _Build\deps\streamline).
+# Frame generation needs NVIDIA's Streamline runtime, which no release ships: the Streamline SDK
+# (github.com/NVIDIA-RTX/Streamline/releases) chosen with "Streamline..." (settings: streamline), else a "streamline"
+# folder next to the emulator, else the SDK beside a local build (_Build\deps\streamline\sdk). The emulator loads
+# only NVIDIA's own sl.interposer.dll (run-windows -StreamlineDir).
 $exe = if (Test-Path "$root\kyty_emulator.exe") { "$root\kyty_emulator.exe" } else { "$root\_Build\windows\kyty_emulator.exe" }
-$streamline = if ($env:KYTY_STREAMLINE_DIR) { $env:KYTY_STREAMLINE_DIR } else { Join-Path (Split-Path (Split-Path $exe)) 'deps\streamline\sdk\bin\x64' }
-$frameGenAvailable = Test-Path (Join-Path $streamline 'sl.interposer.dll')
+$streamlineSdkUrl = 'https://github.com/NVIDIA-RTX/Streamline/releases'
+# The runtime's folder in $dir (the folder itself or its bin\x64) when its sl.interposer.dll is signed by NVIDIA;
+# $null otherwise.
+function Find-Streamline([string]$dir) {
+	if (!$dir) { return $null }
+	foreach ($folder in @($dir, (Join-Path $dir 'bin\x64'))) {
+		$file = Join-Path $folder 'sl.interposer.dll'
+		if (Test-Path -LiteralPath $file) {
+			$signature = Get-AuthenticodeSignature -LiteralPath $file
+			if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -match 'O=NVIDIA Corporation') { return $folder }
+			return $null
+		}
+	}
+	return $null
+}
+function Resolve-Streamline {
+	if ($settings.streamline) { return Find-Streamline $settings.streamline }
+	if ($env:KYTY_STREAMLINE_DIR) { return Find-Streamline $env:KYTY_STREAMLINE_DIR }
+	foreach ($dir in @((Join-Path (Split-Path $exe) 'streamline'), (Join-Path (Split-Path (Split-Path $exe)) 'deps\streamline\sdk'))) {
+		$found = Find-Streamline $dir
+		if ($found) { return $found }
+	}
+	return $null
+}
+$streamline = Resolve-Streamline
+$frameGenAvailable = [bool]$streamline
 
 function Get-PlayCommand {
 	$size = $settings.resolution -split 'x'
@@ -80,7 +106,9 @@ function Get-PlayCommand {
 	if ($settings.hdr) { $arguments += '-Hdr' }
 	if ([int]$settings.render -gt 0 -and [int]$settings.render -ne 1440) { $arguments += @('-RenderHeight', [int]$settings.render) }
 	if ($settings.quality -in 'low', 'lowest') { $arguments += @('-Quality', $settings.quality) }
-	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { $arguments += @('-FrameGen', ([int]$settings.framegen - 1)) }
+	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) {
+		$arguments += @('-FrameGen', ([int]$settings.framegen - 1), '-StreamlineDir', "`"$streamline`"")
+	}
 	# The emulator's panel (KYTY_FPS_HUD) at the top right of the game image: the frame rate and frame times, or with
 	# the GPU, processor and memory too.
 	if ([int]$settings.hud -ge 1) { $arguments += @('-Set', "KYTY_FPS_HUD=$([Math]::Min([int]$settings.hud, 2))") }
@@ -99,7 +127,7 @@ if ($DryRun) {
 	"play:       cmd /v:on /s /c `"$(Get-PlayCommand)`""
 	"precompile: cmd /s /c `"$(Get-PrecompileCommand)`""
 	"efficiency cores: 0x{0:X}" -f $efficiencyMask
-	"frame generation: $(if ($frameGenAvailable) { 'available' } else { 'no Streamline DLLs' }) ($streamline)"
+	"frame generation: $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline" } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
 	return
 }
 
@@ -205,9 +233,33 @@ $frameGen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle 
 $frameGen.Items.AddRange($frameGens)
 $frameGen.SelectedItem = if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { "$([int]$settings.framegen)x" } else { 'Off' }
 if ($frameGen.SelectedIndex -lt 0) { $frameGen.SelectedIndex = 0 }
-$frameGenNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0'
-	Text = $(if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' } else { 'needs NVIDIA''s Streamline DLLs (a local build with the Streamline SDK)' }) }
-Add-Row 'Frame generation' @($frameGen, $frameGenNote)
+$frameGenFolder = New-Object System.Windows.Forms.Button -Property @{ Text = 'Streamline...'; AutoSize = $true }
+$frameGenNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+function Update-FrameGenNote {
+	$frameGenNote.Text = if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' } else {
+		'needs NVIDIA''s Streamline SDK: download it, then choose its folder' }
+}
+Update-FrameGenNote
+$frameGenTips = New-Object System.Windows.Forms.ToolTip
+$frameGenTips.SetToolTip($frameGen, "Shown frames = the game's frames x the multiplier. With VSync on, they are capped at the display's refresh`n(a 60 Hz display at 2x runs the game at 30 fps).")
+$frameGenTips.SetToolTip($frameGenFolder, "The NVIDIA Streamline SDK (a release zip from $streamlineSdkUrl), unpacked: its folder or its bin\x64.`nOnly NVIDIA-signed files are used; nothing of NVIDIA's comes with the emulator.")
+$frameGenFolder.Add_Click({
+	$dialog = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{
+		Description = "The unpacked NVIDIA Streamline SDK ($streamlineSdkUrl), or its bin\x64 folder" }
+	if ($settings.streamline -and (Test-Path -LiteralPath $settings.streamline)) { $dialog.SelectedPath = $settings.streamline }
+	if ($dialog.ShowDialog($form) -ne 'OK') { return }
+	$found = Find-Streamline $dialog.SelectedPath
+	if (!$found) {
+		[void][System.Windows.Forms.MessageBox]::Show($form, "No sl.interposer.dll signed by NVIDIA in that folder or its bin\x64.`nDownload the Streamline SDK from $streamlineSdkUrl and choose the unpacked folder.", 'Frame generation')
+		return
+	}
+	$settings.streamline = $dialog.SelectedPath
+	$script:streamline = $found
+	$script:frameGenAvailable = $true
+	$frameGen.Enabled = $true
+	Update-FrameGenNote
+})
+Add-Row 'Frame generation' @($frameGen, $frameGenFolder, $frameGenNote)
 $hud = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
 $hud.Items.AddRange($overlays)
 # (An older launcher saved true for the frame rate.)

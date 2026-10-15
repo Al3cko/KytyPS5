@@ -61,6 +61,19 @@ jobs:
           if ('${{ steps.glslang.outputs.cache-hit }}' -ne 'true') { vcpkg install 'glslang[tools,opt]:x64-windows' }
           "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
 
+      # DLSS frame generation (src/local/frame-gen.cpp): NVIDIA Streamline's headers (MIT, LICENSES/Streamline-MIT.txt)
+      # at build time; its runtime is the user's own (the launcher's "Streamline..." folder). Without them the build
+      # has no frame generation.
+      - name: Streamline headers
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          git clone --quiet --depth 1 --branch v2.14.1 --filter=blob:none --sparse https://github.com/NVIDIA-RTX/Streamline.git _Build\streamline-src
+          git -C _Build\streamline-src sparse-checkout set include
+          New-Item -ItemType Directory -Force _Build\deps\streamline\sdk | Out-Null
+          Copy-Item _Build\streamline-src\include _Build\deps\streamline\sdk -Recurse
+          Get-ChildItem _Build\deps\streamline\sdk\include -Name
+
       # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
         shell: cmd
