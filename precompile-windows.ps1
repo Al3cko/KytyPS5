@@ -150,6 +150,12 @@ if ($ExportHints) {
 if ($Recorded -eq '*') {
 	$Recorded = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds"
 	$hints = "$PSScriptRoot\tools\local\static-precompile\hints-$gameId.hints"
+	# Another region's Demon's Souls of the same version shares its shaders (--apply-hints takes those hints).
+	if (!(Test-Path $hints) -and $info.titleId -match '^PPSA0134[0-2]$') {
+		$region = Get-ChildItem "$PSScriptRoot\tools\local\static-precompile\hints-PPSA0134?_$($info.contentVersion).hints" -File -ErrorAction SilentlyContinue |
+			Sort-Object { $_.Name -notmatch '^hints-PPSA01341_' } | Select-Object -First 1
+		if ($region) { $hints = $region.FullName }
+	}
 	if (!(Test-Path $Recorded) -and (Test-Path $hints)) {
 		# (Made again each run: the hints of this release, the code of this seed file.)
 		$Recorded = Join-Path (Split-Path $Seeds) "hinted-$gameId.seeds"
