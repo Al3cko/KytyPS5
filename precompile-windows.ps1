@@ -8,11 +8,14 @@
 #                                         each pipeline's own pipeline cache data, <title>_<version>.blobs, read
 #                                         alike (a .bin made before them stays in use, and a run adds to it)
 #   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
-#   .\precompile-windows.ps1 -Quick       only the shaders as recorded play used them (this PC's recording, else the
-#                                         release's hints): about half of a full run, what the places played so far
+#   .\precompile-windows.ps1 -Quick       only the shaders as recorded play used them (the release's hints and this
+#                                         PC's recordings): about half of a full run, what the places played so far
 #                                         need. A full run compiles those first too, and the game can start once
 #                                         "ready to play" shows; the rest (every other shader the game ships, for
-#                                         places not recorded) follows.
+#                                         places not recorded) follows, but for the seeds' guessed specializations of
+#                                         shaders recorded play has (two 1-1 walks met 1 of 2,227 such pipelines and 0
+#                                         of 2,130; a fifth of a full run's time on a laptop)
+#   .\precompile-windows.ps1 -Full        those guesses too (the run before 10-15)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
@@ -43,10 +46,11 @@ param(
 	[string]$Game = '',
 	# Default: seeds-<title>_<version>.seeds next to this script (a release) or in _Build\static-precompile.
 	[string]$Seeds = '',
-	# The shaders as the game specialized them in recorded play (tools\local\static-precompile\precompile.py
-	# recorded-seeds): the specializations the seeds' guesses miss (a new PC compiled ~55 compute
-	# pipelines, up to 6 s each, before the HUD). '' = none; default: recorded-<title>_<version>.seeds next to the seed file,
-	# else the release's hints completed with the seed file's code (hinted-<title>_<version>.seeds).
+	# The shaders as the game specialized them in recorded play: the specializations the seeds' guesses miss (a new PC
+	# compiled ~55 compute pipelines, up to 6 s each, before the HUD). '' = none; a seed file of them; default: the
+	# release's hints, this PC's warmup recordings and recorded-<title>_<version>.seeds next to the seed file
+	# (tools\local\static-precompile\precompile.py recorded-seeds) together, completed with the seed file's code
+	# (hinted-<title>_<version>.seeds).
 	[string]$Recorded = '*',
 	[int]$Jobs = 0,
 	[int]$Threads = 3,
@@ -54,6 +58,7 @@ param(
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
 	[switch]$Quick,
+	[switch]$Full,
 	[switch]$InputsOnly,
 	# The specialization hints of this PC's play (its warmup recordings, without the game's code) into
 	# my-hints-<title>_<version>.hints next to this script, nothing compiled: attached to an issue, the next releases'
@@ -149,7 +154,7 @@ if ($ExportHints) {
 	exit 0
 }
 if ($Recorded -eq '*') {
-	$Recorded = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds"
+	$Recorded = ''
 	$hints = "$PSScriptRoot\tools\local\static-precompile\hints-$gameId.hints"
 	# Another region's Demon's Souls of the same version shares its shaders (--apply-hints takes those hints).
 	if (!(Test-Path $hints) -and $info.titleId -match '^PPSA0134[0-2]$') {
@@ -157,12 +162,34 @@ if ($Recorded -eq '*') {
 			Sort-Object { $_.Name -notmatch '^hints-PPSA01341_' } | Select-Object -First 1
 		if ($region) { $hints = $region.FullName }
 	}
-	if (!(Test-Path $Recorded) -and (Test-Path $hints)) {
-		# (Made again each run: the hints of this release, the code of this seed file.)
-		$Recorded = Join-Path (Split-Path $Seeds) "hinted-$gameId.seeds"
-		& $Exe --game $Game --seeds $Seeds --apply-hints $hints --out $Recorded
+	# Recorded play, all of it (made again each run, with the code of this seed file): the release's hints (every world's
+	# tours and players' play), this PC's warmup recordings and a recorded seed file next to the seed file. One of them
+	# alone left the others out: a laptop's recorded seed file of 10-11 kept the release's hints of a pipeline its play
+	# then met (2-3 s to compile, every launch until the driver cache kept it).
+	$sources = @()
+	if (Test-Path $hints) {
+		$released = Join-Path (Split-Path $Seeds) "released-$gameId.seeds"
+		& $Exe --game $Game --seeds $Seeds --apply-hints $hints --out $released
+		if ($LASTEXITCODE) { Write-Host 'the release''s specialization hints could not be applied (kyty_shader_precompile --apply-hints)' }
+		else { $sources += $released }
+	}
+	$sources += @(Get-ChildItem "$PSScriptRoot\_PipelineCache\warmup-v2\*\$gameId.shaders" -File -ErrorAction SilentlyContinue).FullName
+	$manual = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds"
+	if (Test-Path $manual) { $sources += $manual }
+	if ($sources.Count -eq 1 -and $sources[0] -eq $released) {
+		$Recorded = $released
+	} elseif ($sources.Count) {
+		# Their hints together (each specialization once), completed with the code of the seed file.
+		$together = Join-Path (Split-Path $Seeds) "recorded-play-$gameId.hints"
+		$arguments = @('--game', $Game, '--seeds', $Seeds, '--make-hints', $together)
+		foreach ($source in $sources) { $arguments += @('--recorded', $source) }
+		& $Exe @arguments
+		if (!$LASTEXITCODE) {
+			$Recorded = Join-Path (Split-Path $Seeds) "hinted-$gameId.seeds"
+			& $Exe --game $Game --seeds $Seeds --apply-hints $together --out $Recorded
+		}
 		if ($LASTEXITCODE) {
-			Write-Host 'the specialization hints could not be applied (kyty_shader_precompile --apply-hints): the seeds alone'
+			Write-Host 'the specializations of recorded play could not be gathered (kyty_shader_precompile --make-hints/--apply-hints): the seeds alone'
 			$Recorded = ''
 		}
 	}
@@ -253,9 +280,11 @@ if ($hasRecorded) {
 		'--threads', "$cpus")) 'plan'
 }
 if (!$Quick) {
-	# (With the compiled inputs: the game's shader prefetch has them from the start.)
-	Wait-Precompile (Start-Precompile 'plan-seeds' @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus",
-		'--static-inputs')) 'plan'
+	# (With the compiled inputs: the game's shader prefetch has them from the start.) The seeds' guessed specializations
+	# of shaders recorded play has are left out (-Full: not).
+	$seedPlan = @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus", '--static-inputs')
+	if ($hasRecorded -and !$Full) { $seedPlan += @('--covered-by', "`"$Recorded`"") }
+	Wait-Precompile (Start-Precompile 'plan-seeds' $seedPlan) 'plan'
 }
 $first  = [System.Collections.Generic.Queue[object]]::new()
 $second = [System.Collections.Generic.Queue[object]]::new()

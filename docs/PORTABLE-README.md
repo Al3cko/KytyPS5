@@ -150,14 +150,18 @@ There are two levels of preparation, both specific to the graphics card and driv
    result is a store the game reads pipeline by pipeline (`<title>_<version>.binaries`, about 2 GB, nothing to
    load at launch); with other drivers a cache each launch loads (with a progress bar).
    - Choose "Precompile first" in the dialog at launch, or double-click `precompile.cmd` on its own.
-   - The time depends on the CPU threads: about 55 minutes with 22 threads, about 1 hour 15 minutes with
-     16, about 2.5 hours with 8. The CPU is fully loaded meanwhile: running it overnight is a good idea.
+   - The time depends on the CPU: under an hour with 22 threads, about 1 hour 50 minutes on a 16-thread
+     laptop (Ryzen 9 5900HX), longer with fewer threads. The CPU is fully loaded meanwhile: running it
+     overnight is a good idea. Once "ready to play" shows (about halfway), what play needs is in place
+     and the game can be started; the rest follows.
    - Closing the window stops it; running it again continues where it stopped.
    - Coming from an older package with a precompiled `_PipelineCache\static\<title>.bin`: the precompile
      turns it into the store in a few minutes; the `.bin` is then unused and can be deleted (about 4 GB).
    - It compiles the shaders as the game uses them in play too: the package carries what was recorded
      while playing every world on the test PC (`tools\local\static-precompile\hints-<title>_<version>.hints`,
-     without the game's shader code), completed with the code of your own game files.
+     without the game's shader code), together with what your own play recorded, completed with the code of
+     your own game files. For those shaders it leaves out the guessed variants the game did not use (a fifth
+     of the time); `precompile.cmd -Full` compiles them too.
    - Places and effects the test PC never recorded (bosses' deaths, for one) still compile when they first
      appear. The launcher's "Export shader hints" button (or `precompile.cmd -ExportHints`) writes what your
      own play recorded, without the game's shader code, to `my-hints-<title>_<version>.hints` (a few hundred
@@ -211,7 +215,7 @@ can be warped too; one in the character creation cannot (it has no save yet).
 | `logs` | Run logs |
 | `game-path.txt` | The remembered game location |
 | `seeds-<title>_<version>.seeds` | The list of shaders the first launch collects from the game files (one per game version) (it contains the game's shader code: do not share it), for the precompile |
-| `hinted-<title>_<version>.seeds` | The recorded play of the package's hints with the code of your game files (made by each precompile; it contains the game's shader code: do not share it) |
+| `hinted-<title>_<version>.seeds` | The recorded play of the package's hints and of your own play with the code of your game files (made by each precompile, from `released-<title>_<version>.seeds` and `recorded-play-<title>_<version>.hints`; the `.seeds` files contain the game's shader code: do not share them) |
 | `launch.json` | The emulator's switches; normally left alone |
 
 ## Known issues

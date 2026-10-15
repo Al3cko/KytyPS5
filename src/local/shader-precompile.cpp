@@ -35,7 +35,9 @@
 // files make (two fifths of a run) is compiled once. --native-variants: the native XPR variants too (none by default:
 // the emulator builds a missing one in the background, its draws taking the normal path meanwhile; 7% of a full run);
 // --native-guesses with it: also those of a seed file without recorded specializations (the game met none of them in a
-// 1-1 session; a third of such a file's time).
+// 1-1 session; a third of such a file's time). --covered-by <file> with --dry-run --plan: the work items of the seed
+// file whose programs that seed file of recorded play's specializations all holds are planned as skipped (none of
+// their pipelines is made, but where another work item needs one).
 // --status prints
 // whether those inputs and the static cache are this GPU's and driver's ("inputs current|stale",
 // "static cache current|outdated|stale", outdated: older than the seeds; run-windows.ps1 asks before every launch).
@@ -142,6 +144,8 @@ int main(int argc, char* argv[]) {
 			options.timings = argv[++i];
 		} else if (arg == "--plan") {
 			options.plan = argv[++i];
+		} else if (arg == "--covered-by") {
+			options.covered_by = argv[++i];
 		} else if (arg == "--threads") {
 			options.threads = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 		} else if (arg == "--shard") {

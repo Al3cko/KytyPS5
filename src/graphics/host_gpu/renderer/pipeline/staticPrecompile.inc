@@ -142,6 +142,8 @@ struct PrecompilePlan {
 		uint64_t file = 0;
 		uint32_t n    = 0;
 	};
+	// An owner's file: no shard makes the pipeline (PrecompileOptions::covered_by).
+	static constexpr uint64_t Skipped = UINT64_MAX;
 	std::unordered_map<uint64_t, Owner> owners;
 
 	static constexpr std::string_view Magic = "KytyPrecompilePlan1\n";
@@ -658,17 +660,38 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	const size_t       planned_keys = plan.owners.size();
 	std::mutex         plan_mutex;
 	std::unordered_set<uint64_t> made_keys;
-	std::atomic<size_t>          left_to_others {0};
-	const auto make_here = [&](uint64_t key, size_t n) {
+	std::atomic<size_t>          left_to_others {0}, skipped {0};
+	// (--covered-by: the programs, by stage and hash, of the seed file of recorded play's specializations.)
+	std::set<std::pair<uint32_t, uint64_t>> covered_programs;
+	if (args.dry_run && !args.covered_by.empty()) {
+		std::vector<std::vector<uint32_t>> covered_words, covered_recipes;
+		if (!LocalShaderWarmup::Cache::ReadSeeds(args.covered_by, covered_words, covered_recipes)) {
+			PipelineCacheLog("Shader seeds: cannot read {}", Common::PathToString(args.covered_by));
+			return false;
+		}
+		for (const auto& words: covered_words)
+			if (words.size() >= 3) covered_programs.emplace(words[0], uint64_t {words[1]} | uint64_t {words[2]} << 32u);
+	}
+	const auto covers = [&](ShaderType stage, uint64_t hash) {
+		return covered_programs.contains({static_cast<uint32_t>(stage), hash});
+	};
+	// `covered`: the work item's programs all have recorded specializations (covered_programs).
+	const auto make_here = [&](uint64_t key, size_t n, bool covered) {
 		if (args.dry_run) {
 			if (args.plan.empty()) return false;
 			std::lock_guard lock(plan_mutex);
-			const auto [owner, added] = plan.owners.try_emplace(key, PrecompilePlan::Owner {seed_file, static_cast<uint32_t>(n)});
-			if (!added && owner->second.file == seed_file && n < owner->second.n) owner->second.n = static_cast<uint32_t>(n);
+			const PrecompilePlan::Owner mine {covered ? PrecompilePlan::Skipped : seed_file, static_cast<uint32_t>(n)};
+			const auto [owner, added] = plan.owners.try_emplace(key, mine);
+			if (!added && owner->second.file == PrecompilePlan::Skipped && !covered) owner->second = mine;
+			else if (!added && owner->second.file == mine.file && n < owner->second.n) owner->second.n = static_cast<uint32_t>(n);
 			return false;
 		}
 		if (planned) {
 			const auto owner = plan.owners.find(key); // (not changed while shards run)
+			if (owner != plan.owners.end() && owner->second.file == PrecompilePlan::Skipped) {
+				skipped.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
 			if (owner != plan.owners.end() && (owner->second.file != seed_file || owner->second.n != n)) {
 				left_to_others.fetch_add(1, std::memory_order_relaxed);
 				return false;
@@ -711,11 +734,12 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				if (stage_of(n) != ShaderType::Compute) return;
 				LocalShaderWarmup::Record input;
 				if (!decode(static_cast<uint32_t>(n), input)) return;
+				const bool covered = covers(ShaderType::Compute, input.hash);
 				// (`native`: a table mode program's pipeline, TryCreateComputePipeline's.)
 				const auto create = [&](const Permutation& permutation, bool native, const char* kind) {
 					input.compute.stage.program = &permutation.program;
 					const auto key              = ComputePipelineIdentity(spirv_hash(&permutation), input.compute, native);
-					const bool here             = make_here(key, n);
+					const bool here             = make_here(key, n, covered);
 					if (!here && !args.dry_run) return;
 					const auto start = std::chrono::steady_clock::now();
 					if (here) {
@@ -758,6 +782,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				       });
 			};
 			const bool unbuffered = recipe.vertex_input.binding_count == 0 && vs.stage == ShaderType::Vertex;
+			const bool covered    = covers(vs.stage, vs.hash) &&
+			                     (recipe.pixel == LocalShaderWarmup::NoShader || covers(ShaderType::Pixel, ps.hash));
 			const auto create     = [&](const Permutation& vertex_permutation, const Permutation* pixel, bool native,
 			                            const char* kind) {
 				vs.vertex.stage.program = &vertex_permutation.program;
@@ -765,7 +791,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				const auto key  = GraphicsPipelineIdentity(spirv_hash(&vertex_permutation), pixel ? spirv_hash(pixel) : 0,
 				                                           recipe.rendering, recipe.vertex_input, recipe.state, vs.vertex,
 				                                           pixel ? &ps.pixel : nullptr, native);
-				const bool here = make_here(key, n);
+				const bool here = make_here(key, n, covered);
 				if (!here && !args.dry_run) return;
 				const auto start = std::chrono::steady_clock::now();
 				if (here) {
@@ -866,9 +892,9 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	size_t spirv_words = 0;
 	for (const auto& [permutation, spirv]: spirv_of) spirv_words += spirv.words;
 	PipelineCacheLog("Shader seeds: {} programs ({} with indirect image tables, {} MiB of SPIR-V) in {} ms; {} pipelines "
-	                 "in {} ms ({} threads; {} made by another work item{}{})",
+	                 "in {} ms ({} threads; {} made by another work item, {} skipped: recorded play's programs{}{})",
 	                 compiled.load(), indirect.load(), spirv_words >> 18u, programs_ms, created.load(), elapsed() - programs_ms,
-	                 threads, left_to_others.load(), planned ? ", planned" : "",
+	                 threads, left_to_others.load(), skipped.load(), planned ? ", planned" : "",
 	                 !args.native_variants                ? "; no native variants"
 	                 : guesses && !args.native_guesses ? "; guessed specializations: no native variants"
 	                                                   : "");

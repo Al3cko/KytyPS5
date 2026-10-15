@@ -143,6 +143,13 @@ public:
 		// The run's plan: each pipeline key of its seed files with the work item that makes it first. A dry run adds
 		// the seed file's keys to it; a shard creates only the pipelines whose first work item is its own.
 		std::filesystem::path plan;
+		// With a dry run (--covered-by): the seed file of recorded play's specializations (a recording, or the release's
+		// hints) planned before this one. This file's work items whose programs it all holds - a compute seed whose
+		// shader it has, a recipe both of whose shaders it has - are planned as skipped: their guessed specializations
+		// of programs whose real ones are known. (1.07 on a laptop: a fifth of a full run's compile time; two 1-1 walks
+		// met 1 such pipeline of 2,227 and 0 of 2,130, every other one recorded play's.) One also needed by a work item
+		// it does not cover is made there.
+		std::filesystem::path covered_by;
 		// Native XPR variants of a seed file without recorded specializations too (its guesses; see WarmSeeds).
 		bool                  native_guesses = false;
 		// Native XPR variants at all (--native-variants): without it none are made. The emulator builds a missing one
