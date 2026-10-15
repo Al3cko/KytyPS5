@@ -99,5 +99,9 @@ fork's `KYTY_*` names; the ideas carry over to any HLE PS5 emulator. Title-speci
 - What stalls is a specialization key the prefetch lacks (0.1-0.5 s re-translation on the render thread), not a
   missing SPIR-V. Measure coverage per stage at the key level; normalize key fields the module ignores (recorded
   coverage CS 92.3 -> 97.5%, PS 93.9 -> 98.6%); a full playthrough's recording covers effects met once.
+- Recorded play is what gets used: with a recorded tier in the store, two 1-1 walks used ~2,000 recorded-tier
+  pipelines and 1 of ~2,200 statically guessed ones. Compile the recorded tier first ("ready to play"), merge every
+  recording source (shipped hints + this PC's), and skip guessed variants of shaders it covers (a fifth of compile
+  time; laptop from scratch 2:36 -> 1:48 h, ready to play at 0:59).
 - Compile cost multipliers: wave64 on a 32-wide GPU (every instruction twice, x2.3), runtime format decode as nested
   switches (up to 9.5 MB SPIR-V), EXEC predication.
