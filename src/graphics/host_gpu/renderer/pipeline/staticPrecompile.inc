@@ -781,7 +781,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 			// guess was right (seldom: a 1-1 session met none of these variants, every native pipeline it made had a
 			// recorded specialization's modules). One the store lacks is built in the background, its draws taking the
 			// normal path meanwhile (TryCreateGraphicsPipeline), so a guess file leaves them out (a third of its time).
-			const bool native_first = !guesses || args.native_guesses;
+			const bool native_first = args.native_variants && (!guesses || args.native_guesses);
 			for (const auto& [pixel, cursor]: pixel_variants(recipe)) {
 				const auto found = vertex.find({recipe.vertex, cursor});
 				if (found == vertex.end()) continue;
@@ -803,7 +803,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 					for (const auto& vertex_permutation: found->second)
 						portable |= same_as(exact[recipe.vertex].get(), vertex_permutation.get());
 				}
-				if (!portable) create_with_native(*exact[recipe.vertex], pixel, "gfx-exact", "gfx-exact-native", true);
+				if (!portable)
+					create_with_native(*exact[recipe.vertex], pixel, "gfx-exact", "gfx-exact-native", args.native_variants);
 			}
 			// Table mode (TableStore): a draw without vertex buffers, its table programs with native bindings: those of each
 			// specialization of its two programs (the pairs of their SPIR-V once).
@@ -861,7 +862,9 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	                 "in {} ms ({} threads; {} made by another work item{}{})",
 	                 compiled.load(), indirect.load(), spirv_words >> 18u, programs_ms, created.load(), elapsed() - programs_ms,
 	                 threads, left_to_others.load(), planned ? ", planned" : "",
-	                 guesses && !args.native_guesses ? "; guessed specializations: no native variants" : "");
+	                 !args.native_variants                ? "; no native variants"
+	                 : guesses && !args.native_guesses ? "; guessed specializations: no native variants"
+	                                                   : "");
 	for (const auto& [message, count]: rejections) PipelineCacheLog("Shader seeds: rejected {}: {}", count, message);
 
 	// What was compiled, as a warmup file (compiler inputs with the specialization used), with the SPIR-V

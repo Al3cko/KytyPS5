@@ -2,7 +2,7 @@
 //
 //   kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] [--threads <n>]
 //                          [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines] [--dry-run]
-//                          [--plan <file>] [--native-guesses]
+//                          [--plan <file>] [--native-variants [--native-guesses]]
 //   kyty_shader_precompile --game <dir> --merge [--prune] [--keep-shards]
 //   kyty_shader_precompile --game <dir> --seeds <file> --status
 //   kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>]
@@ -32,8 +32,10 @@
 // timings then listing what would be (0 ms). --plan <file> with --dry-run adds every pipeline of the seed file to the
 // run's plan (its key, the work item that makes it first; a key an earlier seed file has stays that one's); with
 // --shard, the shard creates only the pipelines whose first work item is its own: what several work items or seed
-// files make (two fifths of a run) is compiled once. --native-guesses: the native XPR variants of a seed file without
-// recorded specializations as well (the game met none of them in a 1-1 session; a third of such a file's time).
+// files make (two fifths of a run) is compiled once. --native-variants: the native XPR variants too (none by default:
+// the emulator builds a missing one in the background, its draws taking the normal path meanwhile; 7% of a full run);
+// --native-guesses with it: also those of a seed file without recorded specializations (the game met none of them in a
+// 1-1 session; a third of such a file's time).
 // --status prints
 // whether those inputs and the static cache are this GPU's and driver's ("inputs current|stale",
 // "static cache current|outdated|stale", outdated: older than the seeds; run-windows.ps1 asks before every launch).
@@ -72,7 +74,7 @@ using Libs::Graphics::PipelineCache;
 static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
 	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines] "
-	                     "[--dry-run] [--plan <file>] [--native-guesses]\n"
+	                     "[--dry-run] [--plan <file>] [--native-variants [--native-guesses]]\n"
 	                     "       kyty_shader_precompile --game <dir> --merge [--prune] [--keep-shards]\n"
 	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n"
 	                     "       kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>] "
@@ -115,6 +117,8 @@ int main(int argc, char* argv[]) {
 			options.pipelines = false;
 		} else if (arg == "--dry-run") {
 			options.dry_run = true;
+		} else if (arg == "--native-variants") {
+			options.native_variants = true;
 		} else if (arg == "--native-guesses") {
 			options.native_guesses = true;
 		} else if (arg == "--amd") {

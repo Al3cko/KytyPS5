@@ -145,6 +145,12 @@ public:
 		std::filesystem::path plan;
 		// Native XPR variants of a seed file without recorded specializations too (its guesses; see WarmSeeds).
 		bool                  native_guesses = false;
+		// Native XPR variants at all (--native-variants): without it none are made. The emulator builds a missing one
+		// in the background (TryCreateGraphicsPipeline, KYTY_ASYNC_XPR_PIPELINES: run-windows.ps1's default), its draws
+		// taking the normal path meanwhile; native records draw well under 1% of a frame's draws since table mode.
+		// (1.07: 18,935 of the recorded specializations' 89,091 pipelines; a fresh 1-1 start built ~170 of them in the
+		// background, with fewer slow frames than before.)
+		bool                  native_variants = false;
 		// Compute seeds translated for this host subgroup size instead of the one they were listed or recorded with
 		// (0: as they were): kyty_shader_precompile passes the GPU's (GetComputeProgram's), --amd what a GPU running
 		// wave64 programs natively (AMD RDNA3) gets.
