@@ -2138,15 +2138,16 @@ void PipelineCache::InitializeDriverCache() {
 		                      m_driver_cache_key / (title_id + ".bin");
 	}
 	// The launcher keeps one cache across emulator builds: pipelines of changed shaders pile up in it, so past
-	// 1 GiB (one build's warmup is ~130 MB) it starts over. The driver copies a loaded cache whole into the process's
-	// memory (a 0.94 GB and a 0.6 GB one: 1.5 GB of RAM at 1-1): at most 1/64 of the PC's RAM each, but not under
-	// 512 MiB: ordinary play passes 1/64 of 16 GB (256 MiB; 265 MiB after 30 minutes of 1-1, issue #14), and a cache
-	// that starts over at every launch compiles its pipelines in play again.
+	// 2 GiB (one build's warmup is ~130 MB) it starts over. The driver copies a loaded cache whole into the process's
+	// memory (a 0.94 GB and a 0.6 GB one: 1.5 GB of RAM at 1-1): 512 MiB each below 24 GB of RAM (ordinary play
+	// passes 1/64 of 16 GB: 256 MiB, 265 MiB after 30 minutes of 1-1, issue #14; a 16 GB PC is short of RAM as it is),
+	// 1/16 of the RAM from 24 GB (a 1.2 GB cache on a 32 GB PC started over at every launch, issue #9): a cache that
+	// starts over compiles its pipelines in play again.
 	const uint64_t ram       = LocalPlatform::PhysicalMemory();
 	const auto     ram_limit = [ram](uint64_t limit) {
-		return ram != 0 ? std::min(limit, std::max(uint64_t {512} << 20u, ram / 64u)) : limit;
+		return ram != 0 ? std::min(limit, ram >= (uint64_t {24} << 30u) ? ram / 16u : uint64_t {512} << 20u) : limit;
 	};
-	m_driver_cache = LoadDriverCache(m_driver_cache_path, ram_limit(uint64_t {1} << 30u), m_driver_cache_saved_size);
+	m_driver_cache = LoadDriverCache(m_driver_cache_path, ram_limit(uint64_t {2} << 30u), m_driver_cache_saved_size);
 	if (m_driver_cache == nullptr) return;
 	// Table mode pipelines (src/local/table-xpr.inc) in a cache of their own: the static precompile holds none of
 	// them (each compiles in ~0.1-4 s), they are saved once their compiles settle (not only at a clean exit), and
