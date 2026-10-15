@@ -595,8 +595,9 @@ struct PipelineCache::ProgramCache {
 		uint64_t                                               spill = 0;
 		std::thread                                            loader;
 		std::vector<std::thread>                               threads;
-		// Render thread: programs and modules taken over, programs translated there while pending.
-		size_t adopted = 0, adopted_modules = 0, claimed = 0;
+		// Render thread: programs and modules taken over, programs translated there while pending; groups of warm programs
+		// taken over (TakePrefetchedModules) and found not done yet.
+		size_t adopted = 0, adopted_modules = 0, claimed = 0, taken = 0, take_early = 0;
 		// Render thread: spilled plans loaded back, and the time it took (LoadSpilledPlan).
 		size_t plans_loaded = 0;
 		double plan_load_ms = 0.0, plan_load_max_ms = 0.0, plan_read_ms = 0.0, plan_values_ms = 0.0, plan_linear_ms = 0.0;
@@ -672,8 +673,9 @@ struct PipelineCache::ProgramCache {
 			const auto begin = std::chrono::steady_clock::now();
 			if (!std::filesystem::exists(path) || !p.inputs.Open(path, identity) || p.inputs.records.empty()) {
 				PipelineCacheLog("Shader prefetch: no inputs for this GPU and driver in {} (precompile-windows.ps1 "
-				                 "writes them)", Common::PathToString(path));
-				return;
+				                 "writes them){}", Common::PathToString(path), recorded.empty() ? "" : ": the recording's only");
+				if (recorded.empty()) return;
+				p.inputs.records.clear();
 			}
 			const std::unordered_set<ProgramKey, ProgramKeyHash> skip(warm.begin(), warm.end());
 			for (uint32_t i = 0; i < p.inputs.records.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
@@ -697,15 +699,32 @@ struct PipelineCache::ProgramCache {
 			// game starts and loads are among the first recorded (1,138 translated on the render thread at the laptop's
 			// tutorial start, 13.8 s, 58% of them in the oldest tenth of the recording, all in it), and the biggest-first
 			// order reached them minutes later (20K programs on 4 threads).
-			uint32_t ranked = 0;
+			// The recording's records the static inputs lack (play since the last precompile, or a warmup that stopped at its
+			// budget before them: the inputs hold the seeds' guesses and the hints) are inputs too, each record once: those
+			// the warmup did not translate, also of its programs (their other specializations: TakePrefetchedModules).
+			uint32_t ranked = 0, added = 0;
 			for (uint32_t i = 0; i < recorded.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
 				LocalShaderWarmup::Record record;
 				LocalShaderWarmup::Reader reader {recorded[i]};
 				if (!LocalShaderWarmup::Visit(reader, record) || !LocalShaderWarmup::ValidKey(record)) continue;
-				const ProgramKey key {record.stage, record.hash, record.user_data_count,
-				                      static_cast<uint32_t>(record.code.size()), record.static_key};
-				if (const auto found = p.index.find(key); found != p.index.end() && found->second->recorded == UINT32_MAX) {
-					found->second->recorded = i;
+				ProgramKey key {record.stage, record.hash, record.user_data_count,
+				                static_cast<uint32_t>(record.code.size()), record.static_key};
+				auto [found, inserted] = p.index.try_emplace(key, nullptr);
+				if (inserted) {
+					auto& group      = *p.groups.emplace_back(std::make_unique<Prefetch::Group>());
+					group.key        = std::move(key);
+					group.source     = SourceDigest(record.code, record.back_code);
+					group.code_words = record.code.size();
+					found->second    = &group;
+				}
+				auto& group = *found->second;
+				if (std::ranges::none_of(group.records, [&](uint32_t index) { return p.inputs.records[index] == recorded[i]; })) {
+					group.records.push_back(static_cast<uint32_t>(p.inputs.records.size()));
+					p.inputs.records.push_back(std::move(recorded[i]));
+					added++;
+				}
+				if (group.recorded == UINT32_MAX) {
+					group.recorded = i;
 					ranked++;
 				}
 			}
@@ -726,8 +745,9 @@ struct PipelineCache::ProgramCache {
 			uint32_t       threads = std::clamp(cpus > 12u ? cpus - 12u : 2u, 2u, std::max(2u, cpus / 2u));
 			if (const char* value = std::getenv("KYTY_SHADER_PREFETCH_THREADS"); value != nullptr && *value != '\0')
 				threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
-			PipelineCacheLog("Shader prefetch: {} programs ({} inputs, {} recorded first) to translate on {} threads, loaded in {} ms",
-			                 p.groups.size(), p.inputs.records.size(), ranked, threads,
+			PipelineCacheLog("Shader prefetch: {} programs ({} inputs, {} of them recorded play's; {} recorded first) to "
+			                 "translate on {} threads, loaded in {} ms",
+			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads,
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
 			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this] { PrefetchWork(); });
@@ -897,6 +917,26 @@ struct PipelineCache::ProgramCache {
 		return &group;
 	}
 
+	// The prefetched translations of a program the warmup already holds (the recording's records it did not translate:
+	// the program's other specializations) join its modules, once the prefetch's worker is done with them (pending or
+	// running: left to it, the caller translates); false when none came.
+	bool TakePrefetchedModules(SourceEntry& source, const ShaderParams& params) {
+		if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return false;
+		const auto found = prefetch->index.find(lookup_key);
+		if (found == prefetch->index.end()) return false;
+		auto& group = *found->second;
+		auto  state = static_cast<uint8_t>(Prefetch::Done);
+		if (group.source != SourceDigest(params.code, params.back_code)) return false;
+		if (!group.state.compare_exchange_strong(state, Prefetch::Taken, std::memory_order_acq_rel)) {
+			prefetch->take_early += state != Prefetch::Taken;
+			return false;
+		}
+		prefetch->taken++;
+		for (auto& module: group.modules) source.prefetched.push_back(std::move(module));
+		group.modules.clear();
+		return !source.prefetched.empty();
+	}
+
 	// A prefetched module of the source compiled with the specialization a translation would compile
 	// here (portable formats, see Get) and a push data start the cursor allows: its permutation.
 	const Permutation* AdoptPrefetchedModule(SourceEntry& source, const ShaderRecompiler::CompileOptions& options,
@@ -905,12 +945,18 @@ struct PipelineCache::ProgramCache {
 		if (source.prefetched.empty() || prefetch == nullptr) return nullptr;
 		auto compiled = specialization;
 		(void)ShaderRecompiler::IR::PortableFormats(source.resource_plan.info, compiled);
-		const auto module = std::ranges::find_if(source.prefetched, [&](const PrefetchedModule& candidate) {
-			const auto& layout = candidate.program.bindings;
-			return candidate.specialization == compiled &&
-			       layout.push_data_start_dword ==
-			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords());
-		});
+		// The exact specialization first (a module of the recording's records: they hold the exact one, as the warmup
+		// compiles them), then the portable one (the static inputs': the precompile's modules).
+		const auto with = [&](const ShaderRecompiler::IR::ResourceSpecialization& wanted) {
+			return std::ranges::find_if(source.prefetched, [&](const PrefetchedModule& candidate) {
+				const auto& layout = candidate.program.bindings;
+				return candidate.specialization == wanted &&
+				       layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords());
+			});
+		};
+		auto module = with(specialization);
+		if (module == source.prefetched.end()) module = with(compiled);
 		if (module == source.prefetched.end()) return nullptr;
 		std::vector<uint32_t> spirv(module->spirv_words);
 		const auto            bytes = spirv.size() * sizeof(uint32_t);
@@ -1303,8 +1349,9 @@ struct PipelineCache::ProgramCache {
 		const auto source_begin = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		bool       translated_here = false;
 		double     translate_ms    = 0.0;
+		const auto adopt = [&] { return AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor); };
 		if (entry == programs.end() ||
-		    AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor) == nullptr) {
+		    (adopt() == nullptr && (!TakePrefetchedModules(entry->second, params) || adopt() == nullptr))) {
 			translated_here = true;
 			// With the slow-call log: the translation's specialization-independent part (front) and
 			// whether the program had other permutations already.
@@ -1493,14 +1540,32 @@ struct PipelineCache::ProgramCache {
 			if (parsed.ec != std::errc {} || parsed.ptr != end || budget_seconds > 3600) budget_seconds = 0;
 		}
 		if (budget_seconds) warm_deadline = begin + std::chrono::seconds(budget_seconds);
+		// The translation alone (KYTY_SHADER_WARMUP_TRANSLATE_SECONDS, default 5; 0: no limit of its own): the newest
+		// records first, those left to the shader prefetch, which translates the recording first (StartPrefetch). The
+		// recording only grows (every shader of every place played): translating it whole took 16 s of each start-up
+		// for 17,028 inputs on a 16-thread desktop, and kept 3.8 GB. A -Precompile run (KYTY_SHADER_WARMUP_ONLY) takes
+		// them all.
+		uint32_t translate_seconds = 5;
+		if (const char* value = std::getenv("KYTY_SHADER_WARMUP_TRANSLATE_SECONDS"); value && *value) {
+			const auto end    = value + std::strlen(value);
+			const auto parsed = std::from_chars(value, end, translate_seconds);
+			if (parsed.ec != std::errc {} || parsed.ptr != end || translate_seconds > 3600) translate_seconds = 5;
+		}
+		const char* only               = std::getenv("KYTY_SHADER_WARMUP_ONLY");
+		auto        translate_deadline = warm_deadline;
+		if (translate_seconds != 0 && (only == nullptr || std::string_view(only) != "1"))
+			translate_deadline = std::min(translate_deadline, begin + std::chrono::seconds(translate_seconds));
 		warm_permutations.resize(warmup.records.size());
-		size_t compiled = 0;
+		size_t compiled = 0, left = 0;
 		const uint32_t threads = WarmupThreads();
 		std::optional<WarmWorkers> workers;
 		if (threads > 1) workers.emplace(warmup.records, threads);
 		for (size_t remaining = warmup.records.size(); remaining != 0; --remaining) {
 			const size_t index = remaining - 1;
-			if (std::chrono::steady_clock::now() >= warm_deadline) break;
+			if (std::chrono::steady_clock::now() >= translate_deadline) {
+				left = remaining;
+				break;
+			}
 			StartupProgress::Report("Preparing shaders", warmup.records.size() - remaining, warmup.records.size());
 			std::unique_ptr<WarmJob> job;
 			LocalShaderWarmup::Record parsed;
@@ -1557,10 +1622,10 @@ struct PipelineCache::ProgramCache {
 			if (++compiled % 250 == 0) PipelineCacheLog("Shader warmup: compiling {}/{}", compiled, warmup.records.size());
 		}
 		workers.reset();
-		PipelineCacheLog("Shader warmup: compiled {}/{} permutations in {} ms ({} threads)", compiled,
-		    warmup.records.size(),
+		PipelineCacheLog("Shader warmup: compiled {}/{} permutations in {} ms ({} threads); {} records left to the shader "
+		    "prefetch", compiled, warmup.records.size(),
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
-		    threads);
+		    threads, left);
 	}
 	LocalShaderWarmup::Cache warmup;
 	std::unordered_map<uint64_t, uint32_t> recorded_programs;
@@ -1816,13 +1881,19 @@ void PipelineCache::ReportObjects(uint64_t id) const {
 	const auto store = ModuleStore::Stats();
 	std::printf("LIVE_PIPELINE_OBJECTS id=%llu graphics_pipelines=%zu compute_pipelines=%zu pending_graphics=%zu pending_compute=%zu "
 	            "replaced_unoptimized=%zu optimizing=%zu programs=%zu jit_bytes=%zu stored_modules=%llu stored_spirv_mib=%llu "
-	            "store_file_mib=%llu store_loads=%llu store_load_misses=%llu plans_out=%zu plan_reloads=%llu\n",
+	            "store_file_mib=%llu store_loads=%llu store_load_misses=%llu plans_out=%zu plan_reloads=%llu prefetch_adopted=%zu "
+	            "prefetch_claimed=%zu prefetch_taken=%zu prefetch_take_early=%zu prefetch_finished=%zu\n",
 	            static_cast<unsigned long long>(id), m_graphics_pipelines.size(), m_compute_pipelines.size(), m_pending_graphics_pipelines.size(),
 	            m_pending_compute_pipelines.size(), m_replaced_pipelines.size(), m_optimizing.size(),
 	            m_program_cache->programs.size(), JitArena::Used(), static_cast<unsigned long long>(store.modules),
 	            static_cast<unsigned long long>(store.spirv_bytes >> 20u), static_cast<unsigned long long>(store.stored_bytes >> 20u),
 	            static_cast<unsigned long long>(store.loads), static_cast<unsigned long long>(store.load_misses),
-	            m_program_cache->plans_out, static_cast<unsigned long long>(m_program_cache->plan_reloads));
+	            m_program_cache->plans_out, static_cast<unsigned long long>(m_program_cache->plan_reloads),
+	            m_program_cache->prefetch ? m_program_cache->prefetch->adopted : size_t {0},
+	            m_program_cache->prefetch ? m_program_cache->prefetch->claimed : size_t {0},
+	            m_program_cache->prefetch ? m_program_cache->prefetch->taken : size_t {0},
+	            m_program_cache->prefetch ? m_program_cache->prefetch->take_early : size_t {0},
+	            m_program_cache->prefetch ? m_program_cache->prefetch->finished.load() : size_t {0});
 }
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -1893,7 +1964,11 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		m_graphics.RefreshMemoryBudget();
 		const auto video_before = m_graphics.GetDeviceMemoryUsage();
 		m_program_cache->Warm(path, title + device, compile_shaders, adopt_from);
-		if (!compile_shaders) recorded_inputs = m_program_cache->warmup.records;
+		// (The recording's records the warmup did not translate: the shader prefetch's first.)
+		const auto& records = m_program_cache->warmup.records;
+		const auto& warmed  = m_program_cache->warm_permutations;
+		for (size_t i = 0; i < records.size(); ++i)
+			if (i >= warmed.size() || warmed[i] == nullptr) recorded_inputs.push_back(records[i]);
 		const auto memory_shaders = LocalPlatform::ProcessMemory();
 		// KYTY_PIPELINE_WARMUP: 1 makes them all whatever the memory, 0 none; KYTY_PIPELINE_WARMUP_VIDEO_MIB: the compute
 		// pipelines' video memory cap instead of 1/16 of a small one's.
