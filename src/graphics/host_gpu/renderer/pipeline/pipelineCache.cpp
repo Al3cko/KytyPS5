@@ -426,6 +426,7 @@ struct PipelineCache::ProgramCache {
 		uint64_t                                     spirv_offset = 0;
 		size_t                                       spirv_words  = 0;
 		size_t                                       spirv_bytes  = 0;
+		uint64_t                                     spirv_hash   = 0; // XXH3 of the SPIR-V (NotePipelineKeyModule)
 	};
 
 	// A table mode permutation a compile worker translates (Get): the next Get of its specialization and push data
@@ -585,7 +586,8 @@ struct PipelineCache::ProgramCache {
 			stop.store(true, std::memory_order_relaxed);
 			if (loader.joinable()) loader.join();
 			for (auto& thread: threads) thread.join();
-			LocalPlatform::CloseScratchFile(spill);
+			// (Stored modules read their SPIR-V from it: CreateModuleInPlace.)
+			if (!spill_in_store.load(std::memory_order_relaxed)) LocalPlatform::CloseScratchFile(spill);
 		}
 
 		LocalShaderWarmup::Cache                               inputs;
@@ -599,6 +601,7 @@ struct PipelineCache::ProgramCache {
 		std::atomic<uint64_t>                                  spill_end {0};
 		std::atomic<uint64_t>                                  spirv_bytes {0}; // before compression
 		uint64_t                                               spill = 0;
+		std::atomic<bool>                                      spill_in_store {false};
 		std::thread                                            loader;
 		std::vector<std::thread>                               threads;
 		// Render thread: programs and modules taken over, programs translated there while pending; groups of warm programs
@@ -922,7 +925,8 @@ struct PipelineCache::ProgramCache {
 				p.spirv_bytes.fetch_add(bytes, std::memory_order_relaxed);
 				if (!LocalPlatform::WriteScratchFile(p.spill, offset, data, stored)) continue;
 				group.modules.push_back({std::move(record.specialization), std::move(result.program).TakeCompiledInfo(),
-				                         offset, result.spirv.size(), compressed ? stored : 0});
+				                         offset, result.spirv.size(), compressed ? stored : 0,
+				                         XXH3_64bits(result.spirv.data(), bytes)});
 			} catch (const Common::RecoverableExit&) {
 			}
 		}
@@ -991,6 +995,13 @@ struct PipelineCache::ProgramCache {
 		auto module = with(specialization);
 		if (module == source.prefetched.end()) module = with(compiled);
 		if (module == source.prefetched.end()) return nullptr;
+		if (const auto stored = CreateModuleInPlace(options, *module)) {
+			source.permutations.push_back(
+			    ModulePermutation(options, {}, std::move(module->program), std::move(specialization), stored));
+			source.prefetched.erase(module);
+			prefetch->adopted_modules++;
+			return &source.permutations.back();
+		}
 		std::vector<uint32_t> spirv(module->spirv_words);
 		const auto            bytes = spirv.size() * sizeof(uint32_t);
 		if (module->spirv_bytes != 0) {
@@ -1104,6 +1115,29 @@ struct PipelineCache::ProgramCache {
 			                      spirv.size() * sizeof(uint32_t));
 		}
 		if (!stored) SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name, options.shader_hash);
+		return module;
+	}
+
+	// CreateModule for a prefetched module: a stored module of its SPIR-V where the prefetch's file has it (no copy), or
+	// null (the store is off; the SPIR-V validated, dumped or checked here).
+	vk::ShaderModule CreateModuleInPlace(const ShaderRecompiler::CompileOptions& options, const PrefetchedModule& prefetched) {
+		if (Config::ShaderValidationEnabled() || Config::GraphicsDebugDumpEnabled() || DumpWanted(options.shader_hash) ||
+		    InlineKeyCheck() || prefetched.spirv_words > UINT32_MAX)
+			return nullptr;
+		const auto bytes  = prefetched.spirv_words * sizeof(uint32_t);
+		const auto module = ModuleStore::AddFrom(
+		    prefetch->spill, prefetched.spirv_offset,
+		    static_cast<uint32_t>(prefetched.spirv_bytes != 0 ? prefetched.spirv_bytes : bytes),
+		    static_cast<uint32_t>(prefetched.spirv_words), prefetched.spirv_bytes != 0);
+		if (module == nullptr) return nullptr;
+		prefetch->spill_in_store.store(true, std::memory_order_relaxed);
+		if (SlowLog::Threshold() > 0.0) {
+			std::printf("MODULE %s hash=0x%016llx spirv=%016llx\n", StageName(options.stage),
+			            static_cast<unsigned long long>(options.shader_hash),
+			            static_cast<unsigned long long>(prefetched.spirv_hash));
+		}
+		LiveCounters::g_shader_modules.fetch_add(1, std::memory_order_relaxed);
+		if (ModuleSpirvHashesRecorded()) NotePipelineKeyModule(module, options.shader_hash, prefetched.spirv_hash, bytes);
 		return module;
 	}
 

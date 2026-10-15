@@ -257,6 +257,7 @@ constexpr size_t HandleSpace = size_t {1} << 22u;
 alignas(64) uint8_t g_handles[HandleSpace];
 
 struct Entry {
+	uint64_t file       = 0; // the store's (g_file) or another's (AddFrom)
 	uint64_t offset     = 0;
 	uint32_t stored     = 0; // bytes in the file
 	uint32_t words      = 0;
@@ -281,6 +282,19 @@ size_t                   g_recent_next = 0;
 size_t IndexOf(vk::ShaderModule module) {
 	return reinterpret_cast<const uint8_t*>(static_cast<VkShaderModule>(module)) - g_handles;
 }
+
+vk::ShaderModule Push(const Entry& entry) {
+	size_t index = 0;
+	{
+		std::unique_lock lock(g_mutex);
+		index = g_entries.size();
+		if (index >= HandleSpace) return nullptr;
+		g_entries.push_back(entry);
+	}
+	g_live.fetch_add(1, std::memory_order_relaxed);
+	g_spirv_bytes.fetch_add(uint64_t {entry.words} * sizeof(uint32_t), std::memory_order_relaxed);
+	return vk::ShaderModule(reinterpret_cast<VkShaderModule>(&g_handles[index]));
+}
 } // namespace
 
 void Enable(bool maintenance5) {
@@ -304,17 +318,14 @@ vk::ShaderModule Add(const std::vector<uint32_t>& spirv) {
 	const auto        stored      = compressed ? packed_size : bytes;
 	const auto        offset      = g_end.fetch_add(stored, std::memory_order_relaxed);
 	if (stored > UINT32_MAX || !LocalPlatform::WriteScratchFile(g_file, offset, data, stored)) return nullptr;
-	size_t index = 0;
-	{
-		std::unique_lock lock(g_mutex);
-		index = g_entries.size();
-		if (index >= HandleSpace) return nullptr;
-		g_entries.push_back({offset, static_cast<uint32_t>(stored), static_cast<uint32_t>(spirv.size()), compressed});
-	}
-	g_live.fetch_add(1, std::memory_order_relaxed);
-	g_spirv_bytes.fetch_add(bytes, std::memory_order_relaxed);
-	g_stored_bytes.fetch_add(stored, std::memory_order_relaxed);
-	return vk::ShaderModule(reinterpret_cast<VkShaderModule>(&g_handles[index]));
+	const auto module = Push({g_file, offset, static_cast<uint32_t>(stored), static_cast<uint32_t>(spirv.size()), compressed});
+	if (module) g_stored_bytes.fetch_add(stored, std::memory_order_relaxed);
+	return module;
+}
+
+vk::ShaderModule AddFrom(uint64_t file, uint64_t offset, uint32_t stored, uint32_t words, bool compressed) {
+	if (!Enabled() || file == 0 || words == 0) return nullptr;
+	return Push({file, offset, stored, words, compressed});
 }
 
 bool Holds(vk::ShaderModule module) {
@@ -342,10 +353,10 @@ std::shared_ptr<const std::vector<uint32_t>> Load(vk::ShaderModule module) {
 	const auto bytes = spirv->size() * sizeof(uint32_t);
 	if (entry.compressed) {
 		std::vector<char> packed(entry.stored);
-		if (!LocalPlatform::ReadScratchFile(g_file, entry.offset, packed.data(), packed.size()) ||
+		if (!LocalPlatform::ReadScratchFile(entry.file, entry.offset, packed.data(), packed.size()) ||
 		    ZSTD_decompress(spirv->data(), bytes, packed.data(), packed.size()) != bytes)
 			return nullptr;
-	} else if (!LocalPlatform::ReadScratchFile(g_file, entry.offset, spirv->data(), bytes)) {
+	} else if (!LocalPlatform::ReadScratchFile(entry.file, entry.offset, spirv->data(), bytes)) {
 		return nullptr;
 	}
 	std::lock_guard lock(g_recent_mutex);
