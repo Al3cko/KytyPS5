@@ -21,11 +21,12 @@
 //                                  (default: 23, the actuator pair)
 //   KYTY_DUALSENSE_HAPTICS_GAIN=<float>         applied to the vibration samples (default: 1.0)
 //   KYTY_DUALSENSE_SPEAKER_CHANNELS=01|23|all   the same for the pad speaker (default: 01)
-//   KYTY_DUALSENSE_SPEAKER_GAIN=<float>         0..64 (default: 4.0, +12 dB). What the guest sends
+//   KYTY_DUALSENSE_SPEAKER_GAIN=<float>         0..64 (default: 8.0, +18 dB). What the guest sends
 //                                  to a pad speaker port is quiet - Demon's Souls peaks at about
 //                                  -40 dB - and the controller's own amplifier then buries it in
 //                                  its noise floor, so the digital gain is what makes it clear.
-//                                  4.0 is what github.com/Jetsku/KytyPS5's launcher gives at 200%.
+//                                  8 is clear, 16 borderline, 32 clips (4.0 is what
+//                                  github.com/Jetsku/KytyPS5's launcher gives at 200%).
 //   KYTY_DUALSENSE_HAPTICS_LOG=1   prints what it finds and what it writes (default: off)
 namespace Libs::Controller::DualSenseHaptics {
 
