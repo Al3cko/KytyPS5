@@ -50,7 +50,7 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 void PrefetchKeptFile(const std::string& path);
 // The game's file opens followed (Windows; once, KYTY_FILE_FOLLOW=0: not): `recording` lists the files OpenKeptReadFile
 // opened in earlier sessions in the order first opened (one a line, relative to `root` where under it; this session's
-// new ones appended). Each one the game opens, or first reads after it was opened here, has the 256 recorded after it
+// new ones appended). Each one the game opens, or first reads after it was opened here, has the 1024 recorded after it
 // opened on threads of their own, ahead of the game's reads.
 void FollowKeptFiles(const std::string& recording, const std::string& root);
 

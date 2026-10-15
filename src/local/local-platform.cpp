@@ -572,7 +572,10 @@ struct FileFollow {
 	bool                                      on        = false;
 };
 FileFollow g_follow;
-constexpr uint32_t FollowWindow = 256, FollowThreads = 4;
+// The opens wait (metadata, the antivirus), each thread one at a time: the 1-1 fog took 28.5-30.7 s with 4 threads and
+// windows of 256, 24.3 s with 8 and 512, 17.6-20.6 s with 16 and 1024, 18.8 s with 32 and 2048. (KYTY_FILE_FOLLOW_WINDOW,
+// KYTY_FILE_FOLLOW_THREADS: other counts.)
+uint32_t g_follow_window = 1024, g_follow_threads = 16;
 
 void FollowOpenThread() {
 	SetThreadName("Kyty.FileOpen");
@@ -627,12 +630,13 @@ void FollowFrom(const std::string& path) {
 		return;
 	}
 	g_follow.queued[found->second] = 1;
-	const auto end = std::min<size_t>(size_t {found->second} + 1 + FollowWindow, g_follow.paths.size());
+	// Ahead of the windows queued before (the game left them, or is past them): the next file first.
+	const auto end = std::min<size_t>(size_t {found->second} + 1 + g_follow_window, g_follow.paths.size());
 	bool       any = false;
-	for (auto place = found->second + 1; place < end; ++place)
+	for (auto place = end; place-- > size_t {found->second} + 1;)
 		if (g_follow.queued[place] == 0) {
 			g_follow.queued[place] = 1;
-			g_follow.queue.push_back(place);
+			g_follow.queue.push_front(static_cast<uint32_t>(place));
 			any = true;
 		}
 	if (any) g_follow.ready.notify_all();
@@ -684,6 +688,10 @@ void FollowKeptFiles(const std::string& recording, const std::string& root) {
 	static std::once_flag once;
 	std::call_once(once, [&] {
 		if (const char* value = std::getenv("KYTY_FILE_FOLLOW"); value != nullptr && std::string_view(value) == "0") return;
+		if (const char* value = std::getenv("KYTY_FILE_FOLLOW_WINDOW"); value != nullptr && *value != '\0')
+			g_follow_window = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 65536u);
+		if (const char* value = std::getenv("KYTY_FILE_FOLLOW_THREADS"); value != nullptr && *value != '\0')
+			g_follow_threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
 		std::lock_guard lock(g_follow.mutex);
 		g_follow.root = root;
 		if (!g_follow.root.empty() && g_follow.root.back() != '/' && g_follow.root.back() != '\\') g_follow.root += '/';
@@ -712,7 +720,7 @@ void FollowKeptFiles(const std::string& recording, const std::string& root) {
 		std::filesystem::create_directories(std::filesystem::path(recording).parent_path(), error);
 		g_follow.out = std::fopen(recording.c_str(), "ab");
 		g_follow.on  = true;
-		for (uint32_t t = 0; t < FollowThreads; ++t) std::thread(FollowOpenThread).detach();
+		for (uint32_t t = 0; t < g_follow_threads; ++t) std::thread(FollowOpenThread).detach();
 	});
 }
 
