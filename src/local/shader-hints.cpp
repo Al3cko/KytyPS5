@@ -80,6 +80,9 @@ std::vector<uint32_t> HintOf(Record record) {
 	record.code       = {code.words, static_cast<uint32_t>(code.hash), static_cast<uint32_t>(code.hash >> 32u)};
 	record.back_code  = {code.back_words, static_cast<uint32_t>(code.back_hash), static_cast<uint32_t>(code.back_hash >> 32u)};
 	record.static_key = {};
+	// (The GPU's compute subgroup size, which the precompile sets anyway: one record for AMD's 64 and NVIDIA's 32.)
+	if (record.stage == ShaderType::Compute)
+		record.compute.host_subgroup_size = Libs::Graphics::ShaderComputeInputInfo {}.host_subgroup_size;
 	return Encode(record);
 }
 
