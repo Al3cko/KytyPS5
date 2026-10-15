@@ -20,7 +20,7 @@
 #                                            or its bin\x64; default: a "streamline" folder next to
 #                                            the emulator)
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
-#                                            virtual vblank; movies play faster)
+#                                            virtual vblank; movies, menus and loading screens keep 60)
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
 #   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits

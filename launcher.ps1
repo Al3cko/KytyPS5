@@ -213,7 +213,7 @@ $language.SelectedIndex = [Math]::Max(0, [Math]::Min($languages.Count - 1, [int]
 Add-Row 'Console language' @($language)
 $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zone protection (recommended)'; AutoSize = $true; Checked = [bool]$settings.redzone }
 Add-Row '' @($redzone)
-$fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 120 fps (the game''s own frames; movies play faster)'; AutoSize = $true; Checked = [bool]$settings.fps120 }
+$fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 120 fps (the game''s own frames; movies stay at 60)'; AutoSize = $true; Checked = [bool]$settings.fps120 }
 Add-Row '' @($fps120)
 $vsync = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'VSync (no screen tearing; adaptive sync displays keep it)'; AutoSize = $true; Checked = [bool]$settings.vsync }
 Add-Row '' @($vsync)
