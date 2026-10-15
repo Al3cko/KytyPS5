@@ -2661,6 +2661,7 @@ void CommandProcessor::Flip() {
 	LiveControl::Flip();
 	FrameCapture::OnFlip();
 	CheckBuffer();
+	m_renderer.GetPipelineCache().SweepPlans();
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");

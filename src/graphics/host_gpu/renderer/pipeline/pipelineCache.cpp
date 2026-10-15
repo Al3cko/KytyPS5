@@ -356,6 +356,50 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+// Resource plans out of memory (ProgramCache::SweepPlans): zstd-compressed ResourcePlanSerial bytes in a scratch file,
+// as the shader prefetch spills its own. A plan is ~77 KB of IR in memory and ~2.6 KB there (the prefetch's 20,133:
+// 1,555 MiB, 52 MiB written); the warmup's (32 GB of RAM: 9,018 programs, ~700 MB) and those of every place played
+// stayed in memory all session. KYTY_PLAN_EVICT=0 keeps them.
+struct SpilledPlan {
+	uint64_t file = 0, offset = 0;
+	uint32_t bytes = 0, raw = 0; // (bytes 0: not written)
+};
+
+static bool PlanEvictionEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PLAN_EVICT");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return enabled;
+}
+
+// A plan's bytes written (any thread: the file's end reserved atomically).
+static bool SpillPlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan, SpilledPlan& out) {
+	static std::once_flag        once;
+	static uint64_t              file = 0;
+	static std::atomic<uint64_t> end {0};
+	std::call_once(once, [] { file = LocalPlatform::OpenScratchFile(); });
+	std::vector<uint8_t> bytes;
+	if (file == 0 || !ResourcePlanSerial::Save(plan, bytes) || bytes.size() > UINT32_MAX) return false;
+	std::vector<char> packed(ZSTD_compressBound(bytes.size()));
+	const auto        packed_size = ZSTD_compress(packed.data(), packed.size(), bytes.data(), bytes.size(), 1);
+	if (ZSTD_isError(packed_size)) return false;
+	const auto offset = end.fetch_add(packed_size, std::memory_order_relaxed);
+	if (!LocalPlatform::WriteScratchFile(file, offset, packed.data(), packed_size)) return false;
+	out = {file, offset, static_cast<uint32_t>(packed_size), static_cast<uint32_t>(bytes.size())};
+	return true;
+}
+
+// A plan SpillPlanBytes or the shader prefetch wrote (its linear SRT plan left to the caller); false when it cannot be
+// read.
+static bool LoadPlanBytes(const SpilledPlan& in, ShaderRecompiler::IR::ResourcePlan& plan, bool& linear) {
+	std::vector<char>    packed(in.bytes);
+	std::vector<uint8_t> bytes(in.raw);
+	return LocalPlatform::ReadScratchFile(in.file, in.offset, packed.data(), packed.size()) &&
+	       ZSTD_decompress(bytes.data(), bytes.size(), packed.data(), packed.size()) == bytes.size() &&
+	       ResourcePlanSerial::Load(bytes, plan, &linear);
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -420,7 +464,71 @@ struct PipelineCache::ProgramCache {
 		std::vector<PrefetchedModule> prefetched;
 		// Table mode permutations being translated.
 		std::vector<std::shared_ptr<TableJob>> table_jobs;
+		// The plan out of memory (SweepPlans): its bytes, whether only they hold it, its linear SRT plan meanwhile (made
+		// from the plan alone: rebuilding it took ~1 ms), the sweep of its last use.
+		SpilledPlan                                                 plan_spilled;
+		bool                                                        plan_out = false;
+		std::shared_ptr<const ShaderRecompiler::IR::LinearSrtPlan> plan_linear;
+		uint32_t                                                    plan_use = 0;
 	};
+	// Plans: sweeps so far (one a flip, SweepPlans), out of memory now, brought back.
+	uint32_t plan_clock = 0;
+	size_t   plans_out = 0;
+	uint64_t plan_reloads = 0;
+
+	// The source's plan in memory again (before each use of it), its last use noted.
+	void EnsurePlan(SourceEntry& source) {
+		source.plan_use = plan_clock;
+		if (!source.plan_out) return;
+		ShaderRecompiler::IR::ResourcePlan plan;
+		bool                               linear = false;
+		if (!LoadPlanBytes(source.plan_spilled, plan, linear) || linear != (source.plan_linear != nullptr))
+			EXIT("a shader's resource plan could not be read back from the scratch file\n");
+		plan.linear_srt      = std::move(source.plan_linear);
+		source.resource_plan = std::move(plan);
+		// (The guard knows the plan by its address: the same, but it is checked again from the start.)
+		source.specialization_guard = {};
+		source.guarded_permutation  = nullptr;
+		source.plan_out             = false;
+		plans_out--;
+		plan_reloads++;
+	}
+
+	// Each flip; every PlanSweepFlips, the plans no use needed for PlanIdleFlips leave memory, written first where no
+	// file holds them yet (a few a sweep: programs translated during play; the warmup's and the prefetch's are). They
+	// are destroyed on a compile worker (the warmup's thousands at once: their IR nodes freed off the render thread).
+	void SweepPlans() {
+		// (KYTY_PLAN_IDLE_FLIPS=<n>: another idle time, and a sweep each n/30 flips: a test of plans leaving and coming
+		// back all the time.)
+		static const uint32_t PlanIdleFlips = [] {
+			const char* value = std::getenv("KYTY_PLAN_IDLE_FLIPS");
+			return value != nullptr && *value != '\0' ? std::max(30u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
+			                                          : 3600u;
+		}();
+		static constexpr uint32_t PlanWritesPerSweep = 4;
+		const uint32_t            PlanSweepFlips     = PlanIdleFlips / 30u;
+		if (!PlanEvictionEnabled() || ++plan_clock % PlanSweepFlips != 0) return;
+		uint32_t writes = 0;
+		auto     freed  = std::make_shared<std::vector<ShaderRecompiler::IR::ResourcePlan>>();
+		for (auto& [key, source]: programs) {
+			(void)key;
+			if (source.plan_out || plan_clock - source.plan_use < PlanIdleFlips) continue;
+			if (source.plan_spilled.bytes == 0) {
+				if (writes >= PlanWritesPerSweep || !SpillPlanBytes(source.resource_plan, source.plan_spilled)) continue;
+				writes++;
+			}
+			source.plan_linear = std::move(source.resource_plan.linear_srt);
+			freed->push_back(std::move(source.resource_plan));
+			source.resource_plan = {};
+			source.plan_out      = true;
+			plans_out++;
+		}
+		if (freed->empty()) return;
+		if (freed->size() >= 256)
+			PipelineCacheLog("Shader plans: {} out of memory ({} now), {} brought back so far", plans_out, freed->size(),
+			                 plan_reloads);
+		if (push_job) push_job([freed] { freed->clear(); });
+	}
 	// Runs a job on the pipeline cache's compile workers (set by PipelineCache).
 	std::function<void(std::function<void()>)> push_job;
 	// The last table mode Get found its permutation still translating (empty, not refused), and that translation's
@@ -979,6 +1087,7 @@ struct PipelineCache::ProgramCache {
 				std::vector<uint32_t>().swap(entry->second.warm_back_code);
 			}
 		}
+		if (entry != programs.end()) EnsurePlan(entry->second);
 		ShaderRecompiler::IR::ResourceSnapshot temporary_resources;
 		auto& resources = NativePreparationScratchEnabled() ? input_info.stage.resources
 		                                                    : temporary_resources;
@@ -1184,6 +1293,8 @@ struct PipelineCache::ProgramCache {
 					return {};
 				entry = programs.try_emplace(lookup_key, std::move(*group->plan)).first;
 				entry->second.prefetched = std::move(group->modules);
+				entry->second.plan_spilled = {prefetch->spill, group->plan_offset, group->plan_bytes, group->plan_raw};
+				entry->second.plan_use     = plan_clock;
 				group->plan.reset();
 			}
 		}
@@ -1216,6 +1327,7 @@ struct PipelineCache::ProgramCache {
 				                               resource_plan, runtime, resources, specialization, &report)))
 					return {};
 				entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+				entry->second.plan_use = plan_clock;
 			}
 			// A specialization met for the first time whose formatted buffers can decode their formats at
 			// run time gets the portable module (IR::PortableFormats) under its own specialization: the
@@ -1277,6 +1389,7 @@ struct PipelineCache::ProgramCache {
 		LocalShaderWarmup::Record          record;
 		std::vector<uint32_t>              user_data;
 		ShaderRecompiler::IR::ResourcePlan       plan;
+		SpilledPlan                              spilled; // (its bytes, written by the worker: SweepPlans)
 		ShaderRecompiler::CompileResult          result;
 		ShaderRecompiler::IR::CompiledShaderInfo info; // the result's, taken by the worker
 	};
@@ -1299,6 +1412,7 @@ struct PipelineCache::ProgramCache {
 		const auto options = LocalShaderWarmup::Options(job->record, job->user_data);
 		auto translated    = ShaderRecompiler::TranslateProgram(job->record.code, options);
 		job->plan          = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		if (PlanEvictionEnabled()) (void)SpillPlanBytes(job->plan, job->spilled);
 		// Recorded before buffer words (or without them): the permutation the game now selects.
 		ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, job->record.specialization);
 		job->result        = ShaderRecompiler::CompileProgram(std::move(translated), options, job->record.specialization,
@@ -1417,6 +1531,7 @@ struct PipelineCache::ProgramCache {
 			if (job) {
 				if (entry == programs.end()) {
 					entry = programs.try_emplace(std::move(key), std::move(job->plan)).first;
+					entry->second.plan_spilled = job->spilled;
 					entry->second.warm_code = record.code;
 					entry->second.warm_back_code = record.back_code;
 				}
@@ -1616,6 +1731,12 @@ void PipelineCache::BuildOptimized(Pipeline& pipeline, std::function<void(Pipeli
 void PipelineCache::PromoteFinished() {
 	Common::LockGuard lock(m_mutex);
 	PromoteOptimized();
+	m_program_cache->SweepPlans();
+}
+
+void PipelineCache::SweepPlans() {
+	Common::LockGuard lock(m_mutex);
+	m_program_cache->SweepPlans();
 }
 
 // Finished optimized builds replace their pipelines in place, for every holder of the Pipeline
@@ -1693,12 +1814,13 @@ void PipelineCache::ReportObjects(uint64_t id) const {
 	const auto store = ModuleStore::Stats();
 	std::printf("LIVE_PIPELINE_OBJECTS id=%llu graphics_pipelines=%zu compute_pipelines=%zu pending_graphics=%zu pending_compute=%zu "
 	            "replaced_unoptimized=%zu optimizing=%zu programs=%zu jit_bytes=%zu stored_modules=%llu stored_spirv_mib=%llu "
-	            "store_file_mib=%llu store_loads=%llu store_load_misses=%llu\n",
+	            "store_file_mib=%llu store_loads=%llu store_load_misses=%llu plans_out=%zu plan_reloads=%llu\n",
 	            static_cast<unsigned long long>(id), m_graphics_pipelines.size(), m_compute_pipelines.size(), m_pending_graphics_pipelines.size(),
 	            m_pending_compute_pipelines.size(), m_replaced_pipelines.size(), m_optimizing.size(),
 	            m_program_cache->programs.size(), JitArena::Used(), static_cast<unsigned long long>(store.modules),
 	            static_cast<unsigned long long>(store.spirv_bytes >> 20u), static_cast<unsigned long long>(store.stored_bytes >> 20u),
-	            static_cast<unsigned long long>(store.loads), static_cast<unsigned long long>(store.load_misses));
+	            static_cast<unsigned long long>(store.loads), static_cast<unsigned long long>(store.load_misses),
+	            m_program_cache->plans_out, static_cast<unsigned long long>(m_program_cache->plan_reloads));
 }
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -2401,6 +2523,7 @@ bool PipelineCache::TraceStage(const ShaderRecompiler::IR::CompiledShaderInfo& p
 	    .sync_memory                = SyncShaderGuestMemory,
 	    .try_read_memory_span       = ReadMappedMemorySpan,
 	};
+	cache.EnsurePlan(*found->second.first);
 	return ShaderRecompiler::IR::TraceLinearSrtReads(found->second.first->resource_plan, runtime, trace);
 }
 
@@ -2408,8 +2531,9 @@ ShaderRecompiler::IR::SrtUserDataUse PipelineCache::UserDataUse(const ShaderReco
 	Common::LockGuard lock(m_mutex);
 	auto&             cache = *m_program_cache;
 	const auto        found = FindProgramSource(cache, program);
-	return found == cache.by_program.end() ? ShaderRecompiler::IR::SrtUserDataUse {}
-	                                       : ShaderRecompiler::IR::UserDataUse(found->second.first->resource_plan);
+	if (found == cache.by_program.end()) return {};
+	cache.EnsurePlan(*found->second.first);
+	return ShaderRecompiler::IR::UserDataUse(found->second.first->resource_plan);
 }
 
 bool PipelineCache::RematerializeStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -2420,6 +2544,7 @@ bool PipelineCache::RematerializeStage(const ShaderRecompiler::IR::CompiledShade
 	const auto        found = FindProgramSource(cache, program);
 	if (found == cache.by_program.end()) return false;
 	auto& [source, permutation] = found->second;
+	cache.EnsurePlan(*source);
 	const ShaderRecompiler::IR::SrtRuntime input_runtime {
 	    .user_data                  = user_data,
 	    .shader_base                = shader_base,
