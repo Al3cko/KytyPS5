@@ -294,7 +294,7 @@ if (!$environment.Contains('KYTY_NATIVE_XPR_INSTANCES') -and !$Baseline) { $envi
 # no XPR index-buffer culling, a GPU pass that culls every object's triangles (~2800 compute dispatches a
 # frame at Boletaria 1-1) before drawing them; the PC GPU draws them all instead, the image unchanged
 # (same process at Boletaria 1-1: standing 34.30 -> 36.48 fps, camera turning +0.8%; GPU 60 -> 71% busy).
-if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -eq 'PPSA01341') { $environment['KYTY_GAME_CONVARS'] = 'doIndexBufferCulling=false' }
+if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -match '^PPSA0134[0-2]$') { $environment['KYTY_GAME_CONVARS'] = 'doIndexBufferCulling=false' }
 # -RenderHeight: the height Demon's Souls' performance mode renders its 3D at (src/loader/demonsSoulsRenderSize.h);
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
