@@ -6,13 +6,13 @@
 // souls, another the item names and the boss's name. In a frame showing the 3D, each vertex of such a draw is placed in
 // one of the HUD's areas (Areas: the top left - health, magic, stamina -, the bottom left - equipment, items -, the top
 // right - souls - and the bottom middle - boss health, prompts) while the HUD shows (its round icon in the top left
-// corner, its first draw, was drawn in the frame or the one before; menus draw none); a draw wholly in one gets that
-// area's viewport,
-// squeezed back to 16:9 around its side (the left edge, the right edge, the centre), and a draw over several is drawn
-// once for each, with its viewport and a scissor around where the area then lies (the areas stay apart, squeezed).
-// Widened again, each element stands at its side of the screen as drawn for 16:9. A draw reaching outside the areas -
-// menus, fades, markers over the world (lock-on, enemy health) - stays as it was (stretched, the markers on their
-// targets).
+// corner, its first draw, was drawn in the frame or the one before; menus draw none). A draw wholly in one area gets
+// its viewport squeezed back to 16:9 around the area's side (the left edge, the right edge, the centre); a draw over
+// several is drawn once for each, with its viewport and a scissor around where the area then lies (the areas stay
+// apart, squeezed), and what it has outside them (a dialogue's text in the same batch) once for each rectangle of the
+// canvas outside them, as it was. Widened again, each element stands at its side of the screen as drawn for 16:9. The
+// rest - menus, fades, markers over the world (lock-on, enemy health) - stays as it was (stretched, the markers on
+// their targets).
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -24,8 +24,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace Libs::Graphics::HudAnchor {
 
@@ -210,17 +212,108 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 			}
 		}
 		areas |= bit;
-		if ((areas & Outside) != 0) return areas;
 	}
 	const auto frame = FrameGen::GuestFlips() + 1;
 	if (icon) state.icon_frame = frame;
 	return state.icon_frame != 0 && frame - state.icon_frame <= 1 ? areas : 0u;
 }
 
-// The areas a draw is drawn in, one draw each (empty: as it is).
-inline uint32_t Split(uint32_t areas) {
-	return areas == 0 || (areas & Outside) != 0 ? 0u : areas;
+// The draws a draw is drawn as: once for each of `areas` (Scope), and with `outside` once for each rectangle of the
+// canvas outside the areas (Complement, ClipScope) as it is; none of them: drawn as it is.
+struct Plan {
+	uint32_t areas   = 0;
+	bool     outside = false;
+	[[nodiscard]] bool Single() const { return !outside && std::popcount(areas) == 1; }
+	[[nodiscard]] bool Several() const { return areas != 0 && !Single(); }
+};
+inline Plan Split(uint32_t areas) {
+	return {areas & (Outside - 1u), (areas & Outside) != 0 && (areas & (Outside - 1u)) != 0};
 }
+
+// The canvas outside the areas (as drawn: the viewport unchanged) in window pixels, as rectangles: bands between the
+// areas' tops and bottoms, the gaps between the areas in each.
+struct Rect {
+	int left = 0, top = 0, right = 0, bottom = 0;
+};
+inline uint32_t Complement(const HW::Context& ctx, std::array<Rect, 32>& out) {
+	const auto&                    viewport = ctx.GetScreenViewport().viewports[0];
+	std::array<Rect, Areas.size()> held {};
+	std::array<int, 2 * Areas.size() + 2> ys {0, static_cast<int>(CanvasHeight)};
+	uint32_t                       ny = 2;
+	for (uint32_t a = 0; a < Areas.size(); ++a) {
+		const auto& area = Areas[a];
+		const float x0 = viewport.xoffset + area.x0 * viewport.xscale, x1 = viewport.xoffset + area.x1 * viewport.xscale;
+		const float y0 = viewport.yoffset + area.y0 * viewport.yscale, y1 = viewport.yoffset + area.y1 * viewport.yscale;
+		auto&       r  = held[a];
+		r.left   = std::clamp(static_cast<int>(std::floor(std::min(x0, x1))), 0, static_cast<int>(CanvasWidth));
+		r.right  = std::clamp(static_cast<int>(std::ceil(std::max(x0, x1))), 0, static_cast<int>(CanvasWidth));
+		r.top    = std::clamp(static_cast<int>(std::floor(std::min(y0, y1))), 0, static_cast<int>(CanvasHeight));
+		r.bottom = std::clamp(static_cast<int>(std::ceil(std::max(y0, y1))), 0, static_cast<int>(CanvasHeight));
+		ys[ny++] = r.top;
+		ys[ny++] = r.bottom;
+	}
+	std::sort(ys.begin(), ys.begin() + ny);
+	ny = static_cast<uint32_t>(std::unique(ys.begin(), ys.begin() + ny) - ys.begin());
+	uint32_t count = 0;
+	for (uint32_t b = 0; b + 1 < ny; ++b) {
+		const int top = ys[b], bottom = ys[b + 1];
+		if (bottom <= top) continue;
+		std::array<std::pair<int, int>, Areas.size()> spans {};
+		uint32_t                                       ns = 0;
+		for (const auto& r: held) {
+			if (r.top < bottom && r.bottom > top && r.right > r.left) spans[ns++] = {r.left, r.right};
+		}
+		std::sort(spans.begin(), spans.begin() + ns);
+		int x = 0;
+		for (uint32_t s = 0; s <= ns; ++s) {
+			const int gap_end = s < ns ? spans[s].first : static_cast<int>(CanvasWidth);
+			if (gap_end > x && count < out.size()) {
+				// (Merged with the rectangle above of the same columns.)
+				const auto above = std::find_if(out.begin(), out.begin() + count, [&](const Rect& r) {
+					return r.left == x && r.right == gap_end && r.bottom == top;
+				});
+				if (above != out.begin() + count) {
+					above->bottom = bottom;
+				} else {
+					out[count++] = {x, top, gap_end, bottom};
+				}
+			}
+			if (s < ns) x = std::max(x, spans[s].second);
+		}
+	}
+	return count;
+}
+
+// For the length of one draw of the canvas outside the areas: the generic scissor narrowed to `rect`; restored after it.
+class ClipScope {
+public:
+	ClipScope(HW::Context& ctx, const Rect& rect): m_ctx(&ctx) {
+		const auto& screen = ctx.GetScreenViewport();
+		m_left = screen.generic_scissor_left, m_top = screen.generic_scissor_top;
+		m_right = screen.generic_scissor_right, m_bottom = screen.generic_scissor_bottom;
+		m_window_offset = screen.generic_scissor_window_offset_enable;
+		const int left = std::max(m_left, rect.left), top = std::max(m_top, rect.top);
+		ctx.SetGenericScissor(left, top, std::max(left, std::min(m_right, rect.right)),
+		                      std::max(top, std::min(m_bottom, rect.bottom)), m_window_offset);
+		Changed();
+	}
+	~ClipScope() {
+		m_ctx->SetGenericScissor(m_left, m_top, m_right, m_bottom, m_window_offset);
+		Changed();
+	}
+	KYTY_CLASS_NO_COPY(ClipScope);
+
+private:
+	static void Changed() {
+		auto& shadow = DrawStateObserver::g_shadow;
+		shadow.key_changes |= 1u;
+		shadow.dirty = true;
+	}
+
+	HW::Context* m_ctx = nullptr;
+	bool         m_window_offset = false;
+	int          m_left = 0, m_top = 0, m_right = 0, m_bottom = 0;
+};
 
 // For the length of one draw of an area (the GPU thread, around both of its ways): the viewport squeezed around the
 // area's side, and with `scissor` the generic scissor around where the area then lies; restored after it. The draw

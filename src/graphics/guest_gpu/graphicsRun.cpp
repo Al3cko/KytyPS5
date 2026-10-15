@@ -1900,10 +1900,10 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h); a draw over several of its
 	// areas goes the normal way, drawn once for each.
 	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), packet[1]));
-	if (std::popcount(hud) > 1) return 0u;
+	if (hud.Several()) return 0u;
 	std::optional<HudAnchor::Scope> anchor;
-	if (hud != 0) {
-		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud)), false);
+	if (hud.Single()) {
+		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
 	} else {
 		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
 	}
@@ -2268,15 +2268,29 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	}
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h).
 	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), args.vertex_count));
-	if (hud == 0) {
-		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
+	if (hud.areas == 0 || hud.Single()) {
+		std::optional<HudAnchor::Scope> anchor;
+		if (hud.Single()) {
+			anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
+		} else {
+			HudAnchor::RestoreMask(m_sh_ctx.GetPs());
+		}
 		return m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	}
+	HudAnchor::RestoreMask(m_sh_ctx.GetPs());
 	bool drawn = true;
 	for (uint32_t area = 0; area < 32; ++area) {
-		if ((hud & (1u << area)) == 0) continue;
-		HudAnchor::Scope anchor(m_ctx, m_sh_ctx.GetPs(), area, std::popcount(hud) > 1);
+		if ((hud.areas & (1u << area)) == 0) continue;
+		HudAnchor::Scope anchor(m_ctx, m_sh_ctx.GetPs(), area, true);
 		drawn = m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args) && drawn;
+	}
+	if (hud.outside) {
+		std::array<HudAnchor::Rect, 32> rects {};
+		const auto                      count = HudAnchor::Complement(m_ctx, rects);
+		for (uint32_t r = 0; r < count; ++r) {
+			HudAnchor::ClipScope clip(m_ctx, rects[r]);
+			drawn = m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args) && drawn;
+		}
 	}
 	return drawn;
 }
