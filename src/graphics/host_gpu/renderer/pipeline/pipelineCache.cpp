@@ -1558,9 +1558,9 @@ PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
 
 // A pipeline no cache holds: compiled unoptimized now (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) and optimized on a
 // worker, or optimized before its first use (up to seconds on NVIDIA). Unoptimized first only on NVIDIA, where it was
-// measured (~100x faster to compile) and tested. An AMD RX 6700 XT (RDNA2) crashed in its driver at start-up, every
-// run, while the first compute pipelines were made (10-09 report); the precompile, which builds them optimized, ran
-// on that PC without a crash, so the unoptimized build is the suspect (unconfirmed: no AMD GPU here).
+// measured (~100x faster to compile) and tested. (An AMD RX 6700 XT's driver crash at the first compute pipelines,
+// which kept AMD out, was native wave64 on RDNA2: the unoptimized build was not the cause. Whether AMD's driver
+// compiles faster unoptimized is not measured yet: an RX 9070 XT took 18 s for each of four compute pipelines.)
 // KYTY_PIPELINE_FAST_BUILD=1 / 0 chooses either on any GPU.
 static PipelineBuild FirstBuild(const GraphicContext& graphics) {
 	static const int fast = [] {
@@ -2747,8 +2747,12 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	}
 
 	SlowLog::Scope create_slow([&](double ms) {
-		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu\n", ms,
-		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id));
+		const auto* vs = vs_input_info.stage.program;
+		const auto* ps = ps_active ? ps_input_info->stage.program : nullptr;
+		std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu VS=0x%016llx PS=0x%016llx\n", ms,
+		            static_cast<unsigned long long>(vs_id), static_cast<unsigned long long>(ps_id),
+		            static_cast<unsigned long long>(vs != nullptr ? vs->shader_hash : 0),
+		            static_cast<unsigned long long>(ps != nullptr ? ps->shader_hash : 0));
 	}, SlowLog::HitchThreshold());
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto cached = std::make_unique<Pipeline>();
@@ -2815,8 +2819,10 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	SlowLog::Scope create_slow([&](double ms) {
-		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu\n", ms,
-		            static_cast<unsigned long long>(compute_program.id));
+		const auto* cs = input_info.stage.program;
+		std::printf("SLOW CreateComputePipeline %.1f ms CS=%llu CS=0x%016llx\n", ms,
+		            static_cast<unsigned long long>(compute_program.id),
+		            static_cast<unsigned long long>(cs != nullptr ? cs->shader_hash : 0));
 	}, SlowLog::HitchThreshold());
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto cached = std::make_unique<Pipeline>();

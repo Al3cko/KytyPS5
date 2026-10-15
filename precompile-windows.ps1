@@ -18,6 +18,9 @@
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
 #                                         translates in the background (_PipelineCache\static\<title>_<version>.shaders;
 #                                         every full run writes them too)
+#   .\precompile-windows.ps1 -ExportHints nothing compiled: the specialization hints of this PC's recorded play
+#                                         (my-hints-<title>_<version>.hints, without the game's code), to attach
+#                                         to an issue for the releases' hints
 # The NVIDIA driver compiles big compute shaders nearly one at a time per process, so the work is split
 # into shards, a below-normal-priority process each (kyty_shader_precompile --shard i/n), whose caches
 # are merged into the static cache at the end. The shards are small (-Shards, about 100 pipelines each):
@@ -52,6 +55,10 @@ param(
 	[switch]$Coverage,
 	[switch]$Quick,
 	[switch]$InputsOnly,
+	# The specialization hints of this PC's play (its warmup recordings, without the game's code) into
+	# my-hints-<title>_<version>.hints next to this script, nothing compiled: attached to an issue, the next releases'
+	# hints hold them (places and effects the test PC never recorded: a boss's death compiled ~75 s on an AMD GPU).
+	[switch]$ExportHints,
 	[string]$Exe = $(if (Test-Path "$PSScriptRoot\kyty_shader_precompile.exe") { "$PSScriptRoot\kyty_shader_precompile.exe" } else { "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe" })
 )
 $ErrorActionPreference = 'Stop'
@@ -128,6 +135,17 @@ if (!(Test-Path $Seeds) -or $remake) {
 	if ($LASTEXITCODE) { throw 'making the seed file failed (kyty_shader_precompile --make-seeds)' }
 	if ($remake -and (Get-FileHash $made).Hash -eq (Get-FileHash $Seeds).Hash) { Remove-Item $made } elseif ($remake) { Move-Item -Force $made $Seeds }
 	Set-Content $madeBy $programStamp
+}
+if ($ExportHints) {
+	$recordings = @(Get-ChildItem "$PSScriptRoot\_PipelineCache\warmup-v2\*\$gameId.shaders" -File -ErrorAction SilentlyContinue)
+	if (!$recordings) { throw "no recorded play of $gameId in _PipelineCache\warmup-v2 (play first, with the shader warmup on)" }
+	$out = "$PSScriptRoot\my-hints-$gameId.hints"
+	$arguments = @('--game', $Game, '--seeds', $Seeds, '--make-hints', $out)
+	foreach ($file in $recordings) { $arguments += @('--recorded', $file.FullName) }
+	& $Exe @arguments
+	if ($LASTEXITCODE) { throw 'making the hints failed (kyty_shader_precompile --make-hints)' }
+	Write-Host "hints: $out ($([math]::Ceiling((Get-Item $out).Length / 1KB)) KiB, no game code in it): attach it to an issue"
+	exit 0
 }
 if ($Recorded -eq '*') {
 	$Recorded = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds"
