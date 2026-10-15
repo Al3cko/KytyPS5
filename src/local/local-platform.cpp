@@ -553,11 +553,15 @@ void PrefetchThread() {
 } // namespace
 
 uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
-	const std::lock_guard lock(g_kept_files_mutex);
-	if (const auto found = g_kept_files.find(path); found != g_kept_files.end()) {
-		*size = found->second.size;
-		return reinterpret_cast<uint64_t>(found->second.handle);
+	{
+		const std::lock_guard lock(g_kept_files_mutex);
+		if (const auto found = g_kept_files.find(path); found != g_kept_files.end()) {
+			*size = found->second.size;
+			return reinterpret_cast<uint64_t>(found->second.handle);
+		}
 	}
+	// Opened outside the lock: a 16 GB laptop's opens took 100-390 ms while the game streamed a level in, and each
+	// read of a file kept open already (an audio stream's next piece) waited for them behind it (open=150-250 ms).
 	const auto wide = WidePath(path);
 	if (wide.empty()) return 0;
 	HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -568,9 +572,11 @@ uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
 		CloseHandle(handle);
 		return 0;
 	}
-	g_kept_files.emplace(path, KeptFile {handle, static_cast<uint64_t>(length.QuadPart)});
-	*size = static_cast<uint64_t>(length.QuadPart);
-	return reinterpret_cast<uint64_t>(handle);
+	const std::lock_guard lock(g_kept_files_mutex);
+	const auto [kept, added] = g_kept_files.try_emplace(path, KeptFile {handle, static_cast<uint64_t>(length.QuadPart)});
+	if (!added) CloseHandle(handle); // (another thread opened it meanwhile: its handle is the one kept)
+	*size = kept->second.size;
+	return reinterpret_cast<uint64_t>(kept->second.handle);
 }
 
 uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t size) {
