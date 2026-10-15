@@ -211,8 +211,15 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	const auto decode   = [&](uint32_t index, LocalShaderWarmup::Record& record) {
 		LocalShaderWarmup::Reader reader {seed_words[index]};
 		if (!LocalShaderWarmup::Visit(reader, record)) return false;
-		if (args.host_subgroup_size != 0 && record.stage == ShaderType::Compute)
+		// (The static key holds the subgroup size too: one recorded on another GPU failed ValidKey, so the compiled
+		// inputs left out every compute record where the size differs: an AMD RDNA3+ precompile (64) of seeds and
+		// NVIDIA-recorded hints (32) wrote 11,676 inputs of 28,742, and the shader prefetch translated no compute
+		// shader there.)
+		if (args.host_subgroup_size != 0 && record.stage == ShaderType::Compute &&
+		    record.compute.host_subgroup_size != args.host_subgroup_size) {
 			record.compute.host_subgroup_size = args.host_subgroup_size;
+			BuildStageStaticKey(record.compute, record.static_key);
+		}
 		return true;
 	};
 	const auto stage_of = [&](size_t index) { return ShaderType(seed_words[index][0]); };
