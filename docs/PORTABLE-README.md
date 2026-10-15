@@ -151,9 +151,10 @@ There are two levels of preparation, both specific to the graphics card and driv
      while playing every world on the test PC (`tools\local\static-precompile\hints-<title>_<version>.hints`,
      without the game's shader code), completed with the code of your own game files.
    - Places and effects the test PC never recorded (bosses' deaths, for one) still compile when they first
-     appear. `precompile.cmd -ExportHints` writes what your own play recorded, without the game's shader
-     code, to `my-hints-<title>_<version>.hints` (a few hundred KB, nothing is compiled): attached to an
-     issue, it goes into the hints of the next packages.
+     appear. The launcher's "Export shader hints" button (or `precompile.cmd -ExportHints`) writes what your
+     own play recorded, without the game's shader code, to `my-hints-<title>_<version>.hints` (a few hundred
+     KB, nothing is compiled) and shows it in Explorer: attached to an issue, it goes into the hints of the
+     next packages.
    - **After a graphics driver update or a new graphics card it has to be done again**; the launcher
      asks again. It also asks after an update of the emulator that precompiles more: running it again
      then compiles only what is new.

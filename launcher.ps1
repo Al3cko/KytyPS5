@@ -116,8 +116,9 @@ function Get-PlayCommand {
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
 }
-function Get-PrecompileCommand {
+function Get-PrecompileCommand([string]$switch = '') {
 	$arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\precompile-windows.ps1`"")
+	if ($switch) { $arguments += $switch }
 	if ($settings.ecores -and $efficiencyMask -ne 0) { $arguments += @('-Affinity', $efficiencyMask) }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	return 'powershell ' + ($arguments -join ' ') + ' & pause'
@@ -126,6 +127,7 @@ function Save-Settings { $settings | ConvertTo-Json | Set-Content $settingsPath 
 if ($DryRun) {
 	"play:       cmd /v:on /s /c `"$(Get-PlayCommand)`""
 	"precompile: cmd /s /c `"$(Get-PrecompileCommand)`""
+	"hints:      cmd /s /c `"$(Get-PrecompileCommand '-ExportHints')`""
 	"efficiency cores: 0x{0:X}" -f $efficiencyMask
 	"frame generation: $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline" } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
 	return
@@ -273,9 +275,12 @@ Add-Row '' @($ecores)
 $buttons = New-Object System.Windows.Forms.FlowLayoutPanel -Property @{ AutoSize = $true; Margin = '0,10,0,0' }
 $play = New-Object System.Windows.Forms.Button -Property @{ Text = 'Play'; AutoSize = $true; Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold) }
 $precompile = New-Object System.Windows.Forms.Button -Property @{ Text = 'Precompile shaders'; AutoSize = $true }
+$share = New-Object System.Windows.Forms.Button -Property @{ Text = 'Export shader hints'; AutoSize = $true }
+(New-Object System.Windows.Forms.ToolTip).SetToolTip($share, ('The shaders your play recorded, without the game''s code, as my-hints-<game>.hints: ' +
+	'attached to a GitHub issue, the next packages precompile them for everyone.'))
 $logs = New-Object System.Windows.Forms.Button -Property @{ Text = 'Logs folder'; AutoSize = $true }
 $readme = New-Object System.Windows.Forms.Button -Property @{ Text = 'README'; AutoSize = $true }
-$buttons.Controls.AddRange(@($play, $precompile, $logs, $readme))
+$buttons.Controls.AddRange(@($play, $precompile, $share, $logs, $readme))
 $grid.Controls.Add($buttons)
 $grid.SetColumnSpan($buttons, 2)
 $credit = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '0,8,0,0'
@@ -310,6 +315,10 @@ $play.Add_Click({
 $precompile.Add_Click({
 	Read-Form
 	Start-Process cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand)`"" -WorkingDirectory $root
+})
+$share.Add_Click({
+	Read-Form
+	Start-Process cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand '-ExportHints')`"" -WorkingDirectory $root
 })
 $logs.Add_Click({
 	$folder = if (Test-Path "$root\_Build") { "$root\_Build\run-logs" } else { "$root\logs" }

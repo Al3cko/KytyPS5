@@ -145,6 +145,7 @@ if ($ExportHints) {
 	& $Exe @arguments
 	if ($LASTEXITCODE) { throw 'making the hints failed (kyty_shader_precompile --make-hints)' }
 	Write-Host "hints: $out ($([math]::Ceiling((Get-Item $out).Length / 1KB)) KiB, no game code in it): attach it to an issue"
+	Start-Process explorer.exe "/select,`"$out`""
 	exit 0
 }
 if ($Recorded -eq '*') {
