@@ -19,12 +19,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
 
 #ifdef min
 #undef min
@@ -1467,6 +1469,16 @@ static void LogAprRead(const std::string& host_path, uint64_t destination, uint6
 	}
 }
 
+// A PC's recording of the game's file opens (LocalPlatform::FollowKeptFiles) starts, on its first launch, as the
+// release's (tools/local/static-precompile/files-<title>_<version>.files: a tour of every world's opens): its first loads
+// are followed too (1-1 on a 16 GB laptop: 110 s of loading fog unfollowed, ~20 s followed).
+static void SeedFileRecording(const std::string& recording, const std::string& released) {
+	std::error_code error;
+	if (std::filesystem::exists(recording, error) || !std::filesystem::exists(released, error)) return;
+	std::filesystem::create_directories(std::filesystem::path(recording).parent_path(), error);
+	std::filesystem::copy_file(released, recording, error);
+}
+
 // A file of a game packed into a ZArchive ("game.zar!/dir/file"), kept open like LocalPlatform::OpenKeptReadFile's:
 // positional reads from any thread. Null: it is not in the archive.
 static const Common::ArchiveFile* KeptArchiveFile(const std::string& host_path) {
@@ -1554,8 +1566,11 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		std::string title, version;
 		if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title) || title.empty()) return;
 		(void)Loader::SystemContentParamSfoGetString("APP_VER", &version);
-		const auto root = Common::PathToString(LibKernel::FileSystem::GetRealFilename("/app0"));
-		LocalPlatform::FollowKeptFiles("_PipelineCache/files/" + title + (version.empty() ? "" : "_" + version) + ".files", root);
+		const auto root      = Common::PathToString(LibKernel::FileSystem::GetRealFilename("/app0"));
+		const auto id        = title + (version.empty() ? "" : "_" + version);
+		const auto recording = "_PipelineCache/files/" + id + ".files";
+		SeedFileRecording(recording, "tools/local/static-precompile/files-" + id + ".files");
+		LocalPlatform::FollowKeptFiles(recording, root);
 	});
 	if (uint64_t kept_size = 0; const auto kept = LocalPlatform::OpenKeptReadFile(host_path, &kept_size)) {
 		opening = Clock::now() - start;
