@@ -1714,6 +1714,10 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	InitializeStaticCache(false);
 	// Not in the static precompile: a shell that ran the game passes its KYTY_SHADER_WARMUP(_ONLY) on.
 #ifndef KYTY_STATIC_PRECOMPILE
+	PipelineCacheLog("Pipelines in no cache: {}", FirstBuild(m_graphics) == PipelineBuild::Fast
+	                                                  ? "made unoptimized first, the optimized build replaces them "
+	                                                    "(KYTY_PIPELINE_FAST_BUILD=0: optimized at once)"
+	                                                  : "made optimized (KYTY_PIPELINE_FAST_BUILD=1: unoptimized first)");
 	const char* warmup = std::getenv("KYTY_SHADER_WARMUP");
 	std::vector<std::vector<uint32_t>> recorded_inputs; // (the shader prefetch's first, when not translated here)
 	if (warmup && IsBinaryDriverCacheKey(m_driver_cache_key) && m_driver_cache != nullptr &&
