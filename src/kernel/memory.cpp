@@ -74,6 +74,10 @@ extern "C" {
 // the lock (ReapplyRemappedViews): a CPU write to a watched page in between went unseen (a GPU copy left stale, or a
 // GPU-owned page later written back over the write).
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_protective_remap {1};
+// 1: a partial unmap of a view (Windows) leaves the range parked in the view instead of unmapping the whole view and
+// mapping its other parts again (GuestBackingStore::UnmapOne); 2: parked no-access (a stray access faults, for
+// debugging). 0: views with nothing parked yet are split at once, as before (a view holding parked ranges keeps parking).
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_park_unmaps {1};
 // (Diagnostic: microseconds UnmapBacking waits after it mapped views again, before ReapplyRemappedViews: the window
 // kyty_local_protective_remap 0 leaves, widened.)
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_remap_window_us {0};
