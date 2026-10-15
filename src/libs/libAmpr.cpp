@@ -10,6 +10,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 #include "local-platform.h"
 #include "slow-log.h"
 
@@ -1547,6 +1548,15 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	// page protected again meanwhile faults as before). Copied through the write faults page by page, a level's banks
 	// went in at 0.3 GB/s (obj_bg_nex.bnk, 95 MB: 291 ms of copying on a job thread while the Nexus loaded, 10-12); with
 	// a preparation per 4 MiB piece each waited for the GPU thread (obj_bg_tow.bnk, 141 MB: 174 ms).
+	// (The game's opens followed: LocalPlatform::FollowKeptFiles. The recording is the game build's, as the shader caches.)
+	static std::once_flag follow;
+	std::call_once(follow, [] {
+		std::string title, version;
+		if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title) || title.empty()) return;
+		(void)Loader::SystemContentParamSfoGetString("APP_VER", &version);
+		const auto root = Common::PathToString(LibKernel::FileSystem::GetRealFilename("/app0"));
+		LocalPlatform::FollowKeptFiles("_PipelineCache/files/" + title + (version.empty() ? "" : "_" + version) + ".files", root);
+	});
 	if (uint64_t kept_size = 0; const auto kept = LocalPlatform::OpenKeptReadFile(host_path, &kept_size)) {
 		opening = Clock::now() - start;
 		if (file_offset >= kept_size) {

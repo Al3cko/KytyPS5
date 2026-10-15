@@ -5,6 +5,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <filesystem>
 #include <iterator>
 #include <map>
 #include <set>
@@ -504,6 +506,7 @@ struct KeptFile {
 	HANDLE   handle     = INVALID_HANDLE_VALUE;
 	uint64_t size       = 0;
 	bool     prefetched = false;
+	bool     ahead      = false; // opened by FollowKeptFiles's threads, not read by the game yet
 };
 std::mutex                                g_kept_files_mutex;
 std::unordered_map<std::string, KeptFile> g_kept_files; // (never closed: the game's files, read-only)
@@ -552,14 +555,102 @@ void PrefetchThread() {
 }
 } // namespace
 
+// FollowKeptFiles: the recorded opens and the files queued for the openers. A 16 GB laptop loading 1-1 opened 28,528
+// files for 31,390 reads, one after another on the game's file thread (0.9 ms a read at the median, 11 ms at p90:
+// metadata and the antivirus's scan of each first open); its file thread was 60% in CreateFileW over the ~100 s
+// loading fog.
+struct FileFollow {
+	std::mutex                                mutex; // (never held with g_kept_files_mutex)
+	std::condition_variable                   ready;
+	std::unordered_map<std::string, uint32_t> index; // host path -> place in the recording
+	std::vector<const std::string*>           paths; // index's keys in recorded order
+	std::vector<uint8_t>                      queued; // per place: queued, opened or opened by the game
+	std::deque<uint32_t>                      queue;
+	std::string                               root; // (with its separator)
+	FILE*                                     out       = nullptr;
+	uint32_t                                  unflushed = 0;
+	bool                                      on        = false;
+};
+FileFollow g_follow;
+constexpr uint32_t FollowWindow = 256, FollowThreads = 4;
+
+void FollowOpenThread() {
+	SetThreadName("Kyty.FileOpen");
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	for (;;) {
+		std::string path;
+		{
+			std::unique_lock lock(g_follow.mutex);
+			g_follow.ready.wait(lock, [] { return !g_follow.queue.empty(); });
+			path = *g_follow.paths[g_follow.queue.front()];
+			g_follow.queue.pop_front();
+		}
+		{
+			const std::lock_guard lock(g_kept_files_mutex);
+			if (g_kept_files.contains(path)) continue;
+		}
+		const auto wide = WidePath(path);
+		if (wide.empty()) continue;
+		HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+		                            FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (handle == INVALID_HANDLE_VALUE) continue; // (a file of an earlier session gone)
+		LARGE_INTEGER length {};
+		if (GetFileSizeEx(handle, &length) == 0) {
+			CloseHandle(handle);
+			continue;
+		}
+		const std::lock_guard lock(g_kept_files_mutex);
+		const auto [kept, added] =
+		    g_kept_files.try_emplace(path, KeptFile {handle, static_cast<uint64_t>(length.QuadPart), false, true});
+		if (!added) CloseHandle(handle);
+	}
+}
+
+// The game opened (or first read) `path`: the recorded files after it queued, or it recorded.
+void FollowFrom(const std::string& path) {
+	std::lock_guard lock(g_follow.mutex);
+	if (!g_follow.on) return;
+	const auto found = g_follow.index.find(path);
+	if (found == g_follow.index.end()) {
+		const auto place = static_cast<uint32_t>(g_follow.paths.size());
+		const auto added = g_follow.index.emplace(path, place).first;
+		g_follow.paths.push_back(&added->first);
+		g_follow.queued.push_back(1);
+		if (g_follow.out != nullptr) {
+			const bool under = !g_follow.root.empty() && path.starts_with(g_follow.root);
+			std::fprintf(g_follow.out, "%s\n", path.c_str() + (under ? g_follow.root.size() : 0));
+			if (++g_follow.unflushed >= 32) {
+				std::fflush(g_follow.out);
+				g_follow.unflushed = 0;
+			}
+		}
+		return;
+	}
+	g_follow.queued[found->second] = 1;
+	const auto end = std::min<size_t>(size_t {found->second} + 1 + FollowWindow, g_follow.paths.size());
+	bool       any = false;
+	for (auto place = found->second + 1; place < end; ++place)
+		if (g_follow.queued[place] == 0) {
+			g_follow.queued[place] = 1;
+			g_follow.queue.push_back(place);
+			any = true;
+		}
+	if (any) g_follow.ready.notify_all();
+}
+
 uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
 	{
-		const std::lock_guard lock(g_kept_files_mutex);
+		std::unique_lock lock(g_kept_files_mutex);
 		if (const auto found = g_kept_files.find(path); found != g_kept_files.end()) {
-			*size = found->second.size;
-			return reinterpret_cast<uint64_t>(found->second.handle);
+			*size              = found->second.size;
+			const auto handle  = reinterpret_cast<uint64_t>(found->second.handle);
+			const bool first   = std::exchange(found->second.ahead, false);
+			lock.unlock();
+			if (first) FollowFrom(path);
+			return handle;
 		}
 	}
+	FollowFrom(path);
 	// Opened outside the lock: a 16 GB laptop's opens took 100-390 ms while the game streamed a level in, and each
 	// read of a file kept open already (an audio stream's next piece) waited for them behind it (open=150-250 ms).
 	const auto wide = WidePath(path);
@@ -587,6 +678,42 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 	DWORD got     = 0;
 	if (ReadFile(reinterpret_cast<HANDLE>(file), buffer, size, &got, &at) == 0) return 0;
 	return got;
+}
+
+void FollowKeptFiles(const std::string& recording, const std::string& root) {
+	static std::once_flag once;
+	std::call_once(once, [&] {
+		if (const char* value = std::getenv("KYTY_FILE_FOLLOW"); value != nullptr && std::string_view(value) == "0") return;
+		std::lock_guard lock(g_follow.mutex);
+		g_follow.root = root;
+		if (!g_follow.root.empty() && g_follow.root.back() != '/' && g_follow.root.back() != '\\') g_follow.root += '/';
+		if (FILE* in = std::fopen(recording.c_str(), "rb")) {
+			std::string line;
+			for (int c; (c = std::fgetc(in)) != EOF;) {
+				if (c != '\n') {
+					line += static_cast<char>(c);
+					continue;
+				}
+				if (!line.empty() && line.back() == '\r') line.pop_back();
+				if (!line.empty()) {
+					// (Relative: under the root. Absolute: a drive or a separator first.)
+					const bool absolute = line.size() > 1 && (line[1] == ':' || line[0] == '/' || line[0] == '\\');
+					auto       full     = absolute ? line : g_follow.root + line;
+					const auto place    = static_cast<uint32_t>(g_follow.paths.size());
+					if (const auto [added, inserted] = g_follow.index.emplace(std::move(full), place); inserted)
+						g_follow.paths.push_back(&added->first);
+				}
+				line.clear();
+			}
+			std::fclose(in);
+		}
+		g_follow.queued.assign(g_follow.paths.size(), 0);
+		std::error_code error;
+		std::filesystem::create_directories(std::filesystem::path(recording).parent_path(), error);
+		g_follow.out = std::fopen(recording.c_str(), "ab");
+		g_follow.on  = true;
+		for (uint32_t t = 0; t < FollowThreads; ++t) std::thread(FollowOpenThread).detach();
+	});
 }
 
 void PrefetchKeptFile(const std::string& path) {
@@ -1342,6 +1469,8 @@ uint32_t ReadOpenFileAt(uint64_t /*file*/, uint64_t /*offset*/, void* /*buffer*/
 }
 
 void PrefetchKeptFile(const std::string& /*path*/) {}
+
+void FollowKeptFiles(const std::string& /*recording*/, const std::string& /*root*/) {}
 
 std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
 	return {};
