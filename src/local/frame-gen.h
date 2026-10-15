@@ -87,6 +87,11 @@ void SetStaticRect(float x0, float y0, float x1, float y1);
 // (Presenter::PrepareFrame): above 60 Hz the other frames keep 60 (videoOut.cpp).
 void NoteScene();
 [[nodiscard]] bool TakeScene();
+// The current guest frame ran the TAA pass so far, or the last one flipped did (HudAnchor: the game queues a frame's
+// interface before the flip of the one before).
+[[nodiscard]] bool SceneNoted();
+// The guest flips taken so far (TakeScene).
+[[nodiscard]] uint64_t GuestFlips();
 // The current guest frame has no camera yet: its next G-buffer draw goes the normal way (the table way's draws have
 // no constants on the CPU), whose hook reads it.
 [[nodiscard]] bool WantsCamera();

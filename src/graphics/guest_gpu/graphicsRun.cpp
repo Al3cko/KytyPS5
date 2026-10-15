@@ -29,6 +29,7 @@
 #include "live-census.h"
 #include "draw-state-observer.h"
 #include "frame-capture.h"
+#include "hud-anchor.h"
 #include "live-control.h"
 #include "performance-switches.h"
 #include "speculation-state.h"
@@ -40,6 +41,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <x86intrin.h>
 #include <cstdio>
 #include <cstring>
@@ -1895,6 +1897,16 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	    (primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip))
 		return 0;
 	CheckBuffer();
+	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h); a draw over several of its
+	// areas goes the normal way, drawn once for each.
+	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), packet[1]));
+	if (std::popcount(hud) > 1) return 0u;
+	std::optional<HudAnchor::Scope> anchor;
+	if (hud != 0) {
+		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud)), false);
+	} else {
+		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
+	}
 	const RenderExecutor::NativeXprDirectDraw draw {0, packet[1], m_num_instances, false};
 	return m_renderer.GetRenderExecutor().NativeXprTry(CurrentBuffer(), false, {}, 0, 0, vk::IndexType::eUint16, &draw)
 	           ? 3u
@@ -2254,7 +2266,19 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
-	return m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h).
+	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), args.vertex_count));
+	if (hud == 0) {
+		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
+		return m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	}
+	bool drawn = true;
+	for (uint32_t area = 0; area < 32; ++area) {
+		if ((hud & (1u << area)) == 0) continue;
+		HudAnchor::Scope anchor(m_ctx, m_sh_ctx.GetPs(), area, std::popcount(hud) > 1);
+		drawn = m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args) && drawn;
+	}
+	return drawn;
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

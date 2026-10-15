@@ -17,8 +17,9 @@ struct Program;
 // render setup's 16:9, AspectStore) to match: more of the world to the sides, not a stretched 16:9 view. The game's
 // output stays 3840x2160: the wider picture is squeezed into it, the HUD drawn over it as at 16:9, and the presenter
 // widens the frames showing the 3D back to the aspect (movies, menus and loading screens stay 16:9: WideAspect()). The
-// HUD is as much wider; markers over the world (lock-on, enemy health) stay on their targets. (The game's output made
-// as wide, 5120x2160, laid its HUD and menus out at 16:9 against its left edge.)
+// HUD's elements keep their shape at their sides of the screen (src/local/hud-anchor.h); the in-game menus and the
+// markers over the world (lock-on, enemy health, on their targets) are as much wider. (The game's output made as wide,
+// 5120x2160, laid its HUD and menus out at 16:9 against its left edge.)
 namespace DemonsSoulsRenderSize {
 void Install(Program* program);
 // The aspect the 3D is rendered at when KYTY_RENDER_ASPECT took effect (Install), else 0 (the game's 16:9).

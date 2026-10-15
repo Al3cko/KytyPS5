@@ -235,7 +235,7 @@ $ratio.Items.AddRange($ratios)
 $ratio.SelectedItem = ($ratios | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.ratio } | Select-Object -First 1)
 if ($ratio.SelectedIndex -lt 0) { $ratio.SelectedIndex = 0 }
 $ratioNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0'
-	Text = 'the 3D wider (more to the sides, the HUD stretched); movies and menus stay 16:9' }
+	Text = 'the 3D wider (more to the sides); the HUD keeps its shape, menus are stretched, movies stay 16:9' }
 Add-Row 'Aspect ratio' @($ratio, $ratioNote)
 $quality = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 205 }
 $quality.Items.AddRange($qualities)

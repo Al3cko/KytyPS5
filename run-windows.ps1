@@ -25,8 +25,8 @@
 #   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
 #   .\run-windows.ps1 -Aspect 21:9           Demon's Souls renders its 3D wider (21:9 = 64:27, up to 32:9; 3416x1440
-#                                            at 21:9), seeing more to the sides; shown at that aspect (the HUD as
-#                                            much wider), movies and menus at 16:9 (black bars)
+#                                            at 21:9), seeing more to the sides; shown at that aspect (the HUD at
+#                                            its sides unstretched, in-game menus stretched), movies at 16:9
 #   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: simpler shadows and
 #                                            distant detail): faster where the CPU limits
 #   .\run-windows.ps1 -Game <folder>         the game (the folder with eboot.bin); remembered in
