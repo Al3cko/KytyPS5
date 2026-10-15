@@ -23,6 +23,9 @@
   "Preparing shaders" screens at start-up are gone (that work runs beside the game). After updating, the launcher
   asks once to update the shader cache: only what is new is compiled.
 - **Fixes**:
+  - Continue loads the character you saved last, as on the PS5. It always loaded the first character slot, and with a
+    tutorial character there it could drop the player under the world (issue #26). If you have several characters,
+    Continue may now load a different one than before; Load Game picks any of them.
   - Crashes: a rare exit while playing in a world ("unknown format"); rare crashes of the game's own threads while memory
     was being unmapped.
   - On PCs with 16 GB of RAM the graphics driver's pipeline cache no longer starts over every launch or two (which made
@@ -45,6 +48,7 @@
 - **DualSense**：支持震动、手柄扬声器和自适应扳机效果。窗口可以调整大小和最大化。
 - **着色器准备**：随包附带的着色器提示加入了所有世界的巡游记录，以及一位 AMD 玩家的游玩记录，第一次进入各区域时需要的着色器更多地会提前准备好；预编译能更早达到"可以开始游戏"，启动时的"Preparing shaders"画面也去掉了（这部分工作改为在游戏旁边进行）。更新后，启动器会询问一次是否更新着色器缓存：只编译新增的部分。
 - **修正**：
+  - Continue 现在加载最近一次保存的角色，和 PS5 上一样。之前它总是加载第一个角色槽；如果那里是教程角色，就可能掉到地图下面（issue #26）。有多个角色的话，Continue 加载的角色可能和以前不同，可以用 Load Game 选择任意角色。
   - 崩溃：在世界中游玩时偶尔退出的问题（"unknown format"）；内存解除映射时，游戏自身线程偶尔崩溃的问题。
   - 16 GB 内存的电脑上，显卡驱动的管线缓存不再每启动一两次就重新开始（之前会导致着色器重新编译）。
   - 长时间游玩时，在世界之间来回多次后帧率的下降小了很多。
