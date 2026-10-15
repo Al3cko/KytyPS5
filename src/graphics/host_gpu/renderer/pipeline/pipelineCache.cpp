@@ -606,7 +606,7 @@ struct PipelineCache::ProgramCache {
 		// Following play (Follow, Followed): each record of this PC's recorded play's group, in recorded order (read-only
 		// once `ready`), and windows of records after programs the game met, translated before the rest (the newest
 		// window first). Play meets programs in about the order it recorded them: of the 157 programs a 16 GB laptop still
-		// translated itself in a boot and 1-1 walk (1.3 s; the oldest and newest alternately had not reached the middle
+		// translated itself in a boot and prologue walk (1.3 s; the oldest and newest alternately had not reached the middle
 		// of its 11,501 records), 84 were within 64 records of the 40 programs met before, often the very next record:
 		// runs of 9 and 10 met in one frame (~110 ms), which helper threads (FollowWork) translate beside the render
 		// thread. Not followed 120 and 157 (0.9 and 1.3 s), followed 74 (0.56 s), with the helpers 32 and 48 (0.24 and
