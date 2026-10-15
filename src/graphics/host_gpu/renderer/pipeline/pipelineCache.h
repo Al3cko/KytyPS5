@@ -254,9 +254,9 @@ public:
 	                                                 const ShaderProgram&          compute_program);
 	// The optimized builds finished since replace their unoptimized pipelines (at each flip: the draws of native
 	// XPR records hold their pipelines and look nothing up). GPU thread.
+	// Each flip (from the CPU or the GPU's commands): optimized builds in place, shader plans unused for a while out of
+	// memory.
 	void PromoteFinished();
-	// A flip from the GPU's commands (a CPU flip: PromoteFinished): shader plans unused for a while leave memory.
-	void SweepPlans();
 	// Live "objects": what the cache keeps, as counts (stdout).
 	void ReportObjects(uint64_t id) const;
 	// Native XPR records (src/local/native-xpr.inc): the SRT evaluation of a stage

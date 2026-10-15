@@ -1734,11 +1734,6 @@ void PipelineCache::PromoteFinished() {
 	m_program_cache->SweepPlans();
 }
 
-void PipelineCache::SweepPlans() {
-	Common::LockGuard lock(m_mutex);
-	m_program_cache->SweepPlans();
-}
-
 // Finished optimized builds replace their pipelines in place, for every holder of the Pipeline
 // (native XPR records never look it up again). The unoptimized pipeline stays alive until this
 // cache is destroyed: commands recorded before may still use it.

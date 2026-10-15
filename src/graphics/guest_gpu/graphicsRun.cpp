@@ -2661,7 +2661,8 @@ void CommandProcessor::Flip() {
 	LiveControl::Flip();
 	FrameCapture::OnFlip();
 	CheckBuffer();
-	m_renderer.GetPipelineCache().SweepPlans();
+	// (As a CPU flip's preparation does: optimized builds in place, idle shader plans out of memory.)
+	m_renderer.GetPipelineCache().PromoteFinished();
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
