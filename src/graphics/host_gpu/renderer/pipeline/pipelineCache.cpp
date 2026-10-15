@@ -593,6 +593,9 @@ struct PipelineCache::ProgramCache {
 		std::unordered_map<ProgramKey, Group*, ProgramKeyHash> index;  // read-only once `ready`
 		std::atomic<bool>                                      ready {false}, stop {false};
 		std::atomic<size_t>                                    next {0}, finished {0};
+		// The groups of recorded programs (the first ones) and how many workers go on after them (StartPrefetch).
+		size_t   recorded_groups = 0;
+		uint32_t gentle_threads  = 1;
 		std::atomic<uint64_t>                                  spill_end {0};
 		std::atomic<uint64_t>                                  spirv_bytes {0}; // before compression
 		uint64_t                                               spill = 0;
@@ -748,14 +751,23 @@ struct PipelineCache::ProgramCache {
 				return;
 			}
 			uint32_t threads = SpareThreads();
+			// The recording's programs (the place played, what the game soon needs) on all of them, the rest (places not
+			// played on this PC yet) on half: they ran into the play, on the other half of the render thread's core too.
+			// Standing at 1-1 on an 8-core laptop, the render thread took 24.2-25.2 ms a frame beside 4 prefetch threads,
+			// 21.6 ms beside 2 and 19.4 ms once the prefetch was done (all of it: 3.5 minutes on 4 threads, 5.5 on 2).
+			// KYTY_SHADER_PREFETCH_THREADS: that many all along.
+			p.gentle_threads = std::max(1u, threads / 2);
 			if (const char* value = std::getenv("KYTY_SHADER_PREFETCH_THREADS"); value != nullptr && *value != '\0')
-				threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
+				p.gentle_threads = threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
+			p.recorded_groups = static_cast<size_t>(std::ranges::count_if(p.groups, [](const auto& group) {
+				return group->recorded != UINT32_MAX;
+			}));
 			PipelineCacheLog("Shader prefetch: {} programs ({} inputs, {} of them recorded play's; {} recorded first) to "
-			                 "translate on {} threads, loaded in {} ms",
-			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads,
+			                 "translate on {} threads ({} after the recorded ones), loaded in {} ms",
+			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads, p.gentle_threads,
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
-			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this] { PrefetchWork(); });
+			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this, t] { PrefetchWork(t); });
 		});
 	}
 
@@ -774,11 +786,12 @@ struct PipelineCache::ProgramCache {
 		return index <= (count - 1) / 2 ? 2 * index : 2 * (count - 1 - index) + 1;
 	}
 
-	void PrefetchWork() {
+	void PrefetchWork(uint32_t worker) {
 		LocalPlatform::SetThreadName("Kyty.Prefetch");
 		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 		auto& p = *prefetch;
 		for (size_t n; !p.stop.load(std::memory_order_relaxed) &&
+		               (worker < p.gentle_threads || p.next.load(std::memory_order_relaxed) < p.recorded_groups) &&
 		               (n = p.next.fetch_add(1, std::memory_order_relaxed)) < p.groups.size();) {
 			auto& group    = *p.groups[n];
 			auto  expected = static_cast<uint8_t>(Prefetch::Pending);
