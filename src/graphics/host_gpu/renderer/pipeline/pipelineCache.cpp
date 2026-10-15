@@ -458,6 +458,7 @@ struct PipelineCache::ProgramCache {
 			ProgramKey                                        key;
 			uint64_t                                          source = 0; // SourceDigest
 			size_t                                            code_words = 0;
+			uint32_t                                          recorded = UINT32_MAX; // its first record in this PC's play
 			std::vector<uint32_t>                             records;
 			std::atomic<uint8_t>                              state {Pending};
 			std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
@@ -550,11 +551,13 @@ struct PipelineCache::ProgramCache {
 	}
 
 	// Loads the inputs on a thread of its own, leaves out the programs the warmup holds (`warm`), and
-	// starts the translation.
-	void StartPrefetch(std::filesystem::path path, std::string identity, std::vector<ProgramKey> warm) {
+	// starts the translation: first the programs of this PC's recorded play (`recorded`, the warmup's records when it
+	// translated none) in the order they were first met, then the rest, the biggest first.
+	void StartPrefetch(std::filesystem::path path, std::string identity, std::vector<ProgramKey> warm,
+	                   std::vector<std::vector<uint32_t>> recorded) {
 		prefetch         = std::make_unique<Prefetch>();
 		prefetch->loader = std::thread([this, path = std::move(path), identity = std::move(identity),
-		                                warm = std::move(warm)] {
+		                                warm = std::move(warm), recorded = std::move(recorded)]() mutable {
 			LocalPlatform::SetThreadName("Kyty.Prefetch");
 			LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 			auto&      p     = *prefetch;
@@ -582,7 +585,26 @@ struct PipelineCache::ProgramCache {
 				}
 				found->second->records.push_back(i);
 			}
-			std::ranges::stable_sort(p.groups, std::ranges::greater {}, [](const auto& group) { return group->code_words; });
+			// A PC with too little RAM to translate its recorded play at start-up (16 GB): the programs it needs while the
+			// game starts and loads are among the first recorded (1,138 translated on the render thread at the laptop's
+			// tutorial start, 13.8 s, 58% of them in the oldest tenth of the recording, all in it), and the biggest-first
+			// order reached them minutes later (20K programs on 4 threads).
+			uint32_t ranked = 0;
+			for (uint32_t i = 0; i < recorded.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
+				LocalShaderWarmup::Record record;
+				LocalShaderWarmup::Reader reader {recorded[i]};
+				if (!LocalShaderWarmup::Visit(reader, record) || !LocalShaderWarmup::ValidKey(record)) continue;
+				const ProgramKey key {record.stage, record.hash, record.user_data_count,
+				                      static_cast<uint32_t>(record.code.size()), record.static_key};
+				if (const auto found = p.index.find(key); found != p.index.end() && found->second->recorded == UINT32_MAX) {
+					found->second->recorded = i;
+					ranked++;
+				}
+			}
+			std::vector<std::vector<uint32_t>>().swap(recorded);
+			std::ranges::stable_sort(p.groups, {}, [](const auto& group) {
+				return std::pair {group->recorded, ~group->code_words};
+			});
 			p.spill = LocalPlatform::OpenScratchFile();
 			if (p.spill == 0) {
 				PipelineCacheLog("Shader prefetch: no temporary file for the SPIR-V");
@@ -596,8 +618,8 @@ struct PipelineCache::ProgramCache {
 			uint32_t       threads = std::clamp(cpus > 12u ? cpus - 12u : 2u, 2u, std::max(2u, cpus / 2u));
 			if (const char* value = std::getenv("KYTY_SHADER_PREFETCH_THREADS"); value != nullptr && *value != '\0')
 				threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
-			PipelineCacheLog("Shader prefetch: {} programs ({} inputs) to translate on {} threads, loaded in {} ms",
-			                 p.groups.size(), p.inputs.records.size(), threads,
+			PipelineCacheLog("Shader prefetch: {} programs ({} inputs, {} recorded first) to translate on {} threads, loaded in {} ms",
+			                 p.groups.size(), p.inputs.records.size(), ranked, threads,
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
 			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this] { PrefetchWork(); });
@@ -1693,6 +1715,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	// Not in the static precompile: a shell that ran the game passes its KYTY_SHADER_WARMUP(_ONLY) on.
 #ifndef KYTY_STATIC_PRECOMPILE
 	const char* warmup = std::getenv("KYTY_SHADER_WARMUP");
+	std::vector<std::vector<uint32_t>> recorded_inputs; // (the shader prefetch's first, when not translated here)
 	if (warmup && IsBinaryDriverCacheKey(m_driver_cache_key) && m_driver_cache != nullptr &&
 	    (std::string_view(warmup) == "1" || std::string_view(warmup) == "record")) {
 		const auto device = ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -1742,6 +1765,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		m_graphics.RefreshMemoryBudget();
 		const auto video_before = m_graphics.GetDeviceMemoryUsage();
 		m_program_cache->Warm(path, title + device, compile_shaders, adopt_from);
+		if (!compile_shaders) recorded_inputs = m_program_cache->warmup.records;
 		const auto memory_shaders = LocalPlatform::ProcessMemory();
 		// KYTY_PIPELINE_WARMUP: 1 makes them all whatever the memory, 0 none; KYTY_PIPELINE_WARMUP_VIDEO_MIB: the compute
 		// pipelines' video memory cap instead of 1/16 of a small one's.
@@ -1796,7 +1820,8 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		for (const auto& [key, source]: m_program_cache->programs) warm.push_back(key);
 		m_program_cache->StartPrefetch(
 		    StaticInputsPath(),
-		    PipelineCacheTitleId() + ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties()), std::move(warm));
+		    PipelineCacheTitleId() + ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties()), std::move(warm),
+		    std::move(recorded_inputs));
 	}
 #endif
 }
