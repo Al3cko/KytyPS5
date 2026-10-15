@@ -66,11 +66,17 @@ fullscreen (optionally keeping 16:9 with black bars), the console language and r
 with buttons to play, to precompile the shaders (optionally on the efficiency cores only, so the PC
 stays responsive), and to open the logs folder. It remembers the settings (`launcher-settings.json`).
 "Up to 120 fps" (off by default) lets the game render up to 120 frames a second instead of the
-console's 60 where the PC is fast enough: play keeps its speed, but pre-rendered movies play faster.
+console's 60 where the PC is fast enough: play keeps its speed, and movies, menus and loading screens
+stay at 60.
 "Render height" (1440 by default, as on the PS5) is the height the game renders its 3D at before it
 upscales it to its 4K picture; lower heights (1296, 1152, 1080, 900) are faster where the graphics card
 limits the frame rate (a laptop RTX 3080 at Boletaria's start: 20.7 fps at 1440, 24.8 at 1080) and
 less sharp. The interface stays 4K either way.
+"Aspect ratio" (16:9 by default, as on the PS5) renders the 3D wider for ultrawide displays: 21:9
+(3416x1440 at render height 1440) or 32:9, seeing more to the sides, not a stretched 16:9 picture. The
+game's HUD is drawn for 16:9 and is stretched to the width (the lock-on and enemy health bars stay on
+their targets); pre-rendered movies, menus and loading screens are shown at 16:9 with black bars. Pick
+the matching resolution (2560x1080, 3440x1440, 5120x2160, ...) or full screen.
 "Graphics" (Standard by default, as on the PS5) sets how much the game draws. Low draws shadows from
 simpler meshes, picks the level of detail as for a 720-line picture and ends sun shadows at 125 m
 (250 m); Lowest picks detail as for 480 lines, ends sun shadows at 60 m and turns off ambient shadowing
@@ -121,6 +127,7 @@ shortcut):
 | `-Game <folder>` | The game folder (or a `.zar` archive of it) |
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
 | `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
+| `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD is stretched to the width, movies and menus stay 16:9 |
 | `-Quality low` | How much the game draws: `low` or `lowest` (simpler shadows and distant detail), faster where the processor limits the frame rate |
 
 ## Shader precompile (without it the game stutters)

@@ -12,6 +12,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsWarp.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -303,8 +304,9 @@ public:
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay(SystemOverlayHud* hud = nullptr);
+	// `scene`: the frame shows the game's 3D view (Presenter::IsSceneFrame).
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
-	                                           bool draw_system_overlay);
+	                                           bool draw_system_overlay, bool scene);
 	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
 
@@ -831,7 +833,7 @@ bool Swapchain::PrepareSystemOverlay(SystemOverlayHud* hud) {
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
-                                      bool draw_system_overlay) {
+                                      bool draw_system_overlay, bool scene) {
 	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
 		EXIT("invalid prepared presentation image, vk_image=%p layout=%d\n",
 		     static_cast<void*>(source.image), static_cast<int>(source.state.layout));
@@ -863,13 +865,23 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 		const char* value = std::getenv("KYTY_PRESENT_ASPECT");
 		return value != nullptr && std::string_view(value) == "fit";
 	}();
-	int dst_x = 0, dst_y = 0;
-	int dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
-	if (aspect_fit && source.extent.width != 0 && source.extent.height != 0) {
-		const double scale = std::min(static_cast<double>(m_extent.width) / source.extent.width,
-		                              static_cast<double>(m_extent.height) / source.extent.height);
-		dst_w = std::max(1, static_cast<int>(std::lround(source.extent.width * scale)));
-		dst_h = std::max(1, static_cast<int>(std::lround(source.extent.height * scale)));
+	// KYTY_RENDER_ASPECT: the game's 3D was rendered wider and squeezed into its 16:9 output; a frame showing it is
+	// shown at that aspect, the others (movies, menus, loading screens) at their own 16:9, both fitted to the window
+	// (within 2% of the window's aspect: filling it).
+	int          dst_x = 0, dst_y = 0;
+	int          dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
+	const double frame_aspect = source.extent.height != 0
+	                                ? static_cast<double>(source.extent.width) / source.extent.height
+	                                : 0.0;
+	const double wide         = Loader::DemonsSoulsRenderSize::WideAspect();
+	double       aspect       = wide > 0.0 ? (scene ? wide : frame_aspect) : aspect_fit ? frame_aspect : 0.0;
+	if (const double window = static_cast<double>(m_extent.width) / std::max(1u, m_extent.height);
+	    wide > 0.0 && std::fabs(aspect / window - 1.0) < 0.02) {
+		aspect = 0.0;
+	}
+	if (aspect > 0.0 && source.extent.width != 0 && source.extent.height != 0) {
+		dst_w = std::max(1, static_cast<int>(std::lround(std::min<double>(m_extent.width, m_extent.height * aspect))));
+		dst_h = std::max(1, static_cast<int>(std::lround(std::min<double>(m_extent.height, m_extent.width / aspect))));
 		dst_x = (static_cast<int>(m_extent.width) - dst_w) / 2;
 		dst_y = (static_cast<int>(m_extent.height) - dst_h) / 2;
 		if (dst_w != static_cast<int>(m_extent.width) || dst_h != static_cast<int>(m_extent.height)) {
@@ -1156,7 +1168,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.x - region.offset.x) + static_cast<float>(hud->drawn.extent.width) + margin) / w,
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
-			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene);
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
 #if defined(_WIN32)
