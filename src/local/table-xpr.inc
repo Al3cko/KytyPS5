@@ -2457,6 +2457,9 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		return m_dispatch_declined = known->special != nullptr ? known->special : "dispatch: refused", false;
 	if ((Role() == 0 && known->sightings < 2) || known->vs != cs.cs_regs.data_addr) return false;
 	auto& pair = *known;
+	// (The game's 3D view; a dispatch declined below goes the normal way, which notes it too.)
+	if (Role() == 0 && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
+		FrameGen::NoteScene();
 	// KYTY_FRAMEGEN: the TAA dispatch goes the normal way, whose hook reads its depth and motion-vector images (all
 	// dispatches did: +3 ms a frame at 1-1).
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))

@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <list>
@@ -498,11 +499,21 @@ static int FlipRateFloor() {
 	return floor;
 }
 
-static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped) {
+// Above 60 Hz (-Fps120): at least vblank/60 vblanks between the flips of frames without the game's 3D view
+// (Presenter::IsSceneFrame: movies, menus, loading screens), the console's 60 Hz. The game's Bink movies advance a
+// frame per flip (the intro played in 54 s instead of 113 at 120 Hz, ahead of its music); menus gain nothing.
+static int SceneFreeFloor() {
+	static const int floor =
+	    std::max(0, static_cast<int>(std::lround(static_cast<double>(Config::GetVblankFrequency()) / 60.0)) - 1);
+	return floor;
+}
+
+// `floor`: at least floor + 1 vblanks since the last flip (beyond the game's own flip rate).
+static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, int floor) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
-	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) {
+	if (floor > cfg.flip_rate) {
 		return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(floor) + 1u;
 	}
 	const int interval = cfg.flip_rate + 1;
@@ -1143,8 +1154,12 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	r.cfg->mutex.Lock();
-	const bool capped = r.frame != nullptr && Graphics::Presenter::FlipRateApplies(*r.frame);
-	if (!IsFlipDueLocked(*r.cfg, r.generation, capped)) {
+	int floor = 0;
+	if (r.frame != nullptr) {
+		if (Graphics::Presenter::FlipRateApplies(*r.frame)) floor = FlipRateFloor();
+		if (!Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, SceneFreeFloor());
+	}
+	if (!IsFlipDueLocked(*r.cfg, r.generation, floor)) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;

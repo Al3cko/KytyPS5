@@ -49,6 +49,7 @@ struct Presenter::Frame {
 	bool                   reusing_last = false;
 	bool                   hdr          = false; // BT.2100 PQ pixels
 	bool                   blank        = false; // a cleared frame (no guest picture)
+	bool                   scene        = false; // the game's 3D view (FrameGen::TakeScene)
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -1012,6 +1013,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	frame->scene    = FrameGen::TakeScene();
 	frame->fg.valid = false;
 	if (FrameGen::Enabled()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
@@ -1032,6 +1034,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	frame->fg.valid = false;
 	frame->hdr      = false;
 	frame->blank    = true;
+	frame->scene    = false;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1088,6 +1091,10 @@ RenderContext& Presenter::Renderer() const noexcept {
 
 bool Presenter::FlipRateApplies(const Frame& frame) noexcept {
 	return !FrameGen::Enabled() || frame.fg.valid;
+}
+
+bool Presenter::IsSceneFrame(const Frame& frame) noexcept {
+	return frame.scene;
 }
 
 void Presenter::Present(Frame& frame, bool reuse) {

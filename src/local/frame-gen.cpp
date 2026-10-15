@@ -48,6 +48,7 @@ bool     g_ready       = false; // Streamline loaded and the feature available
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
 uint64_t g_guest_frame = 0;     // Kyty.Gpu
+std::atomic<bool> g_scene {false}; // the current guest frame ran the TAA pass
 
 float AsFloat(uint32_t word) {
 	float value = 0.0f;
@@ -788,6 +789,14 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	}
 	g_camera.jitter_ndc = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
 	g_camera.valid      = true;
+}
+
+void NoteScene() {
+	g_scene.store(true, std::memory_order_relaxed);
+}
+
+bool TakeScene() {
+	return g_scene.exchange(false, std::memory_order_relaxed);
 }
 
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,

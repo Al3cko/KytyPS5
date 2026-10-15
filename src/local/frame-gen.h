@@ -82,6 +82,11 @@ void AfterPresent();
 void SetStaticRect(float x0, float y0, float x1, float y1);
 
 // Renderer thread (Kyty.Gpu).
+// The guest frame ran the TAA pass: the game's 3D view (play, or a cutscene in the engine), not a movie, a menu or a
+// loading screen; with or without frame generation, by the normal or the table way. The guest flip takes it
+// (Presenter::PrepareFrame): above 60 Hz the other frames keep 60 (videoOut.cpp).
+void NoteScene();
+[[nodiscard]] bool TakeScene();
 // The current guest frame has no camera yet: its next G-buffer draw goes the normal way (the table way's draws have
 // no constants on the CPU), whose hook reads it.
 [[nodiscard]] bool WantsCamera();
