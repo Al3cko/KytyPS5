@@ -458,8 +458,9 @@ struct Presenter::Impl {
 			return;
 		}
 		std::array<char, 128> line {};
-		if (progress.done < progress.total) {
-			std::snprintf(line.data(), line.size(), "Preparing shaders %zu%%  (%zu / %zu)", progress.done * 100 / progress.total,
+		if (progress.done < progress.total || progress.label != nullptr) {
+			std::snprintf(line.data(), line.size(), "%s %zu%%  (%zu / %zu)",
+			              progress.label != nullptr ? progress.label : "Preparing shaders", progress.done * 100 / progress.total,
 			              progress.done, progress.total);
 		} else {
 			if (prefetch_finished == std::chrono::steady_clock::time_point {}) {
