@@ -200,9 +200,9 @@ if ($Language -ge 0) { Set-Option '--console-language' "$Language" }
 # vblank or a flip on the CPU, its submissions block once the flips queue up. At the console's
 # 60 Hz the game runs at most 60 fps; frames that miss a vblank still queue (no 30 fps lock).
 # -Fps120: a 120 Hz vblank, the game's own frames up to 120 fps (Stonefang standing 60 -> 79 fps).
-# Play keeps its speed (its clock is real time: a 0.7 s camera turn and a 0.6 s walk end in the
-# same place at 79 and 60 fps), but movies advance a frame per flip and play faster (start-up to
-# the title 70 -> 54 s). With the Linux configs' 240 Hz the intro played about four times too fast.
+# Play keeps its speed with gameMinDeltaTime (below), but movies advance a frame per flip and play
+# faster (start-up to the title 70 -> 54 s). With the Linux configs' 240 Hz the intro played about
+# four times too fast.
 Set-Option '--vblank-frequency' "$(if ($Vblank -gt 0) { $Vblank } elseif ($Fps120) { 120 } else { 60 })"
 if ($Patch) { Set-Option '--game-patch' (Resolve-Path $Patch).Path }
 # Windows dispatches exceptions on the faulting thread's stack, over the guest's SysV red
@@ -351,6 +351,15 @@ if ($StreamlineDir) { $environment['KYTY_STREAMLINE_DIR'] = $StreamlineDir }
 foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*=)' })) {
 	$key, $value = $pair -split '=', 2
 	if ($value) { $environment[$key] = $value } else { $environment.Remove($key); Remove-Item "env:$key" -ErrorAction SilentlyContinue }
+}
+# Above 60 Hz (-Fps120, -Vblank; after -Set, whose engine settings get it too): Demon's Souls steps its game by at
+# least a frame of its target rate each frame (gameMinDeltaTime below 0, its default: 1/60 s, the cinematic mode's
+# 1/30), so frames past that rate played the game that much faster (issue #22: Stonefang 2-3 at 74 fps walked 4.52 m/s,
+# 3.66 at 60; the cinematic mode several times over). A 4 ms least step keeps it real time (the same run, the same
+# 74 fps: 3.54-3.68 m/s).
+$vblankHz = if ($Vblank -gt 0) { $Vblank } elseif ($Fps120) { 120 } else { 60 }
+if ($vblankHz -gt 60 -and $titleId -match '^PPSA0134[0-2]$' -and "$($environment['KYTY_GAME_CONVARS'])" -notmatch 'gameMinDeltaTime') {
+	$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], 'gameMinDeltaTime=0.004') | Where-Object { $_ }) -join ';'
 }
 
 # The performance cores of a hybrid CPU (Windows' CPU set efficiency classes: an Intel Core with
