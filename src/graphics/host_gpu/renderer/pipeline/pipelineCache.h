@@ -257,6 +257,9 @@ public:
 	// Each flip (from the CPU or the GPU's commands): optimized builds in place, shader plans unused for a while out of
 	// memory.
 	void PromoteFinished();
+	// The session's numbers in the log (shader prefetch, unoptimized first builds, shader plans), once: at the window's
+	// close, before the process may end without this cache's destructor.
+	void ReportSession();
 	// Live "objects": what the cache keeps, as counts (stdout).
 	void ReportObjects(uint64_t id) const;
 	// Native XPR records (src/local/native-xpr.inc): the SRT evaluation of a stage
@@ -418,6 +421,7 @@ private:
 	                                     bool primitive_restart_enable, const ShaderProgram& vertex_program,
 	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async);
 	void      FinishCompileWorkers();
+	bool      m_session_reported = false; // (ReportSession)
 	CompileWorkers& Workers();
 	CompileWorkers& TableWorkers();
 	CompileWorkers& OptimizeWorkers();

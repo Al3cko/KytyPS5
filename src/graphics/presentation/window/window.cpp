@@ -948,6 +948,7 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+	g_window->render_context->GetPipelineCache().ReportSession();
 	g_window->render_context->GetPipelineCache().Save();
 }
 

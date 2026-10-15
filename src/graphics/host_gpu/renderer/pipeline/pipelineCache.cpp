@@ -1767,27 +1767,34 @@ void PipelineCache::MainPipelineDone() {
 	m_main_pipelines_done.fetch_add(1, std::memory_order_release);
 }
 
+// What the session's shader prefetch, first pipeline builds and shader plans did, once: at the window's close (the
+// process may end without this cache's destructor: the lines were never written, issue #20) or in the destructor.
+void PipelineCache::ReportSession() {
+	Common::LockGuard lock(m_mutex);
+	if (m_session_reported) return;
+	m_session_reported = true;
+	if (const auto& prefetch = m_program_cache->prefetch; prefetch != nullptr && prefetch->ready.load(std::memory_order_acquire)) {
+		PipelineCacheLog("Shader prefetch: {} plans loaded back from the temporary file in {:.1f} ms (at most {:.2f} ms)",
+		                 prefetch->plans_loaded, prefetch->plan_load_ms, prefetch->plan_load_max_ms);
+		PipelineCacheLog("Shader prefetch: {} of {} programs translated; the game took over {} of them ({} modules) "
+		                 "and translated {} itself",
+		                 prefetch->finished.load(), prefetch->groups.size(), prefetch->adopted,
+		                 prefetch->adopted_modules, prefetch->claimed);
+	}
+	PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
+	                 m_unoptimized_builds, m_replaced_pipelines.size());
+	PipelineCacheLog("Shader plans: {} out of memory at the end, {} brought back", m_program_cache->plans_out,
+	                 m_program_cache->plan_reloads);
+}
+
 void PipelineCache::FinishCompileWorkers() {
 	m_table_cache_saver = {}; // (stops and joins it)
-	if (auto& prefetch = m_program_cache->prefetch; prefetch != nullptr) {
-		if (prefetch->ready.load(std::memory_order_acquire)) {
-			PipelineCacheLog("Shader prefetch: {} plans loaded back from the temporary file in {:.1f} ms (at most {:.2f} ms)",
-			                 prefetch->plans_loaded, prefetch->plan_load_ms, prefetch->plan_load_max_ms);
-			PipelineCacheLog("Shader prefetch: {} of {} programs translated; the game took over {} of them ({} modules) "
-			                 "and translated {} itself",
-			                 prefetch->finished.load(), prefetch->groups.size(), prefetch->adopted,
-			                 prefetch->adopted_modules, prefetch->claimed);
-		}
-		prefetch.reset();
-	}
+	ReportSession();
+	m_program_cache->prefetch.reset();
 	m_stopping.store(true, std::memory_order_relaxed);
 	m_optimize_workers.reset();
 	m_table_workers.reset();
 	m_compile_workers.reset();
-	if (m_unoptimized_builds != 0) {
-		PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
-		                 m_unoptimized_builds, m_replaced_pipelines.size());
-	}
 	for (auto& [key, pending]: m_pending_graphics_pipelines) {
 		if (pending->done.load(std::memory_order_acquire) && pending->pipeline->pipeline != nullptr) {
 			m_graphics_pipelines.emplace(key, std::move(pending->pipeline));
