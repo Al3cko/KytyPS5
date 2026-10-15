@@ -115,6 +115,18 @@ fi
 # The game: KYTY_GAME (its folder, or a .zar archive).
 GAME="${KYTY_GAME:-}"
 [ -n "$GAME" ] || { echo "set KYTY_GAME to the game (its folder, or a .zar archive)" >&2; exit 1; }
+# The vblank: KYTY_VBLANK (default 60), or a --vblank-frequency among the arguments. Above 60 Hz Demon's Souls needs
+# gameMinDeltaTime (as run-windows.ps1 gives it, 5550c1bb): it steps its game by at least a frame of its target rate
+# each frame, so every frame past 60 fps (30 in the cinematic mode) played the game that much faster.
+VBLANK="${KYTY_VBLANK:-60}"
+previous=""
+for argument in "$@"; do
+  [ "$previous" != "--vblank-frequency" ] || VBLANK="$argument"
+  previous="$argument"
+done
+if [ "$VBLANK" -gt 60 ] 2>/dev/null && [[ "$KYTY_GAME_CONVARS" != *gameMinDeltaTime* ]]; then
+  export KYTY_GAME_CONVARS="${KYTY_GAME_CONVARS:+$KYTY_GAME_CONVARS;}gameMinDeltaTime=0.004"
+fi
 RUN=("$BIN")
 if [ "${MANGO:-1}" = 1 ] && command -v mangohud >/dev/null 2>&1; then
   RUN=(mangohud "$BIN")
@@ -123,4 +135,4 @@ fi
 exec "${RUN[@]}" --game "$GAME" \
   --screen-width 1920 --screen-height 1080 --console-language 1 \
   --shader-validation false --shader-log-direction Silent --printf-direction Silent \
-  --vblank-frequency 60 --present-mode "${PRESENT_MODE:-Mailbox}" "$@"
+  --vblank-frequency "$VBLANK" --present-mode "${PRESENT_MODE:-Mailbox}" "$@"
