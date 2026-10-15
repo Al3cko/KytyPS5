@@ -385,9 +385,9 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_overlay_revision {0};
-	// KYTY_FPS_HUD: the frame rate panel, its numbers refreshed once a second (the game's presented
-	// frames times the frames DLSS-G shows for each), its frame-time graph with every present; 2: the GPU,
-	// processor and memory rows too (PerfOverlay's sampling thread).
+	// KYTY_FPS_HUD: the frame rate panel, its numbers refreshed once a second (the emulator's own frame rate: the
+	// game's flips; with frame generation the frames presented, generated ones too, and the game's rate below), its
+	// frame-time graph with every present; 2: the GPU, processor and memory rows too (PerfOverlay's sampling thread).
 	SystemOverlayHud                      hud;
 	std::chrono::steady_clock::time_point hud_window {};
 	uint32_t                              hud_frames      = 0;
@@ -500,16 +500,17 @@ struct Presenter::Impl {
 		PerfOverlay::RecentFrames(300, &hud.perf.frame_ms, level >= 2 ? &hud.perf.busy_ms : nullptr);
 		const double seconds = std::chrono::duration<double>(now - hud_window).count();
 		if (seconds >= 1.0) {
-			const double   game  = hud_frames / seconds;
-			const uint32_t shown = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
+			// The emulator's own frame rate (the game's flips) is the number; with frame generation, the frames DLSS-G
+			// presents (those it got, each with its generated ones) are, and the game's rate is below it.
+			const double   game     = PerfOverlay::Summarize(seconds).fps;
+			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
 			std::array<char, 32>  title {};
 			std::array<char, 128> detail {};
-			std::snprintf(title.data(), title.size(), "%.0f FPS", game * shown);
-			if (shown > 1) {
-				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps",
-				              shown, game);
+			if (presents > 1) {
+				std::snprintf(title.data(), title.size(), "%.0f FPS", hud_frames / seconds * presents);
+				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps", presents, game);
 			} else {
-				std::snprintf(detail.data(), detail.size(), "game %.0f fps", game);
+				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
 			}
 			hud.title  = title.data();
 			hud.detail = detail.data();
@@ -1093,7 +1094,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 #if defined(_WIN32)
-	if (!m_impl->PresentDue()) {
+	// (A frame DLSS-G generates frames for goes to it whatever the display's rate: it paces its presents itself, and
+	// held to the refresh it got 57 of a 102 fps game's frames a second on a 60 Hz display, 5x showing 285, not 500.)
+	const bool generated = FrameGen::Enabled() && frame.fg.valid && !reuse;
+	if (!generated && !m_impl->PresentDue()) {
 		// A frame the display could not show anyway (menus and movies run far above it); it
 		// stays the latest frame for an idle refresh, and the next vblank that finds the display
 		// ready and no newer frame shows it (PresentSkippedIfDue).

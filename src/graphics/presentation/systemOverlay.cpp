@@ -1076,9 +1076,11 @@ struct SystemOverlay::Impl {
 				ImGui::PushFont(hud_font, 46.0f * unit);
 				ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
 				ImGui::PopFont();
-				ImGui::PushFont(hud_font, 21.0f * unit);
-				ImGui::TextUnformatted(hud.detail.c_str());
-				ImGui::PopFont();
+				if (!hud.detail.empty()) {
+					ImGui::PushFont(hud_font, 21.0f * unit);
+					ImGui::TextUnformatted(hud.detail.c_str());
+					ImGui::PopFont();
+				}
 				DrawPerf(hud.perf, unit);
 			});
 		}
