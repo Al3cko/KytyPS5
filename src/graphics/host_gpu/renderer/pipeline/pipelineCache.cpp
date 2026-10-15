@@ -705,7 +705,10 @@ struct PipelineCache::ProgramCache {
 			// A PC with too little RAM to translate its recorded play at start-up (16 GB): the programs it needs while the
 			// game starts and loads are among the first recorded (1,138 translated on the render thread at the laptop's
 			// tutorial start, 13.8 s, 58% of them in the oldest tenth of the recording, all in it), and the biggest-first
-			// order reached them minutes later (20K programs on 4 threads).
+			// order reached them minutes later (20K programs on 4 threads). The newest are the place played last, where the
+			// save most likely is: oldest first, a 16 GB laptop walking 1-1 a minute after its HUD still translated 201
+			// programs itself (2.4 s, up to 121 ms each), 177 of them in the newest tenth of its 11,492 records. So the
+			// oldest and the newest alternately (RecordedRank, as the warmup's WarmOrder).
 			// The recording's records the static inputs lack (play since the last precompile, or a warmup that stopped at its
 			// budget before them: the inputs hold the seeds' guesses and the hints) are inputs too, each record once: those
 			// the warmup did not translate, also of its programs (their other specializations: TakePrefetchedModules).
@@ -731,7 +734,7 @@ struct PipelineCache::ProgramCache {
 					added++;
 				}
 				if (group.recorded == UINT32_MAX) {
-					group.recorded = i;
+					group.recorded = RecordedRank(i, static_cast<uint32_t>(recorded.size()));
 					ranked++;
 				}
 			}
@@ -764,6 +767,11 @@ struct PipelineCache::ProgramCache {
 	static uint32_t SpareThreads() {
 		const uint32_t cpus = std::max(1u, std::thread::hardware_concurrency());
 		return std::clamp(cpus > 12u ? cpus - 12u : 2u, 2u, std::max(2u, cpus / 2u));
+	}
+
+	// A recorded record's place in the prefetch's order: the oldest and the newest alternately (0, n-1, 1, n-2, ...).
+	static uint32_t RecordedRank(uint32_t index, uint32_t count) {
+		return index <= (count - 1) / 2 ? 2 * index : 2 * (count - 1 - index) + 1;
 	}
 
 	void PrefetchWork() {
