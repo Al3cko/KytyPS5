@@ -571,6 +571,7 @@ struct PipelineCache::ProgramCache {
 			uint64_t                                          source = 0; // SourceDigest
 			size_t                                            code_words = 0;
 			uint32_t                                          recorded = UINT32_MAX; // its first record in this PC's play
+			uint32_t                                          first_record = UINT32_MAX; // (by_record's index of it)
 			std::vector<uint32_t>                             records;
 			std::atomic<uint8_t>                              state {Pending};
 			std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
@@ -583,7 +584,11 @@ struct PipelineCache::ProgramCache {
 			std::shared_ptr<const ShaderRecompiler::IR::LinearSrtPlan>       plan_linear;
 		};
 		~Prefetch() {
-			stop.store(true, std::memory_order_relaxed);
+			{
+				std::lock_guard lock(follow_mutex);
+				stop.store(true, std::memory_order_relaxed);
+			}
+			follow_cv.notify_all();
 			if (loader.joinable()) loader.join();
 			for (auto& thread: threads) thread.join();
 			// (Stored modules read their SPIR-V from it: CreateModuleInPlace.)
@@ -598,6 +603,55 @@ struct PipelineCache::ProgramCache {
 		// The groups of recorded programs (the first ones) and how many workers go on after them (StartPrefetch).
 		size_t   recorded_groups = 0;
 		uint32_t gentle_threads  = 1;
+		// Following play (Follow, Followed): each record of this PC's recorded play's group, in recorded order (read-only
+		// once `ready`), and windows of records after programs the game met, translated before the rest (the newest
+		// window first). Play meets programs in about the order it recorded them: of the 157 programs a 16 GB laptop still
+		// translated itself in a boot and 1-1 walk (1.3 s; the oldest and newest alternately had not reached the middle
+		// of its 11,501 records), 84 were within 64 records of the 40 programs met before, often the very next record:
+		// runs of 9 and 10 met in one frame (~110 ms), which helper threads (FollowWork) translate beside the render
+		// thread. Not followed 120 and 157 (0.9 and 1.3 s), followed 74 (0.56 s), with the helpers 32 and 48 (0.24 and
+		// 0.27 s); the walk's fps alike (22.5-25 either way, run to run).
+		static constexpr uint32_t FollowWindow = 256, FollowWindows = 8;
+		struct Window {
+			uint32_t start = UINT32_MAX, next = UINT32_MAX;
+		};
+		std::vector<Group*>                by_record;
+		std::mutex                         follow_mutex;
+		std::condition_variable            follow_cv;
+		std::array<Window, FollowWindows>  windows {};
+		uint32_t                           newest     = 0; // windows[newest % FollowWindows]: the last one opened
+		uint64_t                           generation = 0; // windows opened
+		std::atomic<size_t>                followed {0};
+		// Any thread taking a program over: play met the program whose first record this is. (KYTY_SHADER_FOLLOW=0: not
+		// followed.)
+		void Follow(uint32_t record) {
+			static const bool off = [] {
+				const char* value = std::getenv("KYTY_SHADER_FOLLOW");
+				return value != nullptr && std::string_view(value) == "0";
+			}();
+			if (off || record >= by_record.size()) return;
+			{
+				std::lock_guard lock(follow_mutex);
+				for (const auto& window: windows)
+					if (window.start != UINT32_MAX && record - window.start < FollowWindow) return; // (followed already)
+				windows[++newest % FollowWindows] = {record, record + 1};
+				generation++;
+			}
+			follow_cv.notify_all();
+		}
+		// The next pending group of the windows, the newest first, or null (`seen`: the windows opened by then).
+		Group* Followed(uint64_t* seen = nullptr) {
+			std::lock_guard lock(follow_mutex);
+			if (seen != nullptr) *seen = generation;
+			for (uint32_t age = 0; age < FollowWindows; ++age) {
+				auto& window = windows[(newest - age) % FollowWindows];
+				while (window.start != UINT32_MAX && window.next - window.start < FollowWindow && window.next < by_record.size()) {
+					auto* group = by_record[window.next++];
+					if (group != nullptr && group->state.load(std::memory_order_relaxed) == Pending) return group;
+				}
+			}
+			return nullptr;
+		}
 		std::atomic<uint64_t>                                  spill_end {0};
 		std::atomic<uint64_t>                                  spirv_bytes {0}; // before compression
 		uint64_t                                               spill = 0;
@@ -719,6 +773,7 @@ struct PipelineCache::ProgramCache {
 			// budget before them: the inputs hold the seeds' guesses and the hints) are inputs too, each record once: those
 			// the warmup did not translate, also of its programs (their other specializations: TakePrefetchedModules).
 			uint32_t ranked = 0, added = 0;
+			p.by_record.resize(recorded.size());
 			for (uint32_t i = 0; i < recorded.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
 				LocalShaderWarmup::Record record;
 				LocalShaderWarmup::Reader reader {recorded[i]};
@@ -733,14 +788,16 @@ struct PipelineCache::ProgramCache {
 					group.code_words = record.code.size();
 					found->second    = &group;
 				}
-				auto& group = *found->second;
+				auto& group    = *found->second;
+				p.by_record[i] = &group;
 				if (std::ranges::none_of(group.records, [&](uint32_t index) { return p.inputs.records[index] == recorded[i]; })) {
 					group.records.push_back(static_cast<uint32_t>(p.inputs.records.size()));
 					p.inputs.records.push_back(std::move(recorded[i]));
 					added++;
 				}
 				if (group.recorded == UINT32_MAX) {
-					group.recorded = RecordedRank(i, static_cast<uint32_t>(recorded.size()));
+					group.recorded     = RecordedRank(i, static_cast<uint32_t>(recorded.size()));
+					group.first_record = i;
 					ranked++;
 				}
 			}
@@ -771,6 +828,11 @@ struct PipelineCache::ProgramCache {
 			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
 			p.ready.store(true, std::memory_order_release);
 			for (uint32_t t = 0; t < threads; ++t) p.threads.emplace_back([this, t] { PrefetchWork(t); });
+			// (KYTY_SHADER_FOLLOW_THREADS: that many helpers, 0 none.)
+			uint32_t helpers = p.by_record.empty() ? 0 : 2;
+			if (const char* value = std::getenv("KYTY_SHADER_FOLLOW_THREADS"); value != nullptr && *value != '\0')
+				helpers = std::min(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 16u);
+			for (uint32_t t = 0; t < helpers; ++t) p.threads.emplace_back([this] { FollowWork(); });
 		});
 	}
 
@@ -793,18 +855,16 @@ struct PipelineCache::ProgramCache {
 		LocalPlatform::SetThreadName("Kyty.Prefetch");
 		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 		auto& p = *prefetch;
-		for (size_t n; !p.stop.load(std::memory_order_relaxed) &&
-		               (worker < p.gentle_threads || p.next.load(std::memory_order_relaxed) < p.recorded_groups) &&
-		               (n = p.next.fetch_add(1, std::memory_order_relaxed)) < p.groups.size();) {
-			auto& group    = *p.groups[n];
-			auto  expected = static_cast<uint8_t>(Prefetch::Pending);
-			if (group.state.compare_exchange_strong(expected, Prefetch::Running, std::memory_order_acq_rel)) {
-				PrefetchTranslate(group);
-				AddGroupMemory(p, group);
-				SpillPlan(p, group);
-				group.state.store(Prefetch::Done, std::memory_order_release);
-				group.state.notify_all();
+		while (!p.stop.load(std::memory_order_relaxed)) {
+			// The recorded programs after those the game met first.
+			if (auto* group = p.Followed()) {
+				if (RunGroup(p, *group)) p.followed.fetch_add(1, std::memory_order_relaxed);
+				continue;
 			}
+			if (worker >= p.gentle_threads && p.next.load(std::memory_order_relaxed) >= p.recorded_groups) break;
+			const size_t n = p.next.fetch_add(1, std::memory_order_relaxed);
+			if (n >= p.groups.size()) break;
+			(void)RunGroup(p, *p.groups[n]);
 			if (p.finished.fetch_add(1, std::memory_order_relaxed) + 1 == p.groups.size()) {
 				PipelineCacheLog("Shader prefetch: all {} programs translated, {} MiB of SPIR-V ({} MiB compressed)",
 				                 p.groups.size(), p.spirv_bytes.load(std::memory_order_relaxed) >> 20u,
@@ -821,6 +881,36 @@ struct PipelineCache::ProgramCache {
 				                 p.spilled_plan_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_verify_failures.load(std::memory_order_relaxed));
 			}
+		}
+	}
+
+	// The group translated here unless another thread took it.
+	bool RunGroup(Prefetch& p, Prefetch::Group& group) {
+		auto expected = static_cast<uint8_t>(Prefetch::Pending);
+		if (!group.state.compare_exchange_strong(expected, Prefetch::Running, std::memory_order_acq_rel)) return false;
+		PrefetchTranslate(group);
+		AddGroupMemory(p, group);
+		SpillPlan(p, group);
+		group.state.store(Prefetch::Done, std::memory_order_release);
+		group.state.notify_all();
+		return true;
+	}
+
+	// A helper of the prefetch: idle but for the windows of programs play just met (Follow), which it translates beside
+	// the workers (each busy with a program of its own, up to ~100 ms) and the render thread meeting them.
+	void FollowWork() {
+		LocalPlatform::SetThreadName("Kyty.Follow");
+		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+		auto& p = *prefetch;
+		while (!p.stop.load(std::memory_order_relaxed) && p.finished.load(std::memory_order_relaxed) < p.groups.size()) {
+			uint64_t seen = 0;
+			if (auto* group = p.Followed(&seen)) {
+				if (RunGroup(p, *group)) p.followed.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			std::unique_lock lock(p.follow_mutex);
+			p.follow_cv.wait_for(lock, std::chrono::milliseconds(250),
+			                     [&] { return p.stop.load(std::memory_order_relaxed) || p.generation != seen; });
 		}
 	}
 
@@ -939,7 +1029,8 @@ struct PipelineCache::ProgramCache {
 		const auto found = prefetch->index.find(lookup_key);
 		if (found == prefetch->index.end()) return nullptr;
 		auto& group = *found->second;
-		auto  state = group.state.load(std::memory_order_acquire);
+		prefetch->Follow(group.first_record);
+		auto state = group.state.load(std::memory_order_acquire);
 		if (state == Prefetch::Pending &&
 		    group.state.compare_exchange_strong(state, Prefetch::Taken, std::memory_order_acq_rel)) {
 			prefetch->claimed++;
@@ -1981,9 +2072,9 @@ void PipelineCache::ReportSession() {
 	if (const auto& prefetch = m_program_cache->prefetch; prefetch != nullptr && prefetch->ready.load(std::memory_order_acquire)) {
 		PipelineCacheLog("Shader prefetch: {} plans loaded back from the temporary file in {:.1f} ms (at most {:.2f} ms)",
 		                 prefetch->plans_loaded, prefetch->plan_load_ms, prefetch->plan_load_max_ms);
-		PipelineCacheLog("Shader prefetch: {} of {} programs translated; the game took over {} of them ({} modules) "
-		                 "and translated {} itself",
-		                 prefetch->finished.load(), prefetch->groups.size(), prefetch->adopted,
+		PipelineCacheLog("Shader prefetch: {} of {} programs translated ({} of them following play); the game took over {} "
+		                 "of them ({} modules) and translated {} itself",
+		                 prefetch->finished.load(), prefetch->groups.size(), prefetch->followed.load(), prefetch->adopted,
 		                 prefetch->adopted_modules, prefetch->claimed);
 	}
 	PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
@@ -2033,7 +2124,7 @@ void PipelineCache::ReportObjects(uint64_t id) const {
 	std::printf("LIVE_PIPELINE_OBJECTS id=%llu graphics_pipelines=%zu compute_pipelines=%zu pending_graphics=%zu pending_compute=%zu "
 	            "replaced_unoptimized=%zu optimizing=%zu programs=%zu jit_bytes=%zu stored_modules=%llu stored_spirv_mib=%llu "
 	            "store_file_mib=%llu store_loads=%llu store_load_misses=%llu plans_out=%zu plan_reloads=%llu prefetch_adopted=%zu "
-	            "prefetch_claimed=%zu prefetch_taken=%zu prefetch_take_early=%zu prefetch_finished=%zu render_translations=%llu "
+	            "prefetch_claimed=%zu prefetch_taken=%zu prefetch_take_early=%zu prefetch_finished=%zu prefetch_followed=%zu render_translations=%llu "
 	            "render_translate_ms=%.0f render_pipelines=%llu render_pipeline_ms=%.0f warmup_phase=%u\n",
 	            static_cast<unsigned long long>(id), m_graphics_pipelines.size(), m_compute_pipelines.size(), m_pending_graphics_pipelines.size(),
 	            m_pending_compute_pipelines.size(), m_replaced_pipelines.size(), m_optimizing.size(),
@@ -2043,7 +2134,7 @@ void PipelineCache::ReportObjects(uint64_t id) const {
 	            m_program_cache->plans_out, static_cast<unsigned long long>(m_program_cache->plan_reloads),
 	            prefetch ? prefetch->adopted : size_t {0}, prefetch ? prefetch->claimed : size_t {0},
 	            prefetch ? prefetch->taken : size_t {0}, prefetch ? prefetch->take_early : size_t {0},
-	            prefetch ? prefetch->finished.load() : size_t {0},
+	            prefetch ? prefetch->finished.load() : size_t {0}, prefetch ? prefetch->followed.load() : size_t {0},
 	            static_cast<unsigned long long>(m_program_cache->render_translations), m_program_cache->render_translate_ms,
 	            static_cast<unsigned long long>(m_render_pipelines), m_render_pipeline_ms,
 	            m_program_cache->warm_phase.load(std::memory_order_relaxed));
