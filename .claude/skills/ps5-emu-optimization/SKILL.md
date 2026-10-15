@@ -75,7 +75,8 @@ scripts and file names below live there).
 3. **Memory coherence tax**: page protection (every downgrade IPIs all cores running the process), ring copies of
    guest-written constants (~10 MB/frame), uploads, readbacks the game waits on.
 4. **Stutter**: first-use translation/pipelines (precompile + recorded warmup), texture streaming bursts, guest
-   partial unmaps (whole Windows view unmapped and remapped, 0.3-0.6 ms each on the game's submit thread).
+   partial unmaps (a Windows view cannot be split: unmapping it whole and mapping the rest again cost up to 29 ms a
+   call on the game's threads; now parked in the view instead, general.md).
 5. **Long play**: the game cuts its direct memory finer every level load (mappings 9K -> 50K over 24 loads); every
    per-mapping structure must be O(1) or epoch-cached, or later worlds get slower.
 

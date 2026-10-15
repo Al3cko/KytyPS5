@@ -40,6 +40,8 @@
 - **Ceiling first**: unsafe skip, measure. Re-run ceilings when the bottleneck moves (barrier skip +0.3% one week,
   +11.5% two weeks later). A ceiling is invalid if its precondition did not hold (an epoch that moved every frame,
   broken depth letting culling pass +40% draws, a "+19%" that was missing geometry).
+- **Log what follows the event before deferring work**: a temporary log of each partial unmap and of the maps after it
+  showed the game maps over <1% of freed ranges within 1 s (96%: after 10 s or never), so doing the work lazily pays.
 - **Count the opportunity**: one temporary counter before building (bytes a trimming could save, draws a fast path
   could take). Several ideas died in minutes this way.
 - **Simulate from traces before an architecture change**, but sims ignore commit/prep costs: a "-5.7 ms" parallel
