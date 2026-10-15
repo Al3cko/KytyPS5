@@ -1025,9 +1025,27 @@ bool PipelineCache::StaticInputsCurrent(GraphicContext& graphics, const std::fil
 	const auto      written = std::filesystem::last_write_time(path, error);
 	if (error) return false;
 	const auto seeded = std::filesystem::last_write_time(seeds, error);
-	return !error && written >= seeded &&
-	       LocalShaderWarmup::Cache::FileIdentity(path) ==
-	           "KytyShaderWarmup3:" + PipelineCacheTitleId() + ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties());
+	if (error || written < seeded ||
+	    LocalShaderWarmup::Cache::FileIdentity(path) !=
+	        "KytyShaderWarmup3:" + PipelineCacheTitleId() + ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties()))
+		return false;
+	// A wave64 GPU's inputs made before 1ad4dccb hold no compute record (their static keys had the seeds' subgroup
+	// size): fewer records than the seed file (1.07: 11,676 for its 20,141, else 28,742), so they are made again.
+	if (graphics.SupportsComputeWave64()) {
+		// (The record count: the first word after the identity line and the checksum.)
+		const auto records = [](const std::filesystem::path& file) -> uint64_t {
+			std::ifstream stream(file, std::ios::binary);
+			std::string   identity;
+			uint64_t      checksum = 0;
+			uint32_t      count    = 0;
+			if (!std::getline(stream, identity) || !stream.read(reinterpret_cast<char*>(&checksum), sizeof(checksum)) ||
+			    !stream.read(reinterpret_cast<char*>(&count), sizeof(count)))
+				return 0;
+			return count;
+		};
+		if (records(path) < records(seeds)) return false;
+	}
+	return true;
 }
 
 // The store and its shards' files (or only the shards': prune), into a new store; the shard files are
