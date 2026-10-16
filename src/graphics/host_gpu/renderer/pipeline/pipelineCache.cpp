@@ -727,17 +727,35 @@ struct PipelineCache::ProgramCache {
 
 	// Loads the inputs on a thread of its own, leaves out the programs the warmup holds (`warm`), and
 	// starts the translation: first the programs of this PC's recorded play (`recorded`, the warmup's records when it
-	// translated none) in the order they were first met, then the rest, the biggest first.
+	// translated none) in the order they were first met, then the rest, the biggest first. A PC without recorded play
+	// (`recorded` and `warm` empty: a new install) takes the release's instead (`released`, a recorded seed file; its
+	// compute records made for `host_subgroup_size`).
 	void StartPrefetch(std::filesystem::path path, std::string identity, std::vector<ProgramKey> warm,
-	                   std::vector<std::vector<uint32_t>> recorded) {
+	                   std::vector<std::vector<uint32_t>> recorded, std::filesystem::path released,
+	                   uint32_t host_subgroup_size) {
 		prefetch = std::make_unique<Prefetch>();
 		prefetch_live.store(prefetch.get(), std::memory_order_release);
 		prefetch->loader = std::thread([this, path = std::move(path), identity = std::move(identity),
-		                                warm = std::move(warm), recorded = std::move(recorded)]() mutable {
+		                                warm = std::move(warm), recorded = std::move(recorded),
+		                                released = std::move(released), host_subgroup_size]() mutable {
 			LocalPlatform::SetThreadName("Kyty.Prefetch");
 			LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 			auto&      p     = *prefetch;
 			const auto begin = std::chrono::steady_clock::now();
+			// The release's recorded play (other PCs' tours of every world and players' play: the release's
+			// specialization hints, which precompile-windows.ps1 completes with this PC's seed file). A new install's prefetch
+			// went biggest first and had not reached the level's programs when the game got there: entering 1-1, the render
+			// thread translated ~490 programs (~1.1 s: a first frame of 1.1-1.2 s, 16-18 slow frames). Taken over now as
+			// from a recording of its own: a first frame of 0.4 s, 9 slow frames, none translated there.
+			bool from_release = false;
+			if (recorded.empty() && warm.empty() && !released.empty()) {
+				std::vector<std::vector<uint32_t>> pipelines;
+				from_release = LocalShaderWarmup::Cache::ReadInputs(released, recorded, pipelines) && !recorded.empty();
+				PipelineCacheLog("Shader prefetch: no recorded play on this PC: the release's {} {} ({} records)",
+				                 from_release ? "from" : "could not be read from", Common::PathToString(released),
+				                 recorded.size());
+				if (!from_release) recorded.clear();
+			}
 			if (!std::filesystem::exists(path) || !p.inputs.Open(path, identity) || p.inputs.records.empty()) {
 				PipelineCacheLog("Shader prefetch: no inputs for this GPU and driver in {} (precompile-windows.ps1 "
 				                 "writes them){}", Common::PathToString(path), recorded.empty() ? "" : ": the recording's only");
@@ -778,6 +796,17 @@ struct PipelineCache::ProgramCache {
 				LocalShaderWarmup::Record record;
 				LocalShaderWarmup::Reader reader {recorded[i]};
 				if (!LocalShaderWarmup::Visit(reader, record) || !LocalShaderWarmup::ValidKey(record)) continue;
+				// The release's compute records hold one subgroup size for every GPU (the hints' default): this GPU's, as
+				// the precompile takes them, else none of their programs is the one a dispatch looks up (on NVIDIA 9,974
+				// of the release's 17,809 programs).
+				if (from_release && record.stage == ShaderType::Compute &&
+				    record.compute.host_subgroup_size != host_subgroup_size) {
+					record.compute.host_subgroup_size = host_subgroup_size;
+					BuildStageStaticKey(record.compute, record.static_key);
+					LocalShaderWarmup::Writer writer;
+					(void)LocalShaderWarmup::Visit(writer, record);
+					recorded[i] = std::move(writer.words);
+				}
 				ProgramKey key {record.stage, record.hash, record.user_data_count,
 				                static_cast<uint32_t>(record.code.size()), record.static_key};
 				auto [found, inserted] = p.index.try_emplace(key, nullptr);
@@ -796,7 +825,8 @@ struct PipelineCache::ProgramCache {
 					added++;
 				}
 				if (group.recorded == UINT32_MAX) {
-					group.recorded     = RecordedRank(i, static_cast<uint32_t>(recorded.size()));
+					// (The release's in its own order: its newest records are no place this PC played last.)
+					group.recorded     = from_release ? i : RecordedRank(i, static_cast<uint32_t>(recorded.size()));
 					group.first_record = i;
 					ranked++;
 				}
@@ -819,9 +849,12 @@ struct PipelineCache::ProgramCache {
 			p.gentle_threads = std::max(1u, threads / 2);
 			if (const char* value = std::getenv("KYTY_SHADER_PREFETCH_THREADS"); value != nullptr && *value != '\0')
 				p.gentle_threads = threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
-			p.recorded_groups = static_cast<size_t>(std::ranges::count_if(p.groups, [](const auto& group) {
-				return group->recorded != UINT32_MAX;
-			}));
+			// (The release's play orders the work alone: it names most of the game's programs, translated on the gentle
+			// threads as without it.)
+			p.recorded_groups = from_release ? 0
+			                                 : static_cast<size_t>(std::ranges::count_if(p.groups, [](const auto& group) {
+				                                   return group->recorded != UINT32_MAX;
+			                                   }));
 			PipelineCacheLog("Shader prefetch: {} programs ({} inputs, {} of them recorded play's; {} recorded first) to "
 			                 "translate on {} threads ({} after the recorded ones), loaded in {} ms",
 			                 p.groups.size(), p.inputs.records.size(), added, ranked, threads, p.gentle_threads,
@@ -2320,9 +2353,24 @@ void PipelineCache::StartShaderPrefetch(std::vector<std::vector<uint32_t>> recor
 	    PipelineCacheTitleId().empty())
 		return;
 	auto identity = PipelineCacheTitleId() + ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties());
+	// The release's recorded play for a PC without its own (KYTY_PREFETCH_RELEASE=0: not): next to the seed file
+	// precompile-windows.ps1 used, released-<title>_<version>.seeds (the package's folder, or _Build\static-precompile in a
+	// source tree).
+	std::filesystem::path released;
+	if (const char* value = std::getenv("KYTY_PREFETCH_RELEASE"); value == nullptr || std::string_view(value) != "0") {
+		const auto      name = "released-" + PipelineCacheGameId() + ".seeds";
+		std::error_code error;
+		for (const auto& candidate: {std::filesystem::path(name), std::filesystem::path("_Build") / "static-precompile" / name}) {
+			if (std::filesystem::is_regular_file(candidate, error)) {
+				released = candidate;
+				break;
+			}
+		}
+	}
 	Common::LockGuard lock(m_mutex);
 	m_program_cache->StartPrefetch(StaticInputsPath(), std::move(identity), std::move(m_program_cache->warm_keys),
-	                               std::move(recorded_inputs));
+	                               std::move(recorded_inputs), std::move(released),
+	                               m_graphics.SupportsComputeWave64() ? 64u : 32u);
 }
 
 PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
