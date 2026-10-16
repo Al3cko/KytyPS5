@@ -2690,8 +2690,15 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size) && (spec == nullptr || !spec->current_set.Contains(vaddr, size));
 }
 
-// Per flip, whatever the memory use: the buffers no binding used for StaleTicks flips go (at most MaxRetirements a flip;
-// 600 flips also retired what a turned camera left behind for ten seconds: re-registered when seen again at Latria).
+// Per flip, whatever the memory use: the CPU-written buffers no binding used for StaleTime go (at most MaxRetirements a
+// flip); with the video memory in use at the critical level or over it, after PressureTime and up to PressureRetirements
+// (only then: ten seconds also retire what a turned camera left behind, re-registered when seen again at Latria).
+// Idleness is counted in time, not flips: the 1800 flips it was are 2 minutes at an 8 GB laptop's 14 fps, where
+// a 5-minute 1-1 tour left 0.5 GB of such buffers idle while the video memory in use went past the budget (8.0 GB of
+// 7.25). Same exe, the 1800-flip rule against this, twice each: 14.8/17.3 -> 23.5/23.9 fps, render 45 -> 38.6 ms, frames
+// over 100 ms 137/137 -> 25/21, region syncs 3650 -> 1900 a frame, buffers 2.9 -> 2.1 GB, bda_fault_pages 3.3/4.6 ->
+// 3.0/2.0. At high frame rates the StaleTicks flips can come first. Never one used in the last MinTicks flips (a long
+// frame is no idle time). The video memory in use is read every 30 flips.
 // The collector below waits for a frame without BDA shaders, which this game never has, so every buffer it ever
 // registered stayed; those inside the BDA shaders' unbounded read windows had their CPU-written pages uploaded and
 // write-protected again at every BDA preparation (the game reuses that memory every frame). At 1-1, three rounds of the
@@ -2700,20 +2707,47 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 // collector's) and buffers BDA shaders read with no buffer registered (Buffer::bda_read: those reads touch no LRU
 // entry, and one after the buffer went would read zeros once) - none faulted back over that route (bda_fault_pages ~0).
 void BufferCache::RetireStaleBuffers(uint64_t tick) {
-	constexpr uint64_t StaleTicks     = 1800;
-	constexpr size_t   MaxRetirements = 64;
-	if (tick <= StaleTicks) return;
+	constexpr auto     StaleTime           = std::chrono::seconds(30);
+	constexpr auto     PressureTime        = std::chrono::seconds(10);
+	constexpr size_t   MaxRetirements      = 64;
+	constexpr size_t   PressureRetirements = 256;
+	constexpr uint64_t MinTicks            = 120;
+	constexpr uint64_t StaleTicks          = 1800;
+	const auto         now                 = std::chrono::steady_clock::now();
+	m_tick_times[tick % m_tick_times.size()] = now.time_since_epoch().count();
+	if (tick % 30 == 0) {
+		uint64_t video = 0, budget = 0;
+		m_retire_pressure = m_graphics.QueryLocalVideoMemory(&video, &budget) && video >= m_critical_gc_memory;
+	}
+	if (tick <= MinTicks) return;
+	const bool pressure = m_retire_pressure;
+	const auto horizon  = (now - (pressure ? PressureTime : StaleTime)).time_since_epoch().count();
+	// The newest tick that began by the horizon among the ticks the ring holds (their times only grow); when even the
+	// oldest held began after it, the ticks older than the ring.
+	uint64_t first = tick - std::min<uint64_t>(tick, m_tick_times.size() - 1), last = tick;
+	if (m_tick_times[first % m_tick_times.size()] > horizon) {
+		last = first;
+	} else {
+		while (first < last) {
+			const uint64_t middle = first + (last - first + 1) / 2;
+			if (m_tick_times[middle % m_tick_times.size()] <= horizon) first = middle;
+			else last = middle - 1;
+		}
+	}
+	// (Never later than the StaleTicks rule it replaced: at 120 fps, 1800 flips are 15 s.)
+	const uint64_t below = std::min(std::max(last, tick > StaleTicks ? tick - StaleTicks : 0), tick - MinTicks);
+	const size_t   limit = pressure ? PressureRetirements : MaxRetirements;
 	thread_local std::vector<BufferId> stale, kept;
 	stale.clear();
 	kept.clear();
-	m_lru_cache.ForEachItemBelow(tick - StaleTicks, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(below, [&](BufferId id) {
 		const auto& buffer = m_slot_buffers[id];
 		if (buffer.is_deleted) return false;
 		if (buffer.bda_read || m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()))
 			kept.push_back(id);
 		else
 			stale.push_back(id);
-		return stale.size() == MaxRetirements;
+		return stale.size() == limit;
 	});
 	// (The ones passed over go to the back of the list: the next flips' walks do not cross them again.)
 	for (const auto id: kept) TouchBuffer(m_slot_buffers[id]);
