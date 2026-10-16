@@ -1031,6 +1031,12 @@ bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::file
 		if (error) return false;
 		const auto seeded = std::filesystem::last_write_time(seeds, error);
 		if (error || written < seeded) return false;
+		// Older than the release's hints too (run from the package's folder): a package with new hints, or a precompile
+		// that compiled the seeds alone (v20261016 on a PC without recorded play, issue #28), compiles what they add.
+		const auto hints  = std::filesystem::path("tools") / "local" / "static-precompile" /
+		                    ("hints-" + PipelineCacheGameId() + ".hints");
+		const auto hinted = std::filesystem::last_write_time(hints, error);
+		if (!error && written < hinted) return false;
 	}
 	if (graphics.pipeline_binaries_enabled) {
 		return PipelineBinaries::Open(graphics.device, StaticBinariesPath(), StaticBinariesSignature(graphics)) != nullptr;

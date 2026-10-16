@@ -173,7 +173,10 @@ if ($Recorded -eq '*') {
 		if ($LASTEXITCODE) { Write-Host 'the release''s specialization hints could not be applied (kyty_shader_precompile --apply-hints)' }
 		else { $sources += $released }
 	}
-	$sources += @(Get-ChildItem "$PSScriptRoot\_PipelineCache\warmup-v2\*\$gameId.shaders" -File -ErrorAction SilentlyContinue).FullName
+	# Through the pipeline: `@(...).FullName` of no recording is $null, a source that made --make-hints fail, and then
+	# a PC without recorded play (a new install) compiled the seeds alone, none of the release's hints (issue #28).
+	$sources += @(Get-ChildItem "$PSScriptRoot\_PipelineCache\warmup-v2\*\$gameId.shaders" -File -ErrorAction SilentlyContinue |
+		ForEach-Object { $_.FullName })
 	$manual = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds"
 	if (Test-Path $manual) { $sources += $manual }
 	if ($sources.Count -eq 1 -and $sources[0] -eq $released) {
@@ -248,6 +251,7 @@ function Wait-Precompile($process, [string]$what) {
 }
 
 Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time, affinity 0x$('{0:X}' -f $mask); logs $logName"
+Write-Host "recorded:   $(if ($Recorded) { "$Recorded (the release's hints and this PC's recorded play)" } else { 'none: the seeds alone' })"
 try {
 if ($Coverage) {
 	$out = [IO.Path]::ChangeExtension($Seeds, '.compiled.shaders')
