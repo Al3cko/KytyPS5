@@ -15,7 +15,9 @@ $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160', '2560x1080', '
 $renderHeights = '1440 (PS5)', '1296', '1152', '1080', '900'
 # The aspect ratio of Demon's Souls' 3D (run-windows.ps1 -Aspect): wider sees more to the sides.
 $ratios = '16:9 (PS5)', '21:9', '32:9'
-# Demon's Souls' own settings for what a frame draws (run-windows.ps1 -Quality): simpler shadows and distant detail.
+# Demon's Souls' own settings for what a frame draws (run-windows.ps1 -Quality): simpler shadows and distant detail;
+# and smaller textures (run-windows.ps1 -TextureReduce: Low 1, Lowest 2; Standard leaves it to the emulator: 1 below
+# 12 GB of video memory, else 0).
 $qualities = 'Standard (PS5)', 'Low', 'Lowest'
 # DLSS frame generation (run-windows.ps1 -FrameGen: the generated frames per rendered one, the multiplier less one).
 $frameGens = 'Off', '2x', '3x', '4x', '5x', '6x'
@@ -110,7 +112,9 @@ function Get-PlayCommand {
 	if ($settings.hdr) { $arguments += '-Hdr' }
 	if ([int]$settings.render -gt 0 -and [int]$settings.render -ne 1440) { $arguments += @('-RenderHeight', [int]$settings.render) }
 	if ($settings.ratio -in '21:9', '32:9') { $arguments += @('-Aspect', $settings.ratio) }
-	if ($settings.quality -in 'low', 'lowest') { $arguments += @('-Quality', $settings.quality) }
+	if ($settings.quality -in 'low', 'lowest') {
+		$arguments += @('-Quality', $settings.quality, '-TextureReduce', $(if ($settings.quality -eq 'lowest') { 2 } else { 1 }))
+	}
 	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) {
 		$arguments += @('-FrameGen', ([int]$settings.framegen - 1), '-StreamlineDir', "`"$streamline`"")
 	}
@@ -241,7 +245,9 @@ $quality = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle =
 $quality.Items.AddRange($qualities)
 $quality.SelectedItem = ($qualities | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.quality } | Select-Object -First 1)
 if ($quality.SelectedIndex -lt 0) { $quality.SelectedIndex = 0 }
-$qualityNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'simpler shadows and distant detail; faster where the CPU limits'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+$qualityNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'simpler shadows and detail, smaller textures; faster on weaker PCs'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+$qualityTips = New-Object System.Windows.Forms.ToolTip
+$qualityTips.SetToolTip($quality, "Standard: the PS5's picture. With less than 12 GB of video memory, large textures leave out their largest level`n(half the size per side) so that they fit.`nLow: simpler shadows and distant detail, textures half the size per side.`nLowest: simpler still, textures a quarter the size per side.")
 Add-Row 'Graphics' @($quality, $qualityNote)
 $frameGen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160; Enabled = $frameGenAvailable }
 $frameGen.Items.AddRange($frameGens)
