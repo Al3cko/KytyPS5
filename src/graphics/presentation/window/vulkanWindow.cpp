@@ -613,6 +613,16 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	            device_properties.vendorID, id);
 	std::fflush(stdout);
 
+	graphics.fragment_wave64_requirable =
+	    features13.subgroupSizeControl == VK_TRUE &&
+	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eFragment) &&
+	    subgroup_size_control.minSubgroupSize <= 64 && subgroup_size_control.maxSubgroupSize >= 64;
+	// (Each GPU's subgroup sizes in the log: which stages a pipeline can require one for, e.g. AMD's pixel shaders.)
+	std::printf("Vulkan subgroups: %u lanes by default, %u-%u, required sizes for stages 0x%x\n", graphics.subgroup_size,
+	            graphics.min_subgroup_size, graphics.max_subgroup_size,
+	            static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages));
+	std::fflush(stdout);
+
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),

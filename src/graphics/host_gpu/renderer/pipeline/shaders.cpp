@@ -807,6 +807,27 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	return create(nullptr, info);
 }
 
+// KYTY_PS_WAVE64=1 (a test for issue #24: AMD's 26.9.2 driver runs pixel shaders on 32-lane subgroups, 26.9.1 on 64, and
+// the mosaics on see-through effects came back with it): pixel shaders on 64-lane subgroups, where the GPU lets a
+// pipeline require that; the log says which.
+static bool PixelWave64Required(const GraphicContext& graphics) {
+	static const bool required = [&] {
+		const char* value = std::getenv("KYTY_PS_WAVE64");
+		if (value == nullptr || std::string_view(value) != "1") return false;
+		if (graphics.fragment_wave64_requirable) {
+			std::printf("Pixel shaders: 64-lane subgroups required (KYTY_PS_WAVE64=1)\n");
+		} else {
+			std::printf("KYTY_PS_WAVE64=1: this GPU lets no pipeline require a pixel shader subgroup size (sizes %u-%u, "
+			            "required sizes for stages 0x%x)\n",
+			            graphics.min_subgroup_size, graphics.max_subgroup_size,
+			            static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages));
+		}
+		std::fflush(stdout);
+		return graphics.fragment_wave64_requirable;
+	}();
+	return required;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
@@ -870,6 +891,11 @@ void CreatePipelineInternal(
 	frag_shader_stage_info.stage  = vk::ShaderStageFlagBits::eFragment;
 	frag_shader_stage_info.module = pixel_program.module;
 	frag_shader_stage_info.pName  = "main";
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo frag_subgroup_size {};
+	if (PixelWave64Required(graphics)) {
+		frag_subgroup_size.requiredSubgroupSize = 64;
+		frag_shader_stage_info.pNext            = &frag_subgroup_size;
+	}
 
 	vk::PipelineShaderStageCreateInfo tess_control_shader_stage_info {};
 	tess_control_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationControl;
