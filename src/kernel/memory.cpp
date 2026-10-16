@@ -3,6 +3,7 @@
 #include "live-counters.h"
 #include "live-trace.h"
 #include "time-census.h"
+#include "writeback-verify.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -1364,6 +1365,15 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* s
 	const auto index = g_write_back_count.fetch_add(1, std::memory_order_relaxed);
 	g_write_backs[index % WriteBackRecords] = {std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                          vaddr, size, source};
+	// (Diagnostic, KYTY_WRITEBACK_VERIFY: the GPU-owned pages checked before, hashed again after.)
+	struct Verify {
+		uint64_t vaddr, size;
+		bool     on;
+		~Verify() {
+			if (on) WritebackVerify::Rehash(vaddr, size);
+		}
+	} verify {vaddr, size, WritebackVerify::Enabled()};
+	if (verify.on) WritebackVerify::Check(vaddr, static_cast<const uint8_t*>(data), size, source);
 	if (TryWriteBacking(vaddr, data, size)) {
 		return;
 	}
