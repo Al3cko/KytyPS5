@@ -656,6 +656,37 @@ uint64_t ComputePipelineIdentity(uint64_t spirv, const ShaderComputeInputInfo& i
 	return XXH3_64bits(parts, sizeof(parts));
 }
 
+// What the game's pipelines got from a static store (ReportStaticStore): made of what it holds, not among them, held
+// but their binaries or cache not made again from the data, refused by the driver when made of them (the last result),
+// and pipelines it could not be asked for (no driver key; no identity).
+struct StoreOutcomes {
+	std::atomic<uint64_t> hits {0}, absent {0}, damaged {0}, refused {0}, unasked {0};
+	std::atomic<int32_t>  refusal {0};
+
+	void Count(std::atomic<uint64_t>& counter) { counter.fetch_add(1, std::memory_order_relaxed); }
+	void Refused(vk::Result result) {
+		Count(refused);
+		refusal.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+	}
+	void Report(const char* store, const char* data, const char* unasked_what) const {
+		const auto counts = std::array {hits.load(), absent.load(), damaged.load(), refused.load(), unasked.load()};
+		if (counts[0] + counts[1] + counts[2] + counts[3] + counts[4] == 0) return;
+		const auto last = counts[3] != 0 ? vk::to_string(static_cast<vk::Result>(refusal.load())) : std::string("none");
+		std::printf("Static pipeline %s: %llu pipelines made of them, %llu not among them, %llu whose %s the driver did "
+		            "not make again, %llu it refused to make of them (last: %s), %llu %s\n",
+		            store, static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+		            static_cast<unsigned long long>(counts[2]), data, static_cast<unsigned long long>(counts[3]),
+		            last.c_str(), static_cast<unsigned long long>(counts[4]), unasked_what);
+	}
+};
+static StoreOutcomes g_binary_outcomes, g_blob_outcomes;
+
+void ReportStaticStore() {
+	g_binary_outcomes.Report("binaries", "binaries", "without a driver key");
+	g_blob_outcomes.Report("blobs", "pipeline cache", "without an identity");
+	std::fflush(stdout);
+}
+
 // (KYTY_PIPELINE_SOURCE_LOG) Whether the static cache or store gave this thread's last pipeline, and for a pipeline
 // cache blob: its size and the microseconds of its read, of the cache made of it and of the pipeline's creation.
 static thread_local bool t_static_hit = false;
@@ -725,15 +756,22 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				auto with              = info;
 				from.pNext             = with.pNext;
 				with.pNext             = &from;
-				if (create(nullptr, with) == vk::Result::eSuccess) {
+				const auto result      = create(nullptr, with);
+				if (result == vk::Result::eSuccess) {
 					if (writer != nullptr) writer->Copy(key, *store);
+					if (writer == nullptr) g_binary_outcomes.Count(g_binary_outcomes.hits);
 					t_static_hit = true;
 					return vk::Result::eSuccess;
 				}
 				pipeline.pipeline = nullptr;
+				if (writer == nullptr) g_binary_outcomes.Refused(result);
+			} else if (writer == nullptr) {
+				g_binary_outcomes.Count(store->Holds(key) ? g_binary_outcomes.damaged : g_binary_outcomes.absent);
 			}
 			if (writer == nullptr && PipelineKeyLog()) LogPipelineKey("miss", key, original);
 			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
+		} else if (writer == nullptr) {
+			g_binary_outcomes.Count(g_binary_outcomes.unasked);
 		}
 	}
 	// Without pipeline binaries, its own cache data by its identity: a cache made of it gives the pipeline without
@@ -741,6 +779,10 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	// one it lacks into a cache of its own, whose data it keeps.
 	const auto* blobs       = graphics.pipeline_blobs;
 	auto*       blob_writer = graphics.pipeline_blob_writer;
+	if (build != PipelineBuild::Optimize && identity == 0 && blobs != nullptr && blob_writer == nullptr &&
+	    graphics.pipeline_cache_control_enabled) {
+		g_blob_outcomes.Count(g_blob_outcomes.unasked);
+	}
 	if (build != PipelineBuild::Optimize && identity != 0 && (blobs != nullptr || blob_writer != nullptr) &&
 	    graphics.pipeline_cache_control_enabled) {
 		std::vector<uint8_t> data;
@@ -764,11 +806,17 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				graphics.device.destroyPipelineCache(cache, nullptr);
 				if (result == vk::Result::eSuccess) {
 					if (blob_writer != nullptr) blob_writer->Copy(identity, *blobs);
+					if (blob_writer == nullptr) g_blob_outcomes.Count(g_blob_outcomes.hits);
 					t_static_hit = true;
 					return result;
 				}
 				pipeline.pipeline = nullptr;
+				if (blob_writer == nullptr) g_blob_outcomes.Refused(result);
+			} else if (blob_writer == nullptr) {
+				g_blob_outcomes.Count(g_blob_outcomes.damaged);
 			}
+		} else if (blobs != nullptr && blob_writer == nullptr) {
+			g_blob_outcomes.Count(blobs->Holds(identity) ? g_blob_outcomes.damaged : g_blob_outcomes.absent);
 		}
 		if (blob_writer != nullptr) {
 			// A static pipeline cache from before the blobs (a conversion, KYTY_STATIC_BLOBS_FROM_CACHE): its hit gives the

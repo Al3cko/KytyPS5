@@ -2259,6 +2259,7 @@ void PipelineCache::ReportSession() {
 	PipelineCacheLog("Made where first needed: {} programs translated ({:.0f} ms), {} pipelines ({:.0f} ms)",
 	                 m_program_cache->render_translations, m_program_cache->render_translate_ms, m_render_pipelines,
 	                 m_render_pipeline_ms);
+	ReportStaticStore();
 }
 
 void PipelineCache::StopWarmup() {

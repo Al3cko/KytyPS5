@@ -488,6 +488,9 @@ void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime);
 // KYTY_PIPELINE_KEY_LOG (diagnostic): a PIPEKEY line with the driver key of each pipeline the static store did not
 // hold (the precompile: of each it makes) and its modules' shader and SPIR-V hashes.
 bool PipelineKeyLog();
+// The session's line of what the game's pipelines got from the static store, its binaries or blobs (shaders.cpp): made
+// of what it holds, not among them, refused by the driver.
+void ReportStaticStore();
 void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes = 0);
 // (KYTY_INLINE_KEY_CHECK) Each module's SPIR-V kept, so that every pipeline key is compared with the key of the same
 // pipeline given its shaders' SPIR-V inline (VK_KHR_maintenance5): what a store keyed by the first needs of the second.
