@@ -569,27 +569,64 @@ static bool TexturePrefixEnabled(bool small_video_memory) {
 	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
 }
 
+// KYTY_TEXTURE_REDUCE=0|1|2 (default: 1 with less than 12 GiB of video memory, else 0): a sampled 2D block-compressed
+// texture of at least 1024 texels on a side is held without its 1 or 2 largest levels, as a T# from that level would be
+// (TextureFromLevel): its kept levels are the first bytes of its memory, so the left-out ones take no video memory and
+// are not uploaded when the game writes them. One level left out is a quarter of the texture: at 1-1 its BC textures
+// took 3.7 GiB (0.9 reduced), on cards whose budget held about 10 of the 11 GB the level wanted. Shaders sample the
+// smaller texture (half the texels across); size queries, explicit levels and texel loads see it too (a little blur).
+static uint32_t TextureReduceLevels(bool small_video_memory) {
+	static const uint32_t levels = [&] {
+		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
+		const uint32_t chosen = value != nullptr && value[0] != '\0'
+		                            ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2))
+		                            : (small_video_memory ? 1u : 0u);
+		if (chosen != 0) {
+			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
+			            "(KYTY_TEXTURE_REDUCE=0 keeps them whole)\n",
+			            chosen);
+			std::fflush(stdout);
+		}
+		return chosen;
+	}();
+	return levels;
+}
+
 static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
 	const auto  base = desc.view_info.base_level;
+	const auto  last = base + desc.view_info.level_count - 1u;
 	const auto& full = desc.info;
-	if (base == 0 || !TexturePrefixEnabled(small_video_memory) || full.resources.layers != 1 || full.samples != 1 ||
-	    full.type != Prospero::ImageType::kColor2D || full.IsVolume() || full.IsDepth() || full.HasMetadata() ||
-	    full.HasStencil() || full.tile_mode == Prospero::TileMode::kLinear ||
+	// The levels left out of a large BC texture (none where the view reads only those, nor of one the GPU wrote: the
+	// character creator compresses faces on the GPU through texel views of the same memory, which must stay whole).
+	const auto reduce = TextureReduceLevels(small_video_memory);
+	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= 1024u &&
+	                          full.resources.levels > reduce && last >= reduce &&
+	                          !cache.IsRegionGpuModified(full.data.address, full.data.size) &&
+	                          !cache.HasGpuWrittenImageOverlap(full.data.address, full.data.size)
+	                        ? reduce
+	                        : 0u;
+	// The first level held: the T#'s base, or past the levels left out.
+	const auto first_held = std::max(base, drop);
+	if (first_held == 0 || (drop == 0 && !TexturePrefixEnabled(small_video_memory)) || full.resources.layers != 1 ||
+	    full.samples != 1 || full.type != Prospero::ImageType::kColor2D || full.IsVolume() || full.IsDepth() ||
+	    full.HasMetadata() || full.HasStencil() || full.tile_mode == Prospero::TileMode::kLinear ||
 	    full.tile_mode == Prospero::TileMode::kDepth || full.tile_mode == Prospero::TileMode::kRenderTarget ||
 	    cache.HoldsImage(full)) {
 		return;
 	}
 	ImageInfo from {};
-	for (uint32_t first = 1; first < base; ++first) {
+	for (uint32_t first = std::max(drop, 1u); first < first_held; ++first) {
 		if (TextureFromLevel(full, first, from) && cache.HoldsImage(from)) {
-			desc.info                 = from;
-			desc.view_info.base_level = base - first;
+			desc.info                  = from;
+			desc.view_info.base_level  = first_held - first;
+			desc.view_info.level_count = last - first_held + 1u;
 			return;
 		}
 	}
-	if (!TextureFromLevel(full, base, from)) return;
-	desc.info                 = from;
-	desc.view_info.base_level = 0;
+	if (!TextureFromLevel(full, first_held, from)) return;
+	desc.info                  = from;
+	desc.view_info.base_level  = 0;
+	desc.view_info.level_count = last - first_held + 1u;
 }
 
 // KYTY_TEXTURE_LAYER_RANGE=1|0 (default: on): a sampled array texture of one
