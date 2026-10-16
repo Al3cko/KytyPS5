@@ -508,6 +508,20 @@ static int SceneFreeFloor() {
 	return floor;
 }
 
+// Frame generation above 60 Hz: the game's frames too keep 60 (KYTY_FRAMEGEN_BASE=<Hz>: another rate, 0: none). DLSS-G
+// paces the frames it generates from the intervals between the game's own; on the 120 Hz vblanks a game between 60 and
+// 120 fps flipped after one vblank or two by turns (8.3 or 16.7 ms, 3-25 ms with late vblanks; at 60 Hz 16.7 +- 0.3 ms),
+// and its frames stuttered (issue #29).
+static int FrameGenFloor() {
+	static const int floor = [] {
+		const char* value = std::getenv("KYTY_FRAMEGEN_BASE");
+		const int   base  = value != nullptr ? std::max(0, std::atoi(value)) : 60;
+		if (base == 0) return 0;
+		return std::max(0, static_cast<int>(std::lround(static_cast<double>(Config::GetVblankFrequency()) / base)) - 1);
+	}();
+	return floor;
+}
+
 // `floor`: at least floor + 1 vblanks since the last flip (beyond the game's own flip rate).
 static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, int floor) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
@@ -1158,6 +1172,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	if (r.frame != nullptr) {
 		if (Graphics::Presenter::FlipRateApplies(*r.frame)) floor = FlipRateFloor();
 		if (!Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, SceneFreeFloor());
+		if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
 	}
 	if (!IsFlipDueLocked(*r.cfg, r.generation, floor)) {
 		r.cfg->mutex.Unlock();

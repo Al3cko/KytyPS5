@@ -40,6 +40,8 @@ public:
 	// The frame shows the game's 3D view (its TAA pass ran): above 60 Hz the others (movies, menus, loading screens)
 	// keep 60 (videoOut.cpp).
 	[[nodiscard]] static bool IsSceneFrame(const Frame& frame) noexcept;
+	// Frame generation is on: it paces the frames it makes from the intervals between the game's (videoOut.cpp).
+	[[nodiscard]] static bool GeneratesFrames() noexcept;
 	void                         Present(Frame& frame, bool reuse = false);
 	void                         Discard(Frame& frame);
 

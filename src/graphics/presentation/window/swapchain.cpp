@@ -1110,6 +1110,10 @@ bool Presenter::IsSceneFrame(const Frame& frame) noexcept {
 	return frame.scene;
 }
 
+bool Presenter::GeneratesFrames() noexcept {
+	return FrameGen::Enabled();
+}
+
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
