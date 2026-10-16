@@ -25,7 +25,7 @@ struct DeferredPhi {
 class Builder {
 public:
 	explicit Builder(uint32_t version = 0x00010300u);
-	~Builder() = default;
+	~Builder();
 	KYTY_CLASS_DEFAULT_COPY(Builder);
 
 	uint32_t AllocateId();
@@ -55,6 +55,8 @@ public:
 	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
 
 	[[nodiscard]] std::vector<uint32_t> Build() const;
+	// A module Build made, done with: the thread's next Build fills it again (no allocation of its size).
+	static void Recycle(std::vector<uint32_t>&& module);
 
 private:
 	static void AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,

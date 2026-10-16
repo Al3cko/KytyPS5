@@ -62,7 +62,6 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
-#include <zstd.h>
 
 extern "C" {
 // 1: find graphics pipelines through a block-hashed index of the full key.
@@ -381,12 +380,11 @@ static bool SpillPlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan, Spill
 	std::call_once(once, [] { file = LocalPlatform::OpenScratchFile(); });
 	std::vector<uint8_t> bytes;
 	if (file == 0 || !ResourcePlanSerial::Save(plan, bytes) || bytes.size() > UINT32_MAX) return false;
-	std::vector<char> packed(ZSTD_compressBound(bytes.size()));
-	const auto        packed_size = ZSTD_compress(packed.data(), packed.size(), bytes.data(), bytes.size(), 1);
-	if (ZSTD_isError(packed_size)) return false;
-	const auto offset = end.fetch_add(packed_size, std::memory_order_relaxed);
-	if (!LocalPlatform::WriteScratchFile(file, offset, packed.data(), packed_size)) return false;
-	out = {file, offset, static_cast<uint32_t>(packed_size), static_cast<uint32_t>(bytes.size())};
+	const auto packed = ZstdPack(bytes.data(), bytes.size());
+	if (packed.empty()) return false;
+	const auto offset = end.fetch_add(packed.size(), std::memory_order_relaxed);
+	if (!LocalPlatform::WriteScratchFile(file, offset, packed.data(), packed.size())) return false;
+	out = {file, offset, static_cast<uint32_t>(packed.size()), static_cast<uint32_t>(bytes.size())};
 	return true;
 }
 
@@ -396,8 +394,7 @@ static bool LoadPlanBytes(const SpilledPlan& in, ShaderRecompiler::IR::ResourceP
 	std::vector<char>    packed(in.bytes);
 	std::vector<uint8_t> bytes(in.raw);
 	return LocalPlatform::ReadScratchFile(in.file, in.offset, packed.data(), packed.size()) &&
-	       ZSTD_decompress(bytes.data(), bytes.size(), packed.data(), packed.size()) == bytes.size() &&
-	       ResourcePlanSerial::Load(bytes, plan, &linear);
+	       ZstdUnpack(packed, bytes.data(), bytes.size()) && ResourcePlanSerial::Load(bytes, plan, &linear);
 }
 
 struct PipelineCache::ProgramCache {
@@ -1112,10 +1109,10 @@ struct PipelineCache::ProgramCache {
 				return;
 			}
 		}
-		std::vector<char> packed(ZSTD_compressBound(bytes.size()));
-		const auto        packed_size = ZSTD_compress(packed.data(), packed.size(), bytes.data(), bytes.size(), 1);
-		if (ZSTD_isError(packed_size)) return;
-		const auto offset = p.spill_end.fetch_add(packed_size, std::memory_order_relaxed);
+		const auto packed = ZstdPack(bytes.data(), bytes.size());
+		if (packed.empty()) return;
+		const auto packed_size = packed.size();
+		const auto offset      = p.spill_end.fetch_add(packed_size, std::memory_order_relaxed);
 		if (!LocalPlatform::WriteScratchFile(p.spill, offset, packed.data(), packed_size)) return;
 		group.plan_offset = offset;
 		group.plan_bytes  = static_cast<uint32_t>(packed_size);
@@ -1132,7 +1129,7 @@ struct PipelineCache::ProgramCache {
 		std::vector<char>    packed(group.plan_bytes);
 		std::vector<uint8_t> bytes(group.plan_raw);
 		if (!LocalPlatform::ReadScratchFile(prefetch->spill, group.plan_offset, packed.data(), packed.size()) ||
-		    ZSTD_decompress(bytes.data(), bytes.size(), packed.data(), packed.size()) != bytes.size())
+		    !ZstdUnpack(packed, bytes.data(), bytes.size()))
 			return false;
 		const auto read = std::chrono::steady_clock::now();
 		ShaderRecompiler::IR::ResourcePlan plan;
@@ -1177,18 +1174,18 @@ struct PipelineCache::ProgramCache {
 				                                               record.push_cursor);
 				// Compressed (a fifth of the bytes): the file of a whole game's SPIR-V (4.5 GB) is kept in memory by the
 				// system as a temporary file, which an 8 GB-GPU laptop with 32 GB of RAM did not have to spare.
-				const auto  bytes  = result.spirv.size() * sizeof(uint32_t);
-				std::vector<char> packed(ZSTD_compressBound(bytes));
-				const auto  packed_size = ZSTD_compress(packed.data(), packed.size(), result.spirv.data(), bytes, 1);
-				const bool  compressed  = !ZSTD_isError(packed_size) && packed_size < bytes;
-				const void* data        = compressed ? static_cast<const void*>(packed.data()) : result.spirv.data();
-				const auto  stored      = compressed ? packed_size : bytes;
+				const auto  bytes      = result.spirv.size() * sizeof(uint32_t);
+				const auto  packed     = ZstdPack(result.spirv.data(), bytes);
+				const bool  compressed = !packed.empty() && packed.size() < bytes;
+				const void* data       = compressed ? static_cast<const void*>(packed.data()) : result.spirv.data();
+				const auto  stored     = compressed ? packed.size() : bytes;
 				const auto  offset      = p.spill_end.fetch_add(stored, std::memory_order_relaxed);
 				p.spirv_bytes.fetch_add(bytes, std::memory_order_relaxed);
 				if (!LocalPlatform::WriteScratchFile(p.spill, offset, data, stored)) continue;
 				group.modules.push_back({std::move(record.specialization), std::move(result.program).TakeCompiledInfo(),
 				                         offset, result.spirv.size(), compressed ? stored : 0,
 				                         XXH3_64bits(result.spirv.data(), bytes)});
+				ShaderRecompiler::RecycleSpirv(std::move(result.spirv));
 			} catch (const Common::RecoverableExit&) {
 			}
 		}
@@ -1270,7 +1267,7 @@ struct PipelineCache::ProgramCache {
 		if (module->spirv_bytes != 0) {
 			std::vector<char> packed(module->spirv_bytes);
 			if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, packed.data(), packed.size()) ||
-			    ZSTD_decompress(spirv.data(), bytes, packed.data(), packed.size()) != bytes)
+			    !ZstdUnpack(packed, spirv.data(), bytes))
 				return nullptr;
 		} else if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, spirv.data(), bytes)) {
 			return nullptr;

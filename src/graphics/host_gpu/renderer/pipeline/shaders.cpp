@@ -250,6 +250,40 @@ static vk::Result CapturePipelineBinaries(GraphicContext& graphics, PipelineCach
 	return result;
 }
 
+namespace {
+struct ZstdThread {
+	ZSTD_CCtx*        compress   = nullptr;
+	ZSTD_DCtx*        decompress = nullptr;
+	std::vector<char> packed;
+	~ZstdThread() {
+		ZSTD_freeCCtx(compress);
+		ZSTD_freeDCtx(decompress);
+	}
+};
+thread_local ZstdThread t_zstd;
+} // namespace
+
+std::span<const char> ZstdPack(const void* data, size_t bytes, int level) {
+	auto& zstd = t_zstd;
+	if (zstd.compress == nullptr) zstd.compress = ZSTD_createCCtx();
+	const auto bound = ZSTD_compressBound(bytes);
+	if (zstd.packed.size() < bound) zstd.packed.resize(bound);
+	const auto size = zstd.compress != nullptr
+	                      ? ZSTD_compressCCtx(zstd.compress, zstd.packed.data(), bound, data, bytes, level)
+	                      : ZSTD_compress(zstd.packed.data(), bound, data, bytes, level);
+	if (ZSTD_isError(size)) return {};
+	return {zstd.packed.data(), size};
+}
+
+bool ZstdUnpack(std::span<const char> packed, void* out, size_t bytes) {
+	auto& zstd = t_zstd;
+	if (zstd.decompress == nullptr) zstd.decompress = ZSTD_createDCtx();
+	const auto size = zstd.decompress != nullptr
+	                      ? ZSTD_decompressDCtx(zstd.decompress, out, bytes, packed.data(), packed.size())
+	                      : ZSTD_decompress(out, bytes, packed.data(), packed.size());
+	return size == bytes;
+}
+
 namespace ModuleStore {
 namespace {
 // A stored module's handle: the address of its index's byte here (untouched: no memory).
@@ -310,12 +344,11 @@ vk::ShaderModule Add(const std::vector<uint32_t>& spirv) {
 	if (!Enabled() || spirv.empty()) return nullptr;
 	std::call_once(g_file_once, [] { g_file = LocalPlatform::OpenScratchFile(); });
 	if (g_file == 0) return nullptr;
-	const auto        bytes = spirv.size() * sizeof(uint32_t);
-	std::vector<char> packed(ZSTD_compressBound(bytes));
-	const auto        packed_size = ZSTD_compress(packed.data(), packed.size(), spirv.data(), bytes, 1);
-	const bool        compressed  = !ZSTD_isError(packed_size) && packed_size < bytes;
-	const void*       data        = compressed ? static_cast<const void*>(packed.data()) : spirv.data();
-	const auto        stored      = compressed ? packed_size : bytes;
+	const auto  bytes      = spirv.size() * sizeof(uint32_t);
+	const auto  packed     = ZstdPack(spirv.data(), bytes);
+	const bool  compressed = !packed.empty() && packed.size() < bytes;
+	const void* data       = compressed ? static_cast<const void*>(packed.data()) : spirv.data();
+	const auto  stored     = compressed ? packed.size() : bytes;
 	const auto        offset      = g_end.fetch_add(stored, std::memory_order_relaxed);
 	if (stored > UINT32_MAX || !LocalPlatform::WriteScratchFile(g_file, offset, data, stored)) return nullptr;
 	const auto module = Push({g_file, offset, static_cast<uint32_t>(stored), static_cast<uint32_t>(spirv.size()), compressed});
@@ -354,7 +387,7 @@ std::shared_ptr<const std::vector<uint32_t>> Load(vk::ShaderModule module) {
 	if (entry.compressed) {
 		std::vector<char> packed(entry.stored);
 		if (!LocalPlatform::ReadScratchFile(entry.file, entry.offset, packed.data(), packed.size()) ||
-		    ZSTD_decompress(spirv->data(), bytes, packed.data(), packed.size()) != bytes)
+		    !ZstdUnpack(packed, spirv->data(), bytes))
 			return nullptr;
 	} else if (!LocalPlatform::ReadScratchFile(entry.file, entry.offset, spirv->data(), bytes)) {
 		return nullptr;

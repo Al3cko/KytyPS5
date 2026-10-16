@@ -491,6 +491,12 @@ bool PipelineKeyLog();
 // The session's line of what the game's pipelines got from the static store, its binaries or blobs (shaders.cpp): made
 // of what it holds, not among them, refused by the driver.
 void ReportStaticStore();
+// zstd on the calling thread's own contexts (shaders.cpp): ZSTD_compress and ZSTD_decompress make one for every call, the
+// compressor's ~0.5 MiB (the shader prefetch's threads allocated 2.9 GB of them a minute, memory the system zero-fills).
+// ZstdPack: `data` compressed into the thread's buffer, valid until the thread's next ZstdPack (it only grows, and is not
+// zeroed again); empty when zstd fails. ZstdUnpack: `packed` into `out`, whether it gave exactly `bytes` bytes.
+std::span<const char> ZstdPack(const void* data, size_t bytes, int level = 1);
+bool                  ZstdUnpack(std::span<const char> packed, void* out, size_t bytes);
 void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes = 0);
 // (KYTY_INLINE_KEY_CHECK) Each module's SPIR-V kept, so that every pipeline key is compared with the key of the same
 // pipeline given its shaders' SPIR-V inline (VK_KHR_maintenance5): what a store keyed by the first needs of the second.
