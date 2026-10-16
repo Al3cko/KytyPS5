@@ -29,6 +29,7 @@
 #include "shader-warmup-cache.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "device-fault.h"
 #include "local-platform.h"
 #include "slow-log.h"
 #include "startup-progress.h"
@@ -66,6 +67,8 @@
 extern "C" {
 // 1: find graphics pipelines through a block-hashed index of the full key.
 volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode {0};
+// (performance-switches.h, KYTY_SPECULATE) Speculative translation records ahead on other threads.
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
 }
 
 namespace Libs::Graphics {
@@ -2198,6 +2201,152 @@ void PipelineCache::PromoteFinished() {
 	Common::LockGuard lock(m_mutex);
 	PromoteOptimized();
 	m_program_cache->SweepPlans();
+	EvictIdlePipelines();
+}
+
+namespace {
+// The flips (EvictIdlePipelines) and what eviction did (ReportSession).
+std::atomic<uint32_t> g_pipeline_flip {1};
+struct {
+	std::atomic<uint64_t> kept {0}, evicted {0}, remade {0}, remake_us {0}, remake_max_us {0};
+} g_pipeline_evictions;
+
+// KYTY_PIPELINE_EVICT: 0 keeps every pipeline, 2 (a test) evicts whatever the video memory in use; set, it evicts on any
+// GPU, else only on one short of video memory (GraphicContext::small_video_memory, under 12 GiB). KYTY_PIPELINE_EVICT_SECONDS:
+// the idle time (default 180 s, at least 5).
+struct EvictSettings {
+	bool                     set    = false;
+	bool                     on     = true;
+	bool                     always = false;
+	std::chrono::nanoseconds idle   = std::chrono::seconds(180);
+};
+const EvictSettings& PipelineEvictSettings() {
+	static const EvictSettings settings = [] {
+		EvictSettings out;
+		const char*   evict   = std::getenv("KYTY_PIPELINE_EVICT");
+		const char*   seconds = std::getenv("KYTY_PIPELINE_EVICT_SECONDS");
+		out.set               = evict != nullptr && *evict != '\0';
+		out.on                = !out.set || std::string_view(evict) != "0";
+		out.always            = out.set && std::string_view(evict) == "2";
+		if (seconds != nullptr && *seconds != '\0')
+			out.idle = std::chrono::seconds(std::max<uint64_t>(std::strtoull(seconds, nullptr, 10), 5));
+		return out;
+	}();
+	return settings;
+}
+
+// A pipeline made now: the flip it was made at as its last use (not idle before a first binding); and whether it keeps
+// how to make it again (made of the static store's, where it may be evicted: only there, for the inputs it keeps).
+bool KeepsRemake(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, bool from_store) {
+	const auto& settings = PipelineEvictSettings();
+	pipeline.last_flip   = g_pipeline_flip.load(std::memory_order_relaxed);
+	if (!settings.on || (!settings.set && !graphics.small_video_memory) || !from_store) return false;
+	g_pipeline_evictions.kept.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+} // namespace
+
+// What a graphics pipeline is made of, as its remake keeps it (~11 KB: the vertex input info's 32 resource slots), without
+// the draw's resource values (ShaderStageRuntime::resources: no part of the pipeline). Cold memory once made.
+struct PipelineCache::GraphicsMakeInputs {
+	PipelineRenderingState   rendering;
+	PipelineVertexInputState vertex_input;
+	PipelineStaticParameters static_params;
+	ShaderVertexInputInfo    vs_input_info;
+	ShaderPixelInputInfo     ps_input_info;
+	ShaderProgram            vertex_program;
+	ShaderProgram            pixel_program;
+	bool                     ps_active       = false;
+	bool                     native_bindings = false;
+	bool                     table           = false; // the table pipelines' driver cache
+};
+
+std::shared_ptr<const std::function<void(PipelineCache::Pipeline&)>>
+PipelineCache::GraphicsRemake(GraphicsMakeInputs inputs) {
+	inputs.vs_input_info.stage.resources = {};
+	inputs.ps_input_info.stage.resources = {};
+	return std::make_shared<const std::function<void(Pipeline&)>>([this, in = std::move(inputs)](Pipeline& target) {
+		CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, in.vs_input_info, in.vertex_program,
+		                       in.ps_active ? &in.ps_input_info : nullptr, in.pixel_program, in.static_params,
+		                       in.table ? TablePipelineCache() : m_driver_cache, in.native_bindings, PipelineBuild::Full);
+	});
+}
+
+vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline) {
+	pipeline.last_flip = g_pipeline_flip.load(std::memory_order_relaxed);
+	if (pipeline.pipeline != nullptr || pipeline.remake == nullptr) return pipeline.pipeline;
+	// Made again as it was made (its layouts are the shared ones for its bindings: the same), from the static store.
+	const auto              start = std::chrono::steady_clock::now();
+	PipelineCache::Pipeline made;
+	(*pipeline.remake)(made);
+	EXIT_IF(made.pipeline == nullptr || made.pipeline_layout != pipeline.pipeline_layout ||
+	        made.descriptor_set_layout != pipeline.descriptor_set_layout);
+	const_cast<PipelineCache::Pipeline&>(pipeline).pipeline = made.pipeline;
+	const auto us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	g_pipeline_evictions.remade.fetch_add(1, std::memory_order_relaxed);
+	g_pipeline_evictions.remake_us.fetch_add(us, std::memory_order_relaxed);
+	if (us > g_pipeline_evictions.remake_max_us.load(std::memory_order_relaxed))
+		g_pipeline_evictions.remake_max_us.store(us, std::memory_order_relaxed);
+	return pipeline.pipeline;
+}
+
+// With the video memory in use within EvictMargin of the GPU's budget (checked every CheckFlips flips), up to MaxEvictions
+// a check of the pipelines the static store gave that no binding used for KYTY_PIPELINE_EVICT_SECONDS (default 180, at
+// least 5) leave it: their handles destroyed (BindPipelineHandle makes one again from the store, ~1-2 ms). Their shader
+// code is video memory: on an 8 GB GPU, a 5-minute 1-1 tour took the driver's share 0.6 -> 1.0 GB while the video memory
+// in use went past the budget (7.7 GB of 7.25); evicting every pipeline idle for 5 s there (a test: 9,946 evicted, 6,188
+// made again at 1.1 ms each, fps unchanged) kept it at 0.8 GB. Not those an optimized build will replace, and none while
+// speculative translation records ahead (KYTY_SPECULATE). The time since a pipeline's last binding is what keeps its
+// handle out of commands still to run: GPU work is never minutes behind. Only pipelines in this cache's maps: a worker's
+// result enters them on this thread, its remake set before (PipelineEvictSettings, KeepsRemake).
+void PipelineCache::EvictIdlePipelines() {
+	const auto& settings = PipelineEvictSettings();
+	constexpr uint32_t CheckFlips   = 60;
+	constexpr size_t   MaxEvictions = 256;
+	constexpr uint64_t EvictMargin  = uint64_t {512} << 20u;
+	const uint32_t     flip         = g_pipeline_flip.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto         now          = std::chrono::steady_clock::now();
+	m_flip_times[flip % m_flip_times.size()] = now.time_since_epoch().count();
+	if (!settings.on || flip % CheckFlips != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
+	uint64_t video = 0, budget = 0;
+	m_evict_pressure = m_graphics.QueryLocalVideoMemory(&video, &budget) && (settings.always || video + EvictMargin >= budget);
+	if (!m_evict_pressure) return;
+	// The newest flip that began by the horizon among those the ring holds; none when even the oldest began after it.
+	const auto horizon = (now - settings.idle).time_since_epoch().count();
+	uint32_t   first   = flip - std::min<uint32_t>(flip - 1, static_cast<uint32_t>(m_flip_times.size() - 1)), last = flip;
+	if (m_flip_times[first % m_flip_times.size()] > horizon) return;
+	while (first < last) {
+		const uint32_t middle = first + (last - first + 1) / 2;
+		if (m_flip_times[middle % m_flip_times.size()] <= horizon) first = middle;
+		else last = middle - 1;
+	}
+	const uint32_t below   = last; // bound in an earlier flip: idle since then
+	size_t         evicted = 0;
+	const auto     evict   = [&](Pipeline& pipeline) {
+		if (evicted == MaxEvictions || pipeline.pipeline == nullptr || pipeline.remake == nullptr || pipeline.unoptimized ||
+		    pipeline.optimized != nullptr || pipeline.last_flip >= below)
+			return;
+		DeviceFault::ForgetPipeline(static_cast<VkPipeline>(pipeline.pipeline));
+		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		pipeline.pipeline = nullptr;
+		evicted++;
+	};
+	for (auto& [key, pipeline]: m_graphics_pipelines) evict(*pipeline);
+	for (auto& [id, pipeline]: m_compute_pipelines) evict(*pipeline);
+	if (evicted == 0) return;
+	const auto total = g_pipeline_evictions.evicted.fetch_add(evicted, std::memory_order_relaxed) + evicted;
+	// (A line at most every 30 s: the totals so far.)
+	static auto logged = std::chrono::steady_clock::time_point {};
+	if (now - logged < std::chrono::seconds(30)) return;
+	logged = now;
+	std::printf("Pipelines out of video memory while idle: %llu evicted, %llu made again (%.0f ms); video memory %llu of %llu "
+	            "MiB\n",
+	            static_cast<unsigned long long>(total),
+	            static_cast<unsigned long long>(g_pipeline_evictions.remade.load(std::memory_order_relaxed)),
+	            static_cast<double>(g_pipeline_evictions.remake_us.load(std::memory_order_relaxed)) / 1000.0,
+	            static_cast<unsigned long long>(video >> 20u), static_cast<unsigned long long>(budget >> 20u));
+	std::fflush(stdout);
 }
 
 // Finished optimized builds replace their pipelines in place, for every holder of the Pipeline
@@ -2257,6 +2406,13 @@ void PipelineCache::ReportSession() {
 	                 m_program_cache->render_translations, m_program_cache->render_translate_ms, m_render_pipelines,
 	                 m_render_pipeline_ms);
 	ReportStaticStore();
+	if (const auto kept = g_pipeline_evictions.kept.load(); kept != 0) {
+		PipelineCacheLog("Pipelines out of video memory while idle: {} evicted of {} that could be, {} made again ({:.0f} ms, at "
+		                 "most {:.1f} ms)",
+		                 g_pipeline_evictions.evicted.load(), kept, g_pipeline_evictions.remade.load(),
+		                 static_cast<double>(g_pipeline_evictions.remake_us.load()) / 1000.0,
+		                 static_cast<double>(g_pipeline_evictions.remake_max_us.load()) / 1000.0);
+	}
 }
 
 void PipelineCache::StopWarmup() {
@@ -3496,6 +3652,20 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
 			                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
 			                       job->native_bindings);
+			if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
+				GraphicsMakeInputs inputs;
+				inputs.rendering       = job->rendering;
+				inputs.vertex_input    = job->vertex_input;
+				inputs.static_params   = job->static_params;
+				inputs.vs_input_info   = job->vs_input_info;
+				inputs.ps_input_info   = job->ps_input_info;
+				inputs.ps_active       = job->ps_active;
+				inputs.vertex_program  = job->vertex_program;
+				inputs.pixel_program   = job->pixel_program;
+				inputs.native_bindings = job->native_bindings;
+				inputs.table           = table;
+				job->pipeline->remake  = GraphicsRemake(std::move(inputs));
+			}
 			if (table) TablePipelineDone();
 			else MainPipelineDone();
 			job->done.store(true, std::memory_order_release);
@@ -3530,6 +3700,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
 	                       m_driver_cache, native_bindings, FirstBuild(m_graphics));
+	const bool from_store = LastPipelineFromStore();
 	m_render_pipelines++;
 	m_render_pipeline_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
 	MainPipelineDone();
@@ -3545,13 +3716,29 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	}
 	std::optional<ShaderPixelInputInfo> pixel_info;
 	if (ps_active) pixel_info = *ps_input_info;
-	BuildOptimized(*iter->second, [this, rendering, vertex_input = iter->first.vertex_input, vs_input_info,
-	                               pixel_info, vertex_program, pixel_program, static_params,
-	                               native_bindings](Pipeline& layouts) {
-		CreatePipelineInternal(m_graphics, layouts, rendering, vertex_input, vs_input_info, vertex_program,
-		                       pixel_info ? &*pixel_info : nullptr, pixel_program, static_params, m_driver_cache,
-		                       native_bindings, PipelineBuild::Optimize);
-	});
+	// Its build as `build` says (BuildOptimized: the optimized one).
+	const auto make = [this, rendering, vertex_input = iter->first.vertex_input, vs_input_info, pixel_info, vertex_program,
+	                   pixel_program, static_params, native_bindings](PipelineBuild build) {
+		return [=, this](Pipeline& target) {
+			CreatePipelineInternal(m_graphics, target, rendering, vertex_input, vs_input_info, vertex_program,
+			                       pixel_info ? &*pixel_info : nullptr, pixel_program, static_params, m_driver_cache,
+			                       native_bindings, build);
+		};
+	};
+	if (KeepsRemake(m_graphics, *iter->second, from_store)) {
+		GraphicsMakeInputs inputs;
+		inputs.rendering       = rendering;
+		inputs.vertex_input    = iter->first.vertex_input;
+		inputs.static_params   = static_params;
+		inputs.vs_input_info   = vs_input_info;
+		inputs.ps_active       = ps_active;
+		inputs.vertex_program  = vertex_program;
+		inputs.pixel_program   = pixel_program;
+		inputs.native_bindings = native_bindings;
+		if (ps_active) inputs.ps_input_info = *ps_input_info;
+		iter->second->remake = GraphicsRemake(std::move(inputs));
+	}
+	BuildOptimized(*iter->second, make(PipelineBuild::Optimize));
 	// Warmup recipes describe the normal variant only.
 	if (native_bindings) {
 		return iter->second.get();
@@ -3601,6 +3788,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	const auto create_begin = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
 	                       FirstBuild(m_graphics));
+	const bool from_store = LastPipelineFromStore();
 	m_render_pipelines++;
 	m_render_pipeline_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
 	MainPipelineDone();
@@ -3610,9 +3798,12 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
-	BuildOptimized(*iter->second, [this, input_info, module = compute_program.module](Pipeline& layouts) {
-		CreatePipelineInternal(m_graphics, layouts, input_info, module, m_driver_cache, PipelineBuild::Optimize);
-	});
+	const auto make = [this, input_info, module = compute_program.module](PipelineBuild build) {
+		return [=, this](Pipeline& target) { CreatePipelineInternal(m_graphics, target, input_info, module, m_driver_cache, build); };
+	};
+	if (KeepsRemake(m_graphics, *iter->second, from_store))
+		iter->second->remake = std::make_shared<const std::function<void(Pipeline&)>>(make(PipelineBuild::Full));
+	BuildOptimized(*iter->second, make(PipelineBuild::Optimize));
 	LocalShaderWarmup::PipelineRecord recipe;
 	recipe.compute = m_program_cache->RecordedIndex(compute_program);
 	if (recipe.compute != LocalShaderWarmup::NoShader) {
@@ -3659,6 +3850,13 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderCom
 		}, SlowLog::HitchThreshold());
 		CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module, TablePipelineCache(),
 		                       PipelineBuild::Full, true);
+		if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
+			job->pipeline->remake = std::make_shared<const std::function<void(Pipeline&)>>(
+			    [this, input_info = job->input_info, module = job->module](Pipeline& target) {
+				    CreatePipelineInternal(m_graphics, target, input_info, module, TablePipelineCache(), PipelineBuild::Full,
+				                           true);
+			    });
+		}
 		TablePipelineDone();
 		job->done.store(true, std::memory_order_release);
 	});

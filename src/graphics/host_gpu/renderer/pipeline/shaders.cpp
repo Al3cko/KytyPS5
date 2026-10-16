@@ -723,6 +723,10 @@ void ReportStaticStore() {
 // (KYTY_PIPELINE_SOURCE_LOG) Whether the static cache or store gave this thread's last pipeline, and for a pipeline
 // cache blob: its size and the microseconds of its read, of the cache made of it and of the pipeline's creation.
 static thread_local bool t_static_hit = false;
+
+bool LastPipelineFromStore() {
+	return t_static_hit;
+}
 struct BlobTimes {
 	size_t bytes     = 0;
 	double read_us   = 0.0;

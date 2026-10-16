@@ -3276,7 +3276,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	}
 	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
 	if (!same_command || emit.pipeline != &pipeline) {
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
 	}
 	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 0, 1,
 	                             &record.set, offset_count, offsets.data());

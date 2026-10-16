@@ -10,6 +10,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
@@ -194,6 +195,10 @@ public:
 		// PipelineBuild::Fast compiled it unoptimized; `optimized` is its optimized build.
 		bool                            unoptimized = false;
 		std::shared_ptr<OptimizedBuild> optimized;
+		// Out of video memory while idle (EvictIdlePipelines): the flip of its last binding (BindPipelineHandle), and how
+		// to make it again (a pipeline the static store gave: made again from it; null: never evicted).
+		mutable uint32_t                                       last_flip = 0;
+		std::shared_ptr<const std::function<void(Pipeline&)>> remake;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// Immutable encoding plan; queued packets keep their own shared ownership.
 		mutable std::shared_ptr<const LocalDescriptorPlan> local_descriptor_plan;
@@ -450,6 +455,15 @@ private:
 	CompileWorkers& OptimizeWorkers();
 	void            BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build);
 	void            PromoteOptimized();
+	// At each flip: with the video memory in use near the GPU's budget, the pipelines no binding used for a while leave
+	// it (their handles destroyed; BindPipelineHandle makes one again from the static store when it is bound).
+	void            EvictIdlePipelines();
+	// (EvictIdlePipelines) A graphics pipeline's inputs, as its remake keeps them.
+	struct GraphicsMakeInputs;
+	std::shared_ptr<const std::function<void(Pipeline&)>> GraphicsRemake(GraphicsMakeInputs inputs);
+	// (EvictIdlePipelines) When each recent flip began (steady clock, by flip % size), and the video memory pressure.
+	std::array<int64_t, 32768> m_flip_times {};
+	bool                      m_evict_pressure = false;
 	void InitializeDriverCache();
 	vk::PipelineCache LoadDriverCache(const std::filesystem::path& file_path, uint64_t limit, size_t& loaded_size);
 	bool SaveDriverCache(vk::PipelineCache cache, const std::filesystem::path& file_path, size_t& saved_size);
@@ -491,6 +505,11 @@ bool PipelineKeyLog();
 // The session's line of what the game's pipelines got from the static store, its binaries or blobs (shaders.cpp): made
 // of what it holds, not among them, refused by the driver.
 void ReportStaticStore();
+// Whether the static store gave the last pipeline this thread made (shaders.cpp).
+bool LastPipelineFromStore();
+// The pipeline's handle for a binding now (the GPU thread): the flip noted, and the pipeline made again first when it was
+// evicted (PipelineCache::EvictIdlePipelines).
+vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline);
 // zstd on the calling thread's own contexts (shaders.cpp): ZSTD_compress and ZSTD_decompress make one for every call, the
 // compressor's ~0.5 MiB (the shader prefetch's threads allocated 2.9 GB of them a minute, memory the system zero-fills).
 // ZstdPack: `data` compressed into the thread's buffer, valid until the thread's next ZstdPack (it only grows, and is not

@@ -2066,7 +2066,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
 	const auto& pipeline = *variant.pipeline;
 	if (!same_command || emit.pipeline != &pipeline)
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
 	if (!same_command || emit.pipeline != &pipeline || table.last_set != set)
 		vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 0, 1, &set->set, 0,
 		                             nullptr);
@@ -2647,7 +2647,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	TableWatchDispatch(indirect_args, continues_chain);
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |

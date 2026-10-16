@@ -1602,7 +1602,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LiveCounters::Add(LiveCounters::DirectDraws);
 		if (mesh_active) LiveCounters::Add(LiveCounters::MeshDraws);
 		CommitGraphicsState(buffer, state.vs_input_info, state.color_info, state.color_count,
-		                    state.depth_info, pipeline.pipeline, feedback_aspects);
+		                    state.depth_info, BindPipelineHandle(pipeline), feedback_aspects);
 	} else {
 		buffer.InvalidateGraphicsState();
 	}
@@ -1640,7 +1640,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
 		    m_context.GetGraphics().attachment_feedback_loop_enabled, feedback_aspects);
 		packet.command = vk_buffer;
-		packet.pipeline = pipeline.pipeline;
+		packet.pipeline = BindPipelineHandle(pipeline);
 		packet.index_buffer = index_binding.buffer;
 		packet.index_offset = index_binding.offset;
 		packet.index_type = index_binding.type;
