@@ -2887,7 +2887,16 @@ static std::filesystem::path StaticBinariesPath() {
 }
 
 static std::string StaticBinariesSignature(GraphicContext& graphics) {
-	return PipelineBinaries::Signature(graphics.device, ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties()));
+	const auto& properties = graphics.GetPhysicalDeviceProperties();
+	auto        device     = ShaderInputDeviceSignature(properties);
+#ifdef _WIN32
+	// AMD's Windows driver keys pipelines by the executable's name: none of a store made before the precompile ran under
+	// the emulator's name (precompile-windows.ps1, issue #28) matched the game's keys. Marked, such a store is out of
+	// date (StaticCacheCurrent), so the launcher offers the precompile again; others' stores are unchanged.
+	constexpr uint32_t AmdVendor = 0x1002u;
+	if (properties.vendorID == AmdVendor) device += " made-as-kyty_emulator";
+#endif
+	return PipelineBinaries::Signature(graphics.device, device);
 }
 
 // Without pipeline binaries: each pipeline's own pipeline cache data (pipelineCacheBlobs.h), read when it is needed,
