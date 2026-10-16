@@ -1450,6 +1450,12 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, r, queue_family,
 	                                        device_extensions, graphic_ctx);
 	if (graphic_ctx.device == nullptr) {
+		// (Issue #32: an RTX 5080 whose driver refused the device Streamline asked for; the game runs without it.)
+		if (FrameGen::Requested()) {
+			EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline): start without "
+			     "frame generation (launcher: Frame generation -> Off). KYTY_FRAMEGEN_VERBOSE=1 logs why the driver "
+			     "refused it.\n");
+		}
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
