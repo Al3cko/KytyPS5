@@ -18,7 +18,15 @@
 #include "vulkan-recording.h"
 #endif
 #include "frame-gen.h"
+#include "local-platform.h"
 #include "perf-overlay.h"
+#if defined(_WIN32)
+#include "SDL_syswm.h"
+#endif
+
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include <algorithm>
 #include <array>
@@ -106,12 +114,17 @@ public:
 		return m_format;
 	}
 
-	Presenter::Frame* Acquire() {
+	// `wait`: until a frame is free (else none when none is).
+	Presenter::Frame* Acquire(bool wait = true) {
 		m_mutex.Lock();
 		if (m_frames.empty()) {
 			EXIT("prepared-frame pool was used before swapchain initialization\n");
 		}
 		while (m_free.empty()) {
+			if (!wait) {
+				m_mutex.Unlock();
+				return nullptr;
+			}
 			m_available.Wait(&m_mutex);
 		}
 		auto* frame = m_free.front();
@@ -323,6 +336,8 @@ public:
 	}
 	// Where RecordPresentCommands put the frame in the swapchain image.
 	[[nodiscard]] vk::Rect2D PresentRegion() const noexcept { return m_present_region; }
+	// The presents wait for the display's vertical blank (VSync: FIFO).
+	[[nodiscard]] bool IsFifo() const noexcept { return m_fifo.load(std::memory_order_relaxed); }
 
 private:
 	void                 Destroy();
@@ -332,6 +347,7 @@ private:
 	vk::SwapchainKHR            m_handle = nullptr;
 	vk::Format                  m_format = vk::Format::eUndefined;
 	std::atomic_bool            m_hdr_supported {false};
+	std::atomic_bool            m_fifo {true};
 	bool                        m_hdr_requested = false;
 	bool                        m_hdr_active    = false;
 	vk::Extent2D                m_extent {};
@@ -550,14 +566,64 @@ struct Presenter::Impl {
 		}
 		return &hud;
 	}
+	// The presenter's thread (Presenter::PresentLoop) and what it presents next (Submit, SubmitBlank).
+	struct Waiting {
+		Frame*   frame  = nullptr;
+		bool     reuse  = false;
+		bool     blank  = false; // a cleared frame to make (width, height, opaque)
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		bool     opaque = false;
+		[[nodiscard]] bool Empty() const noexcept { return frame == nullptr && !blank; }
+	};
+	std::mutex                  waiting_mutex;
+	std::condition_variable_any waiting_changed;
+	Waiting                     waiting;
+	bool                        presenting = false; // (waiting_mutex) the thread took one and has not presented it yet
+	std::jthread                thread;
+	// A frame the vblank thread put in place of one still waiting: that one goes back to the pool unshown.
+	void Replace(const Waiting& next) {
+		Waiting dropped;
+		{
+			std::lock_guard lock(waiting_mutex);
+			dropped = std::exchange(waiting, next);
+		}
+		waiting_changed.notify_one();
+		// (A last frame shown again stays the last one.)
+		if (dropped.frame != nullptr) frames.Release(dropped.frame, dropped.reuse);
+	}
+
+	// A cleared frame: into `producer` (the GPU thread's command buffer, a guest flip of a blank buffer), else on the
+	// presenter's own scheduler (its thread's blank frames).
+	void ClearFrame(Frame& frame, uint32_t width, uint32_t height, bool opaque, CommandBuffer* producer) {
+		frame.fg.valid = false;
+		frame.hdr      = false;
+		frame.blank    = true;
+		frame.scene    = false;
+		frame.Configure(window.graphic_ctx, {width, height}, frames.GetFormat());
+		vk::ClearColorValue clear {};
+		clear.float32[3] = opaque ? 1.0f : 0.0f;
+		if (producer != nullptr) {
+			frame.Clear(*producer, clear);
+		} else {
+			auto& command = present_scheduler.BeginCommand();
+			frame.Clear(command, clear);
+			frame.present_tick = present_scheduler.Submit();
+		}
+	}
+
 #if defined(_WIN32)
 	// Presents faster than the display refreshes only pile up in the compositor, and on Windows
 	// a present blocked there holds the driver's device lock (see Swapchain::Present).
 	std::chrono::steady_clock::time_point last_present {};
 	std::chrono::nanoseconds              min_present_interval {-1}; // -1: not queried yet
-	// A frame PresentDue turned away that no newer present replaced: the vblank thread shows it once the display can
-	// take it (Presenter::PresentSkippedIfDue).
-	bool skipped_unshown = false;
+
+	// When PresentDue lets the next present go ahead.
+	[[nodiscard]] std::chrono::steady_clock::time_point NextPresentDue() {
+		(void)PresentDue(false); // (the display's refresh, queried once)
+		return min_present_interval.count() > 0 ? last_present + min_present_interval * 3 / 4
+		                                         : std::chrono::steady_clock::time_point {};
+	}
 
 	// `commit`: the present goes ahead now (the next one is timed from it).
 	[[nodiscard]] bool PresentDue(bool commit = true) {
@@ -682,6 +748,7 @@ void Swapchain::Create() {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
+	m_fifo.store(create_info.presentMode == vk::PresentModeKHR::eFifo, std::memory_order_relaxed);
 	create_info.clipped          = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
@@ -1001,9 +1068,15 @@ Swapchain::Status Swapchain::Present() {
 	return Status::Success;
 }
 
-Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {}
+Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {
+	m_impl->thread = std::jthread([this](std::stop_token token) { PresentLoop(std::move(token)); });
+}
 
-Presenter::~Presenter() = default;
+Presenter::~Presenter() {
+	// The presenter's thread ends before what it presents with (a frame still waiting is not shown).
+	m_impl->thread.request_stop();
+	if (m_impl->thread.joinable()) m_impl->thread.join();
+}
 
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
 	KYTY_PROFILER_FUNCTION();
@@ -1038,27 +1111,10 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
                                                CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
-	auto              format = m_impl->frames.GetFormat();
-	auto*             frame  = m_impl->frames.Acquire();
-	// Into the GPU thread's command buffer (its flip) under the renderer's lock; the present thread's blank frame
-	// (no producer) touches only the presenter's own scheduler and frame, as Present does.
-	std::optional<RenderLockGuard> render_lock;
-	if (producer != nullptr) render_lock.emplace(m_impl->renderer.GetMutex());
-	frame->fg.valid = false;
-	frame->hdr      = false;
-	frame->blank    = true;
-	frame->scene    = false;
-	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
-	vk::ClearColorValue clear {};
-	clear.float32[3] = opaque ? 1.0f : 0.0f;
-	if (producer != nullptr) {
-		EXIT_IF(producer->IsInvalid());
-		frame->Clear(*producer, clear);
-	} else {
-		auto& command = m_impl->present_scheduler.BeginCommand();
-		frame->Clear(command, clear);
-		frame->present_tick = m_impl->present_scheduler.Submit();
-	}
+	EXIT_IF(producer == nullptr || producer->IsInvalid());
+	auto*           frame = m_impl->frames.Acquire();
+	RenderLockGuard render_lock(m_impl->renderer.GetMutex());
+	m_impl->ClearFrame(*frame, width, height, opaque, producer);
 	return *frame;
 }
 
@@ -1066,22 +1122,80 @@ Presenter::Frame* Presenter::PrepareLastFrame() {
 	return m_impl->frames.AcquireLast();
 }
 
-bool Presenter::PresentSkippedIfDue() {
+void Presenter::Submit(Frame& frame, bool reuse) {
+	m_impl->frames.ValidateForPresent(&frame, reuse);
+	m_impl->Replace({.frame = &frame, .reuse = reuse});
+}
+
+void Presenter::SubmitBlank(uint32_t width, uint32_t height, bool opaque) {
+	m_impl->Replace({.blank = true, .width = width, .height = height, .opaque = opaque});
+}
+
+bool Presenter::PresentIdle() {
+	std::lock_guard lock(m_impl->waiting_mutex);
+	return m_impl->waiting.Empty() && !m_impl->presenting;
+}
+
+void Presenter::PresentLoop(std::stop_token token) {
+	LocalPlatform::SetThreadName("Kyty.Present");
+	auto& impl = *m_impl;
+	for (;;) {
+		Impl::Waiting next;
+		{
+			std::unique_lock lock(impl.waiting_mutex);
+			impl.presenting = false;
+			if (!impl.waiting_changed.wait(lock, token, [&] { return !impl.waiting.Empty(); })) return;
 #if defined(_WIN32)
-	// A game above the display's rate had every frame that came within a refresh of the one before turned away, and
-	// the refresh after it showed nothing new when the next frame was late (a 69 fps game on a 60 Hz display: 52
-	// frames a second shown). Each refresh shows the latest frame now. (Frame generation paces its own frames.)
-	if (!m_impl->skipped_unshown || FrameGen::Enabled() || !m_impl->PresentDue(false)) return false;
-	auto* frame = PrepareLastFrame();
-	if (frame == nullptr) {
-		m_impl->skipped_unshown = false; // (the GPU thread took it for a newer frame)
-		return false;
-	}
-	Present(*frame, true);
-	return true;
-#else
-	return false;
+			// Held until the display can take it (Impl::PresentDue), a newer one taking its place meanwhile. (A frame
+			// DLSS-G generates frames for goes at once: it paces its presents itself.)
+			for (;;) {
+				const auto& w = impl.waiting;
+				if (w.frame != nullptr && !w.reuse && w.frame->fg.valid && FrameGen::Enabled()) break;
+				const auto due = impl.NextPresentDue();
+				if (std::chrono::steady_clock::now() >= due) break;
+				impl.waiting_changed.wait_until(lock, token, due, [] { return false; });
+				if (token.stop_requested()) return;
+			}
 #endif
+			next            = std::exchange(impl.waiting, {});
+			impl.presenting = true;
+		}
+		if (next.blank) {
+			// A free frame, else none: each frame held is a guest picture on its way here.
+			auto* frame = impl.frames.Acquire(false);
+			if (frame == nullptr) continue;
+			impl.ClearFrame(*frame, next.width, next.height, next.opaque, nullptr);
+			Present(*frame, false);
+		} else {
+			Present(*next.frame, next.reuse);
+		}
+	}
+}
+
+uint32_t Presenter::DisplayVblanksPerTick(uint32_t vblank_hz) {
+#if defined(_WIN32)
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VSYNC_LOCK");
+		return value == nullptr || std::atoi(value) != 0;
+	}();
+	if (!enabled || vblank_hz == 0 || !m_impl->swapchain.IsFifo() || m_impl->window.window == nullptr) return 0;
+	SDL_SysWMinfo info {};
+	SDL_VERSION(&info.version);
+	if (SDL_GetWindowWMInfo(m_impl->window.window, &info) != SDL_TRUE || info.subsystem != SDL_SYSWM_WINDOWS) return 0;
+	// (A 59.94 Hz mode reports 59.)
+	const int  refresh = LocalPlatform::DisplayRefreshHz(info.info.win.window);
+	const auto hz      = static_cast<int>(vblank_hz);
+	const int  k       = static_cast<int>(std::lround(static_cast<double>(refresh) / hz));
+	if (refresh <= 0 || k < 1 || std::abs(refresh - k * hz) > 1) return 0;
+	return LocalPlatform::StartDisplayVblanks(info.info.win.window) ? static_cast<uint32_t>(k) : 0;
+#else
+	(void)vblank_hz;
+	return 0;
+#endif
+}
+
+bool Presenter::WaitForDisplayVblank(uint64_t& seen, uint32_t timeout_us) {
+	return LocalPlatform::WaitDisplayVblank(seen, timeout_us);
 }
 
 bool Presenter::IsGuestPaused() const noexcept {
@@ -1122,10 +1236,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	// held to the refresh it got 57 of a 102 fps game's frames a second on a 60 Hz display, 5x showing 285, not 500.)
 	const bool generated = FrameGen::Enabled() && frame.fg.valid && !reuse;
 	if (!generated && !m_impl->PresentDue()) {
-		// A frame the display could not show anyway (menus and movies run far above it); it
-		// stays the latest frame for an idle refresh, and the next vblank that finds the display
-		// ready and no newer frame shows it (PresentSkippedIfDue).
-		m_impl->skipped_unshown = true;
+		// (PresentLoop waited until it was due.)
 		m_impl->frames.Release(&frame, true);
 		return;
 	}
@@ -1201,9 +1312,6 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
-#if defined(_WIN32)
-		m_impl->skipped_unshown = false;
-#endif
 		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;

@@ -818,6 +818,138 @@ void MakeCriticalThread() {
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 }
 
+namespace {
+// d3dkmthk.h (WDK) structures for the display's vertical blank, taken from gdi32 at run time.
+using KmtHandle = UINT;
+struct KmtOpenAdapterFromGdiDisplayName {
+	WCHAR     DeviceName[32];
+	KmtHandle hAdapter;
+	LUID      AdapterLuid;
+	UINT      VidPnSourceId;
+};
+struct KmtWaitForVerticalBlankEvent {
+	KmtHandle hAdapter;
+	KmtHandle hDevice;
+	UINT      VidPnSourceId;
+};
+struct KmtCloseAdapter {
+	KmtHandle hAdapter;
+};
+using KmtOpenFn  = LONG(APIENTRY*)(KmtOpenAdapterFromGdiDisplayName*);
+using KmtWaitFn  = LONG(APIENTRY*)(const KmtWaitForVerticalBlankEvent*);
+using KmtCloseFn = LONG(APIENTRY*)(const KmtCloseAdapter*);
+
+struct DisplayVblanks {
+	std::mutex              mutex;
+	std::condition_variable changed;
+	uint64_t                count = 0;
+	std::atomic<HWND>       window {nullptr};
+	std::atomic<bool>       started {false};
+};
+DisplayVblanks g_display_vblanks;
+
+bool MonitorDevice(HWND window, HMONITOR& monitor, MONITORINFOEXW& info) {
+	monitor     = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+	info        = {};
+	info.cbSize = sizeof(info);
+	return monitor != nullptr && GetMonitorInfoW(monitor, &info) != FALSE;
+}
+
+void CountDisplayVblanks(KmtOpenFn open, KmtWaitFn wait, KmtCloseFn close) {
+	SetThreadName("Kyty.DisplayVblank");
+	MakeCriticalThread();
+	HMONITOR  monitor = nullptr;
+	KmtHandle adapter = 0;
+	UINT      source  = 0;
+	uint32_t  waits   = 0;
+	const auto release = [&] {
+		if (adapter != 0) {
+			const KmtCloseAdapter request {adapter};
+			(void)close(&request);
+			adapter = 0;
+		}
+	};
+	for (;;) {
+		// The window's display: at the start, after a failed wait and every 120 vblanks (the window may have moved).
+		if (adapter == 0 || ++waits >= 120) {
+			waits = 0;
+			HMONITOR       now = nullptr;
+			MONITORINFOEXW info {};
+			if (!MonitorDevice(g_display_vblanks.window.load(), now, info)) {
+				release();
+				Sleep(100);
+				continue;
+			}
+			if (adapter == 0 || now != monitor) {
+				release();
+				KmtOpenAdapterFromGdiDisplayName request {};
+				wcsncpy_s(request.DeviceName, info.szDevice, _TRUNCATE);
+				if (open(&request) != 0) {
+					Sleep(100);
+					continue;
+				}
+				monitor = now;
+				adapter = request.hAdapter;
+				source  = request.VidPnSourceId;
+			}
+		}
+		const KmtWaitForVerticalBlankEvent request {adapter, 0, source};
+		if (wait(&request) != 0) {
+			release();
+			Sleep(16);
+			continue;
+		}
+		{
+			std::lock_guard lock(g_display_vblanks.mutex);
+			g_display_vblanks.count++;
+		}
+		g_display_vblanks.changed.notify_all();
+	}
+}
+} // namespace
+
+int DisplayRefreshHz(void* window) {
+	HMONITOR       monitor = nullptr;
+	MONITORINFOEXW info {};
+	if (!MonitorDevice(static_cast<HWND>(window), monitor, info)) return 0;
+	DEVMODEW mode {};
+	mode.dmSize = sizeof(mode);
+	if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) == FALSE) return 0;
+	return mode.dmDisplayFrequency > 1 ? static_cast<int>(mode.dmDisplayFrequency) : 0;
+}
+
+bool StartDisplayVblanks(void* window) {
+	g_display_vblanks.window.store(static_cast<HWND>(window));
+	if (g_display_vblanks.started.load()) return true;
+	HMODULE    gdi   = GetModuleHandleW(L"gdi32.dll");
+	if (gdi == nullptr) gdi = LoadLibraryW(L"gdi32.dll");
+	const auto open  = gdi != nullptr ? reinterpret_cast<KmtOpenFn>(reinterpret_cast<void*>(
+	                                       GetProcAddress(gdi, "D3DKMTOpenAdapterFromGdiDisplayName")))
+	                                  : nullptr;
+	const auto wait  = gdi != nullptr ? reinterpret_cast<KmtWaitFn>(reinterpret_cast<void*>(
+	                                       GetProcAddress(gdi, "D3DKMTWaitForVerticalBlankEvent")))
+	                                  : nullptr;
+	const auto close = gdi != nullptr ? reinterpret_cast<KmtCloseFn>(reinterpret_cast<void*>(
+	                                        GetProcAddress(gdi, "D3DKMTCloseAdapter")))
+	                                  : nullptr;
+	if (open == nullptr || wait == nullptr || close == nullptr) return false;
+	if (!g_display_vblanks.started.exchange(true)) std::thread(CountDisplayVblanks, open, wait, close).detach();
+	return true;
+}
+
+bool WaitDisplayVblank(uint64_t& seen, uint32_t timeout_us) {
+	if (!g_display_vblanks.started.load()) return false;
+	std::unique_lock lock(g_display_vblanks.mutex);
+	if (seen == 0) seen = g_display_vblanks.count; // (a caller's first wait: the next vblank)
+	if (!g_display_vblanks.changed.wait_for(lock, std::chrono::microseconds(timeout_us),
+	                                        [&] { return g_display_vblanks.count > seen; })) {
+		return false;
+	}
+	// One vblank a call: those that came while the caller was away are caught up, four at most.
+	seen = std::max(seen + 1, g_display_vblanks.count > 4 ? g_display_vblanks.count - 4 : uint64_t {0});
+	return true;
+}
+
 uint64_t OpenScratchFile() {
 	wchar_t directory[MAX_PATH + 1] {}, path[MAX_PATH + 1] {};
 	if (GetTempPathW(MAX_PATH + 1, directory) == 0 || GetTempFileNameW(directory, L"kyt", 0, path) == 0) return 0;
@@ -1566,6 +1698,18 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 }
 
 void MakeCriticalThread() {}
+
+int DisplayRefreshHz(void* /*window*/) {
+	return 0;
+}
+
+bool StartDisplayVblanks(void* /*window*/) {
+	return false;
+}
+
+bool WaitDisplayVblank(uint64_t& /*seen*/, uint32_t /*timeout_us*/) {
+	return false;
+}
 
 // Handles are the file descriptor + 1 (0: none).
 uint64_t OpenScratchFile() {

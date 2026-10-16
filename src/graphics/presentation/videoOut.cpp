@@ -834,9 +834,76 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	EXIT_IF(frequency == 0);
 
 	int64_t total_wait = 0;
+	// VSync on a display refreshing at a whole multiple of the vblank rate: each vblank waits for `display_per_tick` of
+	// the display's (Presenter::DisplayVblanksPerTick, looked at again every 120 vblanks) instead of the timer. A display
+	// whose vblanks miss that rate keeps the timer for good: with a variable (or dynamic) refresh rate they follow the
+	// presents, and vblanks waiting for them would wait for the game.
+	uint32_t display_per_tick = 0;
+	uint64_t display_seen     = 0;
+	uint32_t display_check    = 0; // vblanks until DisplayVblanksPerTick
+	bool     display_refused  = false;
+	uint32_t display_ticks    = 0; // the vblanks timed since display_since (their average period checked every 120)
+	uint64_t display_since    = 0;
+	const auto refuse_display = [&](const char* what, double ms, double expected_ms) {
+		std::printf("VSync: %s %.3f ms, not %.3f ms (a variable refresh rate?): the vblanks keep their own clock\n", what, ms,
+		            expected_ms);
+		std::fflush(stdout);
+		display_refused  = true;
+		display_per_tick = 0;
+	};
 	while (!token.stop_requested()) {
+		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
+		const auto period  = std::max(frequency / refresh, uint64_t {1});
+
+		if (display_check-- == 0) {
+			display_check           = 120;
+			const uint32_t per_tick = display_refused ? 0 : m_presenter.DisplayVblanksPerTick(refresh);
+			if (per_tick != display_per_tick) {
+				if (per_tick != 0) {
+					std::printf("VSync: the %u Hz vblanks keep to the display's (%u to one)\n", refresh, per_tick);
+				} else {
+					std::printf("VSync: the display changed: the vblanks keep their own clock\n");
+				}
+				std::fflush(stdout);
+				display_per_tick = per_tick;
+				display_seen     = 0;
+				display_ticks    = 0;
+			}
+		}
+
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
+		bool       waited      = false; // for the display's vblanks
+		if (display_per_tick != 0) {
+			waited = true;
+			// Half a display refresh late: it has none at this rate. (The first wait: the display's thread may still be
+			// starting.)
+			const uint32_t interval_us = 1000000u / (refresh * display_per_tick);
+			bool           ok          = true;
+			uint64_t       last        = sleep_begin;
+			for (uint32_t i = 0; i < display_per_tick && ok; i++) {
+				const bool first = display_seen == 0;
+				last             = Common::Timer::QueryPerformanceCounter();
+				ok = m_presenter.WaitForDisplayVblank(display_seen, first ? 100000u : interval_us * 3 / 2);
+			}
+			const auto now = Common::Timer::QueryPerformanceCounter();
+			const auto ms  = [&](uint64_t ticks) { return static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency); };
+			if (!ok) {
+				refuse_display("no vblank from the display in", ms(now - last), interval_us / 1000.0);
+			} else if (display_ticks++ == 0) {
+				display_since = now;
+			} else if (display_ticks == 121) {
+				// (Within 1%: a 59.94 Hz display keeps 60 Hz vblanks, 0.1% slower; with a variable refresh rate the
+				// display waits for each present after a vblank, 3% or more.)
+				const double average  = ms(now - display_since) / 120.0;
+				const double expected = 1000.0 / refresh;
+				if (std::abs(average - expected) > expected * 0.01) {
+					refuse_display("a vblank kept to the display's took", average, expected);
+				}
+				display_ticks = 0;
+			}
+			total_wait = 0;
+		}
+		if (!waited && total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
@@ -846,14 +913,15 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			break;
 		}
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
-		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
+		if (!waited) total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
 
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
-
+		// The frames go to the presenter's thread (Presenter::Submit): a present waiting for the display never holds
+		// up a vblank. Its idle refreshes (the last frame again, a blank one) only when it has nothing else.
 		if (m_presenter.IsGuestPaused()) {
-			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
-				m_presenter.Present(*frame, true);
+			if (m_presenter.PresentIdle()) {
+				if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
+					m_presenter.Submit(*frame, true);
+				}
 			}
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
 			total_wait +=
@@ -863,11 +931,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
-		if (!presented) presented = m_presenter.PresentSkippedIfDue();
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+		if (!presented && m_presenter.NeedsSystemOverlayRefresh() && m_presenter.PresentIdle()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
-				m_presenter.Present(*frame, true);
-				presented = true;
+				m_presenter.Submit(*frame, true);
 			} else {
 				uint32_t width  = 0;
 				uint32_t height = 0;
@@ -876,12 +942,11 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 					width  = m_video_out_ctx[0].width;
 					height = m_video_out_ctx[0].height;
 				}
-				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
-				m_presenter.Present(blank);
-				presented = true;
+				m_presenter.SubmitBlank(width, height, true);
 			}
+			presented = true;
 		}
-		if (!presented && total_wait < 0) {
+		if (!presented && total_wait < 0 && m_presenter.PresentIdle()) {
 			bool     any_open = false;
 			uint32_t width    = 0;
 			uint32_t height   = 0;
@@ -894,8 +959,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				}
 			}
 			if (!any_open) {
-				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
-				m_presenter.Present(blank);
+				m_presenter.SubmitBlank(width, height, true);
 			}
 		}
 		VblankEnd();
@@ -1216,11 +1280,12 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	m_requests.front().state = RequestState::Presenting;
 	m_mutex.Unlock();
-	// The port is not locked while presenting (a present can wait for the swapchain): the GPU thread reserves the
-	// next flip under it. The presented frame is its own copy; a port closed meanwhile takes no status or event.
+	// The port is not locked while the frame goes to the presenter's thread (Presenter::Submit; the present itself
+	// waits for no vblank of the guest's): the GPU thread reserves the next flip under it. The presented frame is its
+	// own copy; a port closed meanwhile takes no status or event.
 	r.cfg->mutex.Unlock();
 
-	m_presenter.Present(*r.frame);
+	m_presenter.Submit(*r.frame);
 
 	r.cfg->mutex.Lock();
 	m_mutex.Lock();

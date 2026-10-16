@@ -69,6 +69,16 @@ void MakeBackgroundThread(const char* avoid_cpus);
 // unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
 void MakeCriticalThread();
 
+// The refresh rate in Hz of the display a window is on (its HWND on Windows; 0 when unknown or elsewhere).
+int DisplayRefreshHz(void* window);
+// Vertical blanks of that display, counted by a thread of their own that waits for each (Windows:
+// D3DKMTWaitForVerticalBlankEvent on the window's display, again when the window moves to another one); a window
+// passed again replaces the first. false where there are none.
+bool StartDisplayVblanks(void* window);
+// Waits up to `timeout_us` for a display vblank after the `seen`th one; `seen` then counts it. Several that came while
+// the caller was away are taken one call each (four at most). false on a timeout or without StartDisplayVblanks.
+bool WaitDisplayVblank(uint64_t& seen, uint32_t timeout_us);
+
 // A temporary file for scratch data, deleted when it is closed or the process ends (Windows keeps it
 // in memory while it can: FILE_ATTRIBUTE_TEMPORARY); 0 when none could be made. Writes and reads go
 // to any offset, from any thread.
