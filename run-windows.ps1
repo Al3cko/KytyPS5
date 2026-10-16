@@ -364,6 +364,12 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
+# it: run.cmd -FrameGen 1 had started with frame generation off, its runtime not found (issue #38).
+if (!$StreamlineDir -and $FrameGen -gt 0 -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
+	$chosen = try { [string](Get-Content "$PSScriptRoot\launcher-settings.json" -Raw | ConvertFrom-Json).streamline } catch { '' }
+	if ($chosen -and (Test-Path $chosen)) { $StreamlineDir = $chosen }
+}
 if ($StreamlineDir) { $environment['KYTY_STREAMLINE_DIR'] = $StreamlineDir }
 # -Set KEY=VALUE overrides a switch of the config; KEY= drops it. Several: -Set A=1,B=2 (a comma
 # starts a new pair only before KEY=, so values such as 1,2,3,6,7 stay whole).
