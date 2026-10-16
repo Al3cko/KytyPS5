@@ -498,9 +498,13 @@ struct PipelineCache::ProgramCache {
 		plan_reloads++;
 	}
 
-	// Each flip; every PlanSweepFlips, the plans no use needed for PlanIdleFlips leave memory, written first where no
-	// file holds them yet (a few a sweep: programs translated during play; the warmup's and the prefetch's are). They
-	// are destroyed on a compile worker (the warmup's thousands at once: their IR nodes freed off the render thread).
+	// Each flip; every PlanSweepFlips, the plans no use needed for PlanIdleFlips leave memory beyond a budget of RAM/128
+	// (~77 KB a plan: 1,700 at 16 GB, 3,400 at 32 GB, 13,600 at 128 GB), the least recently used first, written first
+	// where no file holds them yet (a few a sweep: programs translated during play; the warmup's and the prefetch's are).
+	// They are destroyed on a compile worker (the warmup's thousands at once: their IR nodes freed off the render thread).
+	// Without the budget every idle plan left, also on PCs with RAM to spare: a place came back with a frame of reloads
+	// (~70 plans, 29 ms of IR rebuilt): a walk at 1-1 back from other worlds peaked at 42 ms each time, 20-24 ms kept;
+	// Stonefang's walk 1% low 54-57 fps, 78-81 kept.
 	void SweepPlans() {
 		// (KYTY_PLAN_IDLE_FLIPS=<n>: another idle time, and a sweep each n/30 flips: a test of plans leaving and coming
 		// back all the time.)
@@ -512,11 +516,26 @@ struct PipelineCache::ProgramCache {
 		static constexpr uint32_t PlanWritesPerSweep = 4;
 		const uint32_t            PlanSweepFlips     = PlanIdleFlips / 30u;
 		if (!PlanEvictionEnabled() || ++plan_clock % PlanSweepFlips != 0) return;
-		uint32_t writes = 0;
-		auto     freed  = std::make_shared<std::vector<ShaderRecompiler::IR::ResourcePlan>>();
+		// (RAM the system does not report: a budget of 0, every idle plan leaves.)
+		static const size_t budget = [] {
+			const uint64_t ram = LocalPlatform::PhysicalMemory();
+			return static_cast<size_t>(ram / 128u / (77u * 1024u));
+		}();
+		size_t                    in_memory = 0;
+		std::vector<SourceEntry*> idle;
 		for (auto& [key, source]: programs) {
 			(void)key;
-			if (source.plan_out || plan_clock - source.plan_use < PlanIdleFlips) continue;
+			if (source.plan_out) continue;
+			in_memory++;
+			if (plan_clock - source.plan_use >= PlanIdleFlips) idle.push_back(&source);
+		}
+		if (in_memory <= budget || idle.empty()) return;
+		std::ranges::sort(idle, {}, [](const SourceEntry* source) { return source->plan_use; });
+		idle.resize(std::min(idle.size(), in_memory - budget));
+		uint32_t writes = 0;
+		auto     freed  = std::make_shared<std::vector<ShaderRecompiler::IR::ResourcePlan>>();
+		for (auto* entry: idle) {
+			auto& source = *entry;
 			if (source.plan_spilled.bytes == 0) {
 				if (writes >= PlanWritesPerSweep || !SpillPlanBytes(source.resource_plan, source.plan_spilled)) continue;
 				writes++;
