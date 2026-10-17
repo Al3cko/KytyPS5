@@ -51,6 +51,8 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1055,7 +1057,7 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
 		        return vk::enumerateInstanceExtensionProperties(nullptr, count, values);
 	        });
 
-	r.enable_validation_layers = Config::VulkanValidationEnabled();
+	r.enable_validation_layers = Config::VulkanValidationEnabled() || Config::SyncValidationEnabled();
 	// HDR10 surface formats (VK_COLOR_SPACE_HDR10_ST2084_EXT) are listed only with this extension.
 	if (Config::HdrEnabled() &&
 	    HasExtension(r.available_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) &&
@@ -1167,6 +1169,24 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
+	if (error && Config::SyncValidationEnabled()) {
+		// (KYTY_VULKAN_SYNCVAL: logged, not fatal: 5 messages of a kind - the id and the message's first 240 characters
+		// with the digits left out, so the same hazard on another handle or command is not a new kind - and 20000 in
+		// all; the layer's own limit of 10 an id is off, KYTY_VULKAN_SYNCVAL sets VK_KHRONOS_VALIDATION_ENABLE_MESSAGE_LIMIT.)
+		static std::mutex                                logged_mutex;
+		static std::unordered_map<std::string, uint32_t> logged;
+		static uint32_t                                  total = 0;
+		const std::string id = callback_data->pMessageIdName != nullptr ? callback_data->pMessageIdName : "?";
+		std::string       kind = id + ':';
+		for (const char* at = callback_data->pMessage; *at != '\0' && kind.size() < id.size() + 240; ++at)
+			if (*at < '0' || *at > '9') kind += *at;
+		std::lock_guard lock(logged_mutex);
+		if (const auto count = ++logged[kind]; count <= 5 && ++total <= 20000) {
+			std::printf("SYNCVAL %s #%u (kinds %zu): %s\n", id.c_str(), count, logged.size(), callback_data->pMessage);
+			std::fflush(stdout);
+		}
+		return VK_FALSE;
+	}
 	if (error) {
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
@@ -1249,8 +1269,30 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
+	vk::ValidationFeatureEnableEXT enabled_features[4]    = {};
 	uint32_t                       enabled_features_count = 0;
+	// KYTY_VULKAN_SYNCVAL: synchronization validation; alone (without --vulkan-validation) the other checks are off.
+	vk::ValidationFeatureDisableEXT disabled_features[5]    = {};
+	uint32_t                        disabled_features_count = 0;
+	if (Config::SyncValidationEnabled()) {
+		// (Read by the layer when the instance is made: every hazard reaches the callback, which limits them itself.)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		_putenv_s("VK_KHRONOS_VALIDATION_ENABLE_MESSAGE_LIMIT", "false");
+		_putenv_s("VK_KHRONOS_VALIDATION_SYNCVAL_MESSAGE_EXTRA_PROPERTIES", "true");
+#else
+		setenv("VK_KHRONOS_VALIDATION_ENABLE_MESSAGE_LIMIT", "false", 1);
+		setenv("VK_KHRONOS_VALIDATION_SYNCVAL_MESSAGE_EXTRA_PROPERTIES", "true", 1);
+#endif
+		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eSynchronizationValidation;
+		if (!Config::VulkanValidationEnabled()) {
+			for (const auto feature: {vk::ValidationFeatureDisableEXT::eCoreChecks, vk::ValidationFeatureDisableEXT::eThreadSafety,
+			                          vk::ValidationFeatureDisableEXT::eApiParameters,
+			                          vk::ValidationFeatureDisableEXT::eObjectLifetimes, vk::ValidationFeatureDisableEXT::eShaders})
+				disabled_features[disabled_features_count++] = feature;
+		}
+		std::printf("Vulkan synchronization validation is enabled (KYTY_VULKAN_SYNCVAL): hazards are logged as SYNCVAL lines\n");
+		std::fflush(stdout);
+	}
 #ifdef KYTY_ENABLE_BEST_PRACTICES
 	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
 #endif
@@ -1271,8 +1313,8 @@ void WindowContext::CreateVulkan() {
 	validation_features.pNext                          = nullptr;
 	validation_features.enabledValidationFeatureCount  = enabled_features_count;
 	validation_features.pEnabledValidationFeatures     = enabled_features;
-	validation_features.disabledValidationFeatureCount = 0;
-	validation_features.pDisabledValidationFeatures    = nullptr;
+	validation_features.disabledValidationFeatureCount = disabled_features_count;
+	validation_features.pDisabledValidationFeatures    = disabled_features_count != 0 ? disabled_features : nullptr;
 
 	vk::DebugUtilsMessengerCreateInfoEXT dbg_create_info {};
 	dbg_create_info.sType           = vk::StructureType::eDebugUtilsMessengerCreateInfoEXT;
