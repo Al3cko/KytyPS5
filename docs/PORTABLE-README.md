@@ -217,6 +217,9 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 - It crashes now and then.
 - Sound: 3D sound has no direction, and there is no reverb.
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
+- On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
+  card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
+  `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".
 - Windows may say "Windows protected your PC" (the programs are not signed): click
   "More info → Run anyway". For a zip downloaded from the internet, you can tick "Unblock" in the
   zip file's properties before extracting it.
