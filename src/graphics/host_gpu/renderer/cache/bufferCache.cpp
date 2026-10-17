@@ -1443,15 +1443,22 @@ void BufferCache::WriteBufferReport(const char* path) {
 	m_scheduler.Context().GetGpu().SendCommandSync([this, path] {
 		FILE* file = std::fopen(path, "wb");
 		if (file == nullptr) return;
-		std::fputs("id\taddress\tsize\tlru_tick\tgc_tick\tmapped\tgpu_modified\tcpu_modified\tbda_read\n", file);
+		std::fputs("id\taddress\tsize\tlru_tick\tgc_tick\tmapped\tgpu_modified\tcpu_modified\tbda_read\tmapped_bytes\tmapped_parts\n",
+		           file);
+		std::vector<std::pair<uint64_t, uint64_t>> parts;
 		m_slot_buffers.ForEach([&](BufferId id, const Buffer& buffer) {
 			if (buffer.is_deleted || buffer.CpuAddress() == 0) return;
 			const auto address = buffer.CpuAddress(), size = buffer.Size();
-			std::fprintf(file, "%u\t0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%d\t%d\t%d\t%d\n", id.index, address,
-			             size, m_lru_cache.TickOf(buffer.lru_id), m_gc_tick,
+			// (How much of it guest mappings cover, in how many pieces: video memory over unmapped guest memory.)
+			LibKernel::Memory::MappedParts(address, size, &parts);
+			uint64_t mapped_bytes = 0;
+			for (const auto& part: parts) mapped_bytes += part.second;
+			std::fprintf(file, "%u\t0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%d\t%d\t%d\t%d\t%" PRIu64 "\t%zu\n",
+			             id.index, address, size, m_lru_cache.TickOf(buffer.lru_id), m_gc_tick,
 			             LibKernel::Memory::IsFullyMapped(address, size) ? 1 : 0,
 			             m_memory_tracker.IsRegionGpuModified(address, size) ? 1 : 0,
-			             m_memory_tracker.IsRegionCpuModified(address, size) ? 1 : 0, buffer.bda_read ? 1 : 0);
+			             m_memory_tracker.IsRegionCpuModified(address, size) ? 1 : 0, buffer.bda_read ? 1 : 0, mapped_bytes,
+			             parts.size());
 		});
 		std::fclose(file);
 	});
