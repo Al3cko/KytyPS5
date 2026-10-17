@@ -431,7 +431,7 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 // with Mono Mix Mode on, Demon's Souls stops setting PCM on its 36 ambisonics object ports (it mixes into its main port
 // itself) and keeps them; each push mixed their last grain again, a high tone that never ended. An object port without
 // PCM for this grain is left out of the mix (on the console a grain's PCM holds for that grain only).
-// (Diagnostic.) A port fed the same non-silent bytes for 100 pushes in a row (its first KiB hashed) is reported once:
+// (Diagnostic.) A port fed the same non-silent bytes for 100 pushes in a row (its first 256 hashed) is reported once:
 // the game's own mix stopped moving.
 static void audioout2_note_grain_locked(AudioOut2ContextHandle ctx) {
 	static std::atomic<uint32_t> reported {0};
@@ -452,7 +452,7 @@ static void audioout2_note_grain_locked(AudioOut2ContextHandle ctx) {
 			            static_cast<unsigned long long>(state.handle), state.ambisonics);
 		}
 		if (!state.pcm_fresh) continue;
-		const auto bytes = std::min<uint64_t>(1024, static_cast<uint64_t>(state.samples_num) *
+		const auto bytes = std::min<uint64_t>(256, static_cast<uint64_t>(state.samples_num) *
 		                                                audioout2_data_format_channels(state.data_format) * 2);
 		const auto* data = static_cast<const uint8_t*>(state.pcm_data);
 		uint64_t    hash = 0xcbf29ce484222325ull;
