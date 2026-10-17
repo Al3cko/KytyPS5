@@ -220,6 +220,10 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 - On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
   card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
   `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".
+- With DLSS frame generation on, the game may stop at start-up with "Could not create the Vulkan device with DLSS
+  frame generation". A user's fix on an RTX 5080 (issue #45): in Windows Security, App & browser control > Exploit
+  protection > Program settings, add `kyty_emulator.exe` and, under "Randomize memory allocations (Bottom-up ASLR)",
+  tick "Override system settings" and turn it On.
 - Windows may say "Windows protected your PC" (the programs are not signed): click
   "More info → Run anyway". For a zip downloaded from the internet, you can tick "Unblock" in the
   zip file's properties before extracting it.
