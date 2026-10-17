@@ -1981,9 +1981,11 @@ void TextureCache::InitializeImage(ImageId id) {
 			if (uploaded) image.staged_ring = nullptr;
 		}
 		// CPU writes over known parts of it, and GPU buffer writes over known parts or none: the subresources over either
-		// alone, each piece from guest memory or from the buffer the GPU wrote it in. The partial upload above takes no
-		// image with buffer writes and stages guest bytes alone: a texture pool's range over memory the GPU writes too
-		// (issue #49: 1 GB of 1024x1024 slots) went up whole when the game streamed a texture into it, 190-360 ms frames.
+		// alone. The partial upload above takes no image with buffer writes and stages guest bytes alone: a texture pool's
+		// range over memory the GPU writes too (issue #49: 1 GB of 1024x1024 slots) went up whole when the game streamed a
+		// texture into it, 190-360 ms frames. The sources are the whole upload's (one for all of it below ChunkedUploadMin,
+		// a piece at a time past it): asked for pieces, the buffer cache made and joined buffers inside the image's range
+		// again and again (an 8 GB laptop's GPU faults in the culling chain came 3 times in 4 tours with that, 10-18).
 		if (!uploaded && image.IsPartiallyCpuDirty() && !image.IsMaybeCpuDirty() &&
 		    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 1 &&
 		    (!image.IsBufferModified() || (!image.BufferModifiedRanges().empty() &&
@@ -1992,7 +1994,8 @@ void TextureCache::InitializeImage(ImageId id) {
 			if (image.IsBufferModified()) {
 				for (const auto& [begin, end]: image.BufferModifiedRanges()) Image::AddRange(ranges, begin, end);
 			}
-			uploaded = UploadImageChunked(image, &ranges);
+			uploaded = image.info.data.size >= ChunkedUploadMin ? UploadImageChunked(image, &ranges)
+			                                                    : UploadImageSubresources(image, ranges);
 			if (uploaded) image.staged_ring = nullptr;
 		}
 		if (!uploaded && UploadImageChunked(image)) {
@@ -2251,6 +2254,61 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 	LiveCounters::Add(LiveCounters::PartialUploads);
 	LiveCounters::Add(LiveCounters::PartialUploadBytes, total);
 	LogPartialUpload(image, pieces.size(), total);
+	return true;
+}
+
+// The subresources over `ranges` alone, from the source a whole upload of the image takes (ObtainBufferForImage over all
+// of it: the buffer cache sees the same request), detiled only where the ranges are.
+bool TextureCache::UploadImageSubresources(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	const auto& info    = image.info;
+	const auto  binding = UploadBinding(image);
+	if (binding == BindingType::DepthTarget || info.IsVolume()) {
+		return false;
+	}
+	auto& cached = m_partial_plans[image.serial];
+	if (cached.plan == nullptr || cached.binding != binding) {
+		cached.plan    = std::make_shared<TextureTransferPlan>(BuildTextureTransfer(image, binding, TransferDirection::Upload));
+		cached.binding = binding;
+	}
+	const auto& plan = *cached.plan;
+	if (!plan.valid || plan.swap_bgra16 || plan.tiles.empty() || plan.tiles.size() != plan.regions.size()) {
+		return false;
+	}
+	std::vector<GpuTileInfo>         tiles;
+	std::vector<vk::BufferImageCopy> regions;
+	uint64_t                         linear_total = 0;
+	for (size_t index = 0; index < plan.tiles.size(); index++) {
+		auto       tile   = plan.tiles[index];
+		auto       region = plan.regions[index];
+		const auto begin  = info.data.address + tile.tiled_offset;
+		if (!IntersectsRanges(ranges, begin, begin + tile.tiled_size)) {
+			continue;
+		}
+		if (region.bufferOffset < tile.linear_offset) {
+			return false;
+		}
+		const auto linear_offset = (linear_total + 255) & ~uint64_t {255};
+		region.bufferOffset      = linear_offset + (region.bufferOffset - tile.linear_offset);
+		tile.linear_offset       = linear_offset;
+		linear_total             = linear_offset + tile.linear_size;
+		tiles.push_back(tile);
+		regions.push_back(region);
+	}
+	LiveCounters::Add(LiveCounters::PartialUploads);
+	if (tiles.empty()) {
+		return true; // (only padding between subresources)
+	}
+	const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(info.data.address, info.data.size);
+	if (source == nullptr) {
+		EXIT("TextureCache: failed to obtain image upload source\n");
+	}
+	const auto linear = m_tiler.Detile(source->Handle(), source_offset, info.data.size, linear_total, tiles,
+	                                   source->Usage() == MemoryUsage::Upload);
+	for (auto& region: regions) {
+		region.bufferOffset += linear.offset;
+	}
+	image.Upload(regions, linear.buffer, linear.offset, linear.size);
+	LiveCounters::Add(LiveCounters::PartialUploadBytes, linear_total);
 	return true;
 }
 

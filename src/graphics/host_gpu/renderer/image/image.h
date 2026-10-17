@@ -323,9 +323,10 @@ private:
 			}
 			at = m_buffer_ranges.erase(at, last);
 			m_buffer_ranges.insert(at, {begin, end});
-			// (Past a few, all of it: what a whole upload costs. More in a large image, where the whole is GBs: a texture
-			// pool's range over memory the GPU writes in many places, issue #49.)
-			if (m_buffer_ranges.size() > (info.data.size >= (uint64_t {64} << 20u) ? 256u : 16u)) {
+			// (Past a few, all of it: what a whole upload costs. More in an image uploaded a piece at a time anyway (256 MiB
+			// and up, TextureCache's ChunkedUploadMin), where the whole is GBs: a texture pool's range over memory the GPU
+			// writes in many places, issue #49.)
+			if (m_buffer_ranges.size() > (info.data.size >= (uint64_t {256} << 20u) ? 256u : 16u)) {
 				m_buffer_whole = true;
 				m_buffer_ranges.clear();
 			}
