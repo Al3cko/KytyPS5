@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "resource-plan-serial.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -2880,6 +2881,34 @@ static std::filesystem::path StaticCachePath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".bin");
 }
 
+// The translation features the static store's pipelines were made with (ShaderRecompiler::Frontend::TranslatorFeatures):
+// _PipelineCache/static/<title>_<version>.features, written by a precompile whose last merge made the store of its own
+// pipelines alone (--merge --prune). None (an older store, none at all): 0.
+static std::filesystem::path StaticFeaturesPath() {
+	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".features");
+}
+
+static uint32_t ReadStaticFeatures() {
+	std::ifstream file(StaticFeaturesPath());
+	uint32_t      features = 0;
+	return file >> features ? features : 0u;
+}
+
+static void WriteStaticFeatures() {
+	namespace Translate = ShaderRecompiler::Frontend;
+	const auto      path      = StaticFeaturesPath();
+	auto            temporary = path;
+	std::error_code error;
+	temporary += ".tmp";
+	{
+		std::ofstream file(temporary, std::ios::trunc);
+		file << Translate::TranslatorFeatureSet() << '\n';
+		if (!file) return;
+	}
+	std::filesystem::rename(temporary, path, error);
+	PipelineCacheLog("Static pipeline store: made with translation features {:#x}", Translate::TranslatorFeatureSet());
+}
+
 // Its pipelines as the driver's binaries (VK_KHR_pipeline_binary), read when needed: the driver keeps a
 // copy of a whole pipeline cache in memory. Headed by the GPU, the driver and its global pipeline key.
 static std::filesystem::path StaticBinariesPath() {
@@ -2969,6 +2998,21 @@ static std::vector<uint8_t> ReadPipelineCacheFile(const std::filesystem::path& p
 
 void PipelineCache::InitializeStaticCache(bool create) {
 	if (PipelineCacheTitleId().empty() || KYTY_BUILD != KYTY_BUILD_RELEASE) return;
+#ifndef KYTY_STATIC_PRECOMPILE
+	// The game's shaders translated as its static pipeline store's were (before any is translated: the pipeline cache's
+	// construction): an older store's pipelines stay in use. No update makes a player compile again: 9935d547's
+	// cooperative halves missed an older store on an 8 GB laptop, where the pipelines made at their first use (past the
+	// warm-up's video memory) took 4.5-6.6 s each on the render thread. A precompile stamps the store it makes with the
+	// features it translated with, and offers itself again until then (StaticCacheCurrent).
+	if (!create) {
+		namespace Translate = ShaderRecompiler::Frontend;
+		Translate::SetTranslatorFeatures(ReadStaticFeatures());
+		if (const auto off = Translate::TranslatorFeatures & ~Translate::TranslatorFeatureSet(); off != 0)
+			PipelineCacheLog("Translation features {:#x} off: the static pipeline store was made without them (precompile "
+			                 "again to use them)",
+			                 off);
+	}
+#endif
 	// KYTY_STATIC_PIPELINE_CACHE=0: without it (first-encounter comparisons).
 	if (const char* value = std::getenv("KYTY_STATIC_PIPELINE_CACHE"); !create && value != nullptr &&
 	    std::string_view(value) == "0")

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -15,6 +16,24 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+static std::atomic<uint32_t> g_translator_features {TranslatorFeatures};
+
+void SetTranslatorFeatures(uint32_t features) {
+	g_translator_features.store(features & TranslatorFeatures, std::memory_order_relaxed);
+}
+
+uint32_t TranslatorFeatureSet() {
+	// (KYTY_LANE_LOCAL_COOP=0/1: the cooperative halves off or on, whatever the store was made with.)
+	static const int cooperative = [] {
+		const char* value = std::getenv("KYTY_LANE_LOCAL_COOP");
+		return value == nullptr ? -1 : std::string_view(value) != "0" ? 1 : 0;
+	}();
+	auto features = g_translator_features.load(std::memory_order_relaxed);
+	if (cooperative >= 0)
+		features = cooperative != 0 ? features | TranslatorFeatureCooperativeHalves : features & ~TranslatorFeatureCooperativeHalves;
+	return features;
+}
 
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
 	switch (index) {
@@ -962,12 +981,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			return value == nullptr || std::string_view(value) != "0";
 		}();
 		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
-		// Cooperative halves (KYTY_LANE_LOCAL_COOP=0: off): a group of exactly one wave on 32-wide subgroups, its halves
-		// the workgroup's two subgroups, may exchange lanes through workgroup memory (LaneLocal.cpp).
-		static const bool cooperative_enabled = [] {
-			const char* value = std::getenv("KYTY_LANE_LOCAL_COOP");
-			return value == nullptr || std::string_view(value) != "0";
-		}();
+		// Cooperative halves: a group of exactly one wave on 32-wide subgroups, its halves the workgroup's two subgroups,
+		// may exchange lanes through workgroup memory (LaneLocal.cpp). Where the static pipeline store was made with them
+		// (SetTranslatorFeatures; KYTY_LANE_LOCAL_COOP=0/1 decides otherwise).
+		const bool cooperative_enabled = (TranslatorFeatureSet() & TranslatorFeatureCooperativeHalves) != 0;
 		const auto* group = options.compute;
 		const bool  one_wave =
 		    group != nullptr && group->host_subgroup_size == 32u &&

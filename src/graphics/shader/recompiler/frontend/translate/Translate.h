@@ -60,4 +60,14 @@ struct LaneLocalProof {
 bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof,
                         std::string* reason = nullptr);
 
+// Translation features that change the SPIR-V of shaders a static pipeline store holds pipelines for (bits). A store
+// made before one keeps its pipelines in use only while the translation leaves that feature out: no update makes a
+// player compile pipelines again (the static precompile stamps its store with them: PipelineCache).
+constexpr uint32_t TranslatorFeatureCooperativeHalves = 1u; // LaneLocal.cpp's cooperative halves (9935d547)
+constexpr uint32_t TranslatorFeatures                 = TranslatorFeatureCooperativeHalves;
+// Those the translation uses (default: all; the emulator sets those its static store was made with before it translates
+// anything). KYTY_LANE_LOCAL_COOP=0/1 overrides the cooperative halves either way.
+void                   SetTranslatorFeatures(uint32_t features);
+[[nodiscard]] uint32_t TranslatorFeatureSet();
+
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend
