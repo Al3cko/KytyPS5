@@ -1,4 +1,5 @@
 #include "frame-gen.h"
+#include "frame-gen-hudless.h"
 
 #include "common/logging/log.h"
 #include "local-platform.h"
@@ -79,6 +80,8 @@ bool IsDepthFormat(vk::Format format) {
 	}
 }
 
+} // namespace
+
 void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect,
                 vk::ImageLayout layout, vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
 	vk::ImageMemoryBarrier2 barrier {};
@@ -98,6 +101,8 @@ void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFl
 	command.pipelineBarrier2(dependency);
 	image.state = {stage, access, layout};
 }
+
+namespace {
 
 // (Re)create `image` as a sampled copy target like `source`; with `attachment`, a color
 // attachment too where the format allows it (*attachment tells).
@@ -460,6 +465,10 @@ bool WantsCamera() {
 	return g_ready && !g_camera.valid;
 }
 
+bool InputsGathered() {
+	return g_sources.valid && g_camera.valid;
+}
+
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
@@ -669,6 +678,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
 	}
 	g_ready = true;
+	InitializeHudless();
 	LOGF("frame generation: DLSS-G ready\n");
 	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame)\n", g_generate);
 	std::fflush(stdout);
@@ -1191,6 +1201,7 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 			graphics.DeleteImage(*image);
 		}
 	}
+	DestroyHudlessInputs(graphics, inputs);
 	inputs.valid = false;
 }
 
