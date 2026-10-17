@@ -957,10 +957,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (indirect_args != 0) {
 		m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
 	}
+	auto&    buffer_cache = m_context.GetBufferCache();
+	uint64_t unregistered = buffer_cache.UnregisterEpoch();
 	RebindBuffers(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 7);
 	RebindImages(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 8);
+	// (A buffer resolved above joined into a new one since - by a later buffer's lookup or an image's refresh - no longer
+	// owns its bytes, and the dispatch's writes there would be lost: as PrepareGraphicsBindingsInto.)
+	for (uint32_t attempt = 0; attempt < 4 && buffer_cache.UnregisterEpoch() != unregistered; ++attempt) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("Bindings: a buffer was unregistered while a dispatch's bindings were made (CS 0x%016llx), resolved "
+			            "again\n",
+			            static_cast<unsigned long long>(program.shader_hash));
+		unregistered = buffer_cache.UnregisterEpoch();
+		RebindBuffers(bindings);
+	}
 	if (FrameGen::IsTaaShader(program.shader_hash)) FrameGen::NoteScene(); // (the game's 3D view)
 	if (FrameGen::Enabled() && FrameGen::IsTaaShader(program.shader_hash) &&
 	    bindings.images.size() > 3) {

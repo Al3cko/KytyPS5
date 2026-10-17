@@ -983,6 +983,7 @@ void BufferCache::Register(BufferId id) {
 }
 
 void BufferCache::Unregister(BufferId id) {
+	++m_unregister_epoch;
 	ChangeRegister<false>(id);
 }
 
