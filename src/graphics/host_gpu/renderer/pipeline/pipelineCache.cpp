@@ -2901,8 +2901,8 @@ static uint32_t ReadStaticFeatures() {
 	return ReadStaticStamp().first;
 }
 
-// `made`: the store holds this precompile's pipelines alone.
-static void WriteStaticFeatures(bool made) {
+// `made`: the store holds this precompile's pipelines alone. (The precompile tool's merge: the emulator has no use.)
+[[maybe_unused]] static void WriteStaticFeatures(bool made) {
 	namespace Translate = ShaderRecompiler::Frontend;
 	const auto      used      = Translate::TranslatorFeatureSet();
 	const auto      features  = made ? used : ReadStaticFeatures();
