@@ -262,10 +262,9 @@ struct TextureCacheTestAccess {
 
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
-                                         uint64_t tick, uint64_t pressure) {
+                                         uint64_t tick, [[maybe_unused]] uint64_t pressure) {
+    // (One collection threshold since 10-01: collecting from no memory use.)
     cache.m_trigger_gc_memory = 0;
-    cache.m_pressure_gc_memory = pressure;
-    cache.m_critical_gc_memory = UINT64_MAX;
     cache.m_gc_tick = tick;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
@@ -430,7 +429,8 @@ struct RenderExecutorTestAccess {
   static bool TryConsumeComputeMetaClear(RenderExecutor &executor,
                                          const ShaderComputeInputInfo &input,
                                          const CommandBuffer &buffer) {
-    return executor.TryConsumeComputeMetaClear(input, buffer, 0, 0, 0, 0);
+    uint64_t cleared = 0;
+    return executor.TryConsumeComputeMetaClear(input, buffer, 0, 0, 0, 0, cleared);
   }
 
   static TextureBinding
@@ -14519,7 +14519,7 @@ OpFunctionEnd
     scheduler.Begin(registers, user_config, shaders);
     StreamBuffer parameters(m_runtime_context, scheduler, MemoryUsage::Stream,
                             1u << 20);
-    TileManager tile_manager(m_runtime_context, scheduler, parameters);
+    TileManager tile_manager(m_runtime_context, scheduler);
     constexpr uint64_t conversion_limit = 128ull << 20;
     Require(name, "D16 conversion chunk boundaries",
             TileManagerTestAccess::ConversionRows(0, 32ull << 10, 32ull << 10,
@@ -28927,6 +28927,15 @@ void CheckDepthTextureEncoding() {
       "compressed sampled depth accepted an unsupported address or control");
 
   std::printf("[host]    %-32s ok\n", "DepthTextureEncoding");
+}
+
+// (The storage-view validation these death tests expect to end the process: since b310b97c the binding reports the view
+// and binds null, StorageTextureReport.)
+void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource &resource, const ShaderTextureResource &descriptor,
+                            uint64_t size) {
+  if (const auto report = StorageTextureReport(resource, descriptor, size); !report.empty()) {
+    EXIT("%s\n", report.c_str());
+  }
 }
 
 ShaderRecompiler::IR::ImageResource BasicStorageTextureResource() {
