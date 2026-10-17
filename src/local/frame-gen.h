@@ -79,6 +79,10 @@ void BypassCommandHooks(vk::Device device);
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count);
 void AfterPresent();
+// Present thread: the swapchain is made again (DLSS-G off until frames with inputs turn it on again).
+void SwapchainChanging();
+// Any thread: a frame with inputs was left unshown (the presenter kept a newer one): the next one resets DLSS-G's history.
+void NoteDroppedFrame();
 // Present thread: the frames DLSS-G showed per presented frame (1 without generation), as last
 // queried (about once a second), for the KYTY_FPS_HUD panel.
 [[nodiscard]] uint32_t PresentedFrames();

@@ -34,6 +34,11 @@
 #include <vector>
 #endif
 
+extern "C" {
+// DLSS-G frames' Reflex sleep (slReflexSleep, every present): 0 skips it (KYTY_FRAMEGEN_SLEEP=0).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_framegen_sleep {1};
+}
+
 namespace Libs::Graphics::FrameGen {
 
 namespace {
@@ -216,6 +221,7 @@ struct Api {
 	PFun_slDLSSGGetState*        dlssg_get_state     = nullptr;
 	PFun_slReflexSetOptions*     reflex_set_options  = nullptr;
 	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
+	PFun_slReflexSleep*          reflex_sleep        = nullptr;
 };
 Api              g_api;
 sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
@@ -225,6 +231,14 @@ vk::Extent2D     g_options_backbuffer {};
 vk::Extent2D     g_options_render {};
 vk::Format       g_options_format = vk::Format::eUndefined; // SDR or HDR10 swapchain
 uint64_t         g_presents = 0;
+// DLSS-G on (generating) or off with its resources kept (eRetainResourcesWhenOff): off after TurnOffAfter presents in a
+// row without inputs (menus, movies, loading), on after TurnOnAfter with them, so a fade or a cut does not flap it. On
+// with null tags it was asked to generate frames it had no inputs for (Streamline "Failed to find global tag").
+constexpr uint32_t TurnOffAfter = 30, TurnOnAfter = 10;
+bool               g_mode_on    = false;
+uint32_t           g_run_with   = 0, g_run_without = 0; // presents in a row with inputs, without them
+// A frame with inputs the presenter left unshown (NoteDroppedFrame): the next one's motion spans two game frames.
+std::atomic<bool>  g_discontinuity {false};
 
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
 using Mat4 = sl::float4x4;
@@ -580,6 +594,8 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	    !FeatureFunction(sl::kFeaturePCL, "slPCLSetMarker", g_api.pcl_set_marker)) {
 		return;
 	}
+	// (Required with DLSS-G, whatever the Reflex mode: Streamline's DLSS-G and Reflex guides.)
+	(void)FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
 	sl::ReflexOptions reflex {};
 	reflex.mode = sl::ReflexMode::eLowLatency;
 	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
@@ -600,11 +616,15 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	}
 	const sl::ViewportHandle viewport {0};
 	const bool               usable = inputs != nullptr && inputs->valid;
+	g_run_with    = usable ? g_run_with + 1 : 0;
+	g_run_without = usable ? 0 : g_run_without + 1;
+	const bool mode_on = g_mode_on ? g_run_without < TurnOffAfter : g_run_with >= TurnOnAfter;
 	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.
-	if (!g_options_set || g_options_format != format ||
+	if (!g_options_set || g_options_format != format || mode_on != g_mode_on ||
 	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
 		sl::DLSSGOptions options {};
-		options.mode                = sl::DLSSGMode::eOn;
+		options.mode                = mode_on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+		options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
 		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
 		options.numBackBuffers      = image_count;
 		options.colorWidth          = backbuffer.width;
@@ -623,6 +643,10 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		g_options_set        = true;
 		g_options_backbuffer = backbuffer;
 		g_options_format     = format;
+		if (mode_on != g_mode_on) {
+			LOGF("frame generation: DLSS-G %s\n", mode_on ? "on" : "off (no inputs)");
+			g_mode_on = mode_on;
+		}
 	}
 
 	++g_frame_index;
@@ -631,6 +655,9 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		return;
 	}
 	auto& token = *g_token;
+	// The frame's Reflex sleep, then its markers (all at its present: the game's frame was made before).
+	if (g_api.reflex_sleep != nullptr && kyty_local_framegen_sleep.load(std::memory_order_relaxed) != 0)
+		g_api.reflex_sleep(token);
 	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
 	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
 	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
@@ -661,7 +688,10 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	constants.depthInverted       = sl::Boolean::eTrue;
 	constants.cameraMotionIncluded = sl::Boolean::eTrue;
 	constants.motionVectors3D     = sl::Boolean::eFalse;
-	constants.reset               = usable ? sl::Boolean::eFalse : sl::Boolean::eTrue;
+	// (A frame left unshown before this one: its motion and matrices are to the game's previous frame, not to the one
+	// presented last.)
+	const bool discontinuity      = g_discontinuity.exchange(false, std::memory_order_relaxed);
+	constants.reset               = usable && !discontinuity ? sl::Boolean::eFalse : sl::Boolean::eTrue;
 	constants.orthographicProjection = sl::Boolean::eFalse;
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
@@ -803,6 +833,29 @@ void AfterPresent() {
 		std::fflush(stdout);
 	}
 #endif
+}
+
+void SwapchainChanging() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
+	if (!g_ready || !g_mode_on) return;
+	sl::DLSSGOptions options {};
+	options.mode                = sl::DLSSGMode::eOff;
+	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
+	options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
+		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
+	g_mode_on     = false;
+	g_run_with    = 0;
+	g_options_set = false; // (the next present sends its sizes again)
+#endif
+}
+
+void NoteDroppedFrame() {
+	g_discontinuity.store(true, std::memory_order_relaxed);
+	static std::atomic<uint32_t> dropped {0};
+	if (const auto count = dropped.fetch_add(1, std::memory_order_relaxed) + 1; count <= 8 || count % 600 == 0)
+		LOGF("frame generation: %u frame(s) with inputs left unshown (the next resets DLSS-G's history)\n", count);
 }
 
 uint32_t PresentedFrames() {
