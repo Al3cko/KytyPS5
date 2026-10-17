@@ -4,6 +4,9 @@ param([switch]$DryRun)
 # they are kept in launcher-settings.json next to this script. -DryRun prints the commands without a window.
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+# cmd.exe by its full path: Start-Process with a bare "cmd" opens whatever "cmd" it finds first, and a file of that
+# name without an extension (in the working folder or on the PATH) made Windows ask which app should open it (issue #47).
+$cmd = if ($env:ComSpec -and (Test-Path -LiteralPath $env:ComSpec)) { $env:ComSpec } else { Join-Path ([Environment]::SystemDirectory) 'cmd.exe' }
 $settingsPath = Join-Path $root 'launcher-settings.json'
 $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish (Spain)', 'German', 'Italian', 'Dutch',
 	'Portuguese (Portugal)', 'Russian', 'Korean', 'Chinese (Traditional)', 'Chinese (Simplified)', 'Finnish', 'Swedish',
@@ -328,16 +331,16 @@ function Read-Form {
 }
 $play.Add_Click({
 	Read-Form
-	Start-Process cmd -ArgumentList "/v:on /s /c `"$(Get-PlayCommand)`"" -WorkingDirectory $root
+	Start-Process $cmd -ArgumentList "/v:on /s /c `"$(Get-PlayCommand)`"" -WorkingDirectory $root
 	$form.Close()
 })
 $precompile.Add_Click({
 	Read-Form
-	Start-Process cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand)`"" -WorkingDirectory $root
+	Start-Process $cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand)`"" -WorkingDirectory $root
 })
 $share.Add_Click({
 	Read-Form
-	Start-Process cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand '-ExportHints')`"" -WorkingDirectory $root
+	Start-Process $cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand '-ExportHints')`"" -WorkingDirectory $root
 })
 $logs.Add_Click({
 	$folder = if (Test-Path "$root\_Build") { "$root\_Build\run-logs" } else { "$root\logs" }
