@@ -1056,8 +1056,17 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	if (!storage && type == Prospero::ImageType::kColor2D) {
 		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
 	}
-	if (!storage) HoldLayerRange(texture_cache, desc, limits.maxImageArrayLayers);
-	if (desc.info.resources.layers > limits.maxImageArrayLayers) {
+	// KYTY_TEST_MAX_ARRAY_LAYERS=<n>: textures held as if the GPU's images held no more than n layers. 2048 = NVIDIA's: an
+	// AMD GPU (8192) then binds the texture-pool views past it null as NVIDIA does (issue #24: a picture broken on AMD
+	// alone, after some play); with KYTY_TEXTURE_LAYER_RANGE=0 too, every view of such a pool, as before c3a332ba.
+	static const uint32_t test_max_layers = [] {
+		const char* value = std::getenv("KYTY_TEST_MAX_ARRAY_LAYERS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	const uint32_t max_layers =
+	    test_max_layers != 0 ? std::min(test_max_layers, limits.maxImageArrayLayers) : limits.maxImageArrayLayers;
+	if (!storage) HoldLayerRange(texture_cache, desc, max_layers);
+	if (desc.info.resources.layers > max_layers) {
 		return bind_null(fmt::format("unrepresentable texture (exceeds host image limits): {}x{} layers={} levels={} "
 		                             "format={} base_array={} addr=0x{:016x}",
 		                             width, height, desc.info.resources.layers, levels, static_cast<uint32_t>(format),
