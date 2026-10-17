@@ -291,4 +291,19 @@ void CommandBuffer::EndRendering() const {
 	m_render_state = {};
 }
 
+void CommandBuffer::ResumeRendering(const RenderState& state) const {
+	RenderState load = state;
+	for (uint32_t i = 0; i < load.num_color_attachments; i++) {
+		load.color_attachments[i].is_clear = false;
+	}
+	load.depth_stencil_attachment.depth_clear   = false;
+	load.depth_stencil_attachment.stencil_clear = false;
+	BeginRendering(load);
+	m_render_state = state;
+}
+
+bool CommandBuffer::RenderingWith(const RenderState& state) const {
+	return m_rendering && SameRendering(m_render_state, state);
+}
+
 } // namespace Libs::Graphics

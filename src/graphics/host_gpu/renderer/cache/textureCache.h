@@ -117,6 +117,8 @@ public:
 		TouchImage(image);
 		return image;
 	}
+	// The image, or null when `id` names no live image (an erased one a record kept): not touched.
+	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
 	void MarkGpuWritten(ImageId id);
 	// A speculative translation's use of the image, when it is committed (`serial`: the image it used).
 	void TouchSpeculated(Image& image, uint64_t serial);
