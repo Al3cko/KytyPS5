@@ -1980,6 +1980,21 @@ void TextureCache::InitializeImage(ImageId id) {
 			uploaded          = UploadImageChunked(image, &ranges);
 			if (uploaded) image.staged_ring = nullptr;
 		}
+		// CPU writes over known parts of it, and GPU buffer writes over known parts or none: the subresources over either
+		// alone, each piece from guest memory or from the buffer the GPU wrote it in. The partial upload above takes no
+		// image with buffer writes and stages guest bytes alone: a texture pool's range over memory the GPU writes too
+		// (issue #49: 1 GB of 1024x1024 slots) went up whole when the game streamed a texture into it, 190-360 ms frames.
+		if (!uploaded && image.IsPartiallyCpuDirty() && !image.IsMaybeCpuDirty() &&
+		    kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 1 &&
+		    (!image.IsBufferModified() || (!image.BufferModifiedRanges().empty() &&
+		                                   kyty_local_buffer_ranges_mode.load(std::memory_order_relaxed) != 0))) {
+			auto ranges = image.CpuDirtyRanges();
+			if (image.IsBufferModified()) {
+				for (const auto& [begin, end]: image.BufferModifiedRanges()) Image::AddRange(ranges, begin, end);
+			}
+			uploaded = UploadImageChunked(image, &ranges);
+			if (uploaded) image.staged_ring = nullptr;
+		}
 		if (!uploaded && UploadImageChunked(image)) {
 			uploaded            = true;
 			image.staged_ring   = nullptr;
