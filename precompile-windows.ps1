@@ -171,6 +171,7 @@ if ($ExportHints) {
 	Start-Process explorer.exe "/select,`"$out`""
 	exit 0
 }
+$recordedLost = $false
 if ($Recorded -eq '*') {
 	$Recorded = ''
 	$hints = "$PSScriptRoot\tools\local\static-precompile\hints-$gameId.hints"
@@ -212,6 +213,7 @@ if ($Recorded -eq '*') {
 		if ($LASTEXITCODE) {
 			Write-Host 'the specializations of recorded play could not be gathered (kyty_shader_precompile --make-hints/--apply-hints): the seeds alone'
 			$Recorded = ''
+			$recordedLost = $true
 		}
 	}
 }
@@ -377,9 +379,10 @@ while ($first.Count -or $second.Count -or $running.Count) {
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
-# (-Quick: what the store held of the other shaders stays.)
+# (-Quick: what the store held of the other shaders stays. Recorded play that could not be gathered: the pipelines an
+# earlier run made for it stay too - pruned to the seeds alone, the game compiled them all again while playing.)
 $mergeArguments = @('--merge')
-if (!$Quick) { $mergeArguments += '--prune' }
+if (!$Quick -and !$recordedLost) { $mergeArguments += '--prune' }
 Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
 if ($Quick) { Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs' }
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries",
