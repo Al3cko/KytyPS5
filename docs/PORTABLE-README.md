@@ -78,12 +78,12 @@ play the HUD keeps its shape: health, magic, stamina and the equipment at the le
 the right edge, the boss's health in the middle. The in-game menus are stretched to the width; the lock-on
 and enemy health bars stay on their targets; pre-rendered movies and loading screens are shown at 16:9
 with black bars. Pick the matching resolution (2560x1080, 3440x1440, 5120x2160, ...) or full screen.
-"Graphics" (Standard by default, as on the PS5) sets how much the game draws. Low draws shadows from
-simpler meshes, picks the level of detail as for a 720-line picture and ends sun shadows at 125 m
-(250 m); Lowest picks detail as for 480 lines, ends sun shadows at 60 m and turns off ambient shadowing
+"Graphics" (Standard by default, as on the PS5) sets how much the game draws. Low picks the level of
+detail as for a 720-line picture and ends sun shadows at 125 m (250 m); Lowest picks detail as for 480
+lines, ends sun shadows at 60 m and turns off ambient shadowing
 and the shadows of torches and other lamps. Each thing drawn costs the emulator processor time, so these
-help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing in Latria: 22.6 fps at
-Standard, 25.5 at Low, 25.8 at Lowest; 28.8 at Lowest with render height 1080).
+help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing at the Gates of
+Boletaria: 21.9 fps at Standard, 25.6 at Lowest).
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
@@ -129,7 +129,7 @@ shortcut):
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
 | `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
 | `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides, in-game menus are stretched, movies stay 16:9 |
-| `-Quality low` | How much the game draws: `low` or `lowest` (simpler shadows and distant detail), faster where the processor limits the frame rate |
+| `-Quality low` | How much the game draws: `low` or `lowest` (shorter shadows, simpler distant detail), faster where the processor limits the frame rate |
 
 ## Shader precompile (without it the game stutters)
 
