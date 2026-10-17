@@ -94,7 +94,9 @@ the frames per second and a graph of the last frames' times (60 and 30 fps lines
 and the longest frame of the last 10 seconds); "Detailed" adds the render thread's time in each frame (orange),
 the graphics card (load, clock, temperature, power and video memory on NVIDIA cards), the processor's load
 with a bar for each core, and the memory in use. (The overlays seen in videos with temperatures and voltages
-of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.)
+of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.) In the
+game, F8 switches the panel between Off, "Frame rate" and "Detailed", whatever the launcher started it with
+(also when started with `run.cmd`).
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 
@@ -191,18 +193,10 @@ Default keyboard layout:
 | Backspace / Tab | Left / right half of the touch pad |
 | F7 | Camera with the mouse (press again to release the mouse) |
 | Space | **Pause / resume the emulation** (careful not to hit it by accident) |
+| F8 | The emulator's overlay: Off, Frame rate, Detailed (the launcher's "Overlay" is where it starts) |
 | F11, Alt+Enter | Toggle full screen |
-| F9 / F10, F8 | Debug warp: pick a map's spawn point, arm (or cancel) the warp |
 
 The keyboard has no L2 / R2 by default: use a gamepad when you need them.
-
-**Debug warp** (for testing other areas): F9 / F10 show the list of spawn points of every map (read
-from the game's map files) and move in it, F8 arms the shown one. Then leave to the title (OPTIONS >
-Settings, the gear tab > Exit Game > Save and Exit Game) and Continue: the game loads on that map.
-The save on disk is only changed by the game itself when it saves on the new map (the panel then says
-"Warp done"), so a character can be warped back the same way; it keeps everything else (level,
-items, world progress). Some spawn points are at a boss's fog gate. A character still in the tutorial
-can be warped too; one in the character creation cannot (it has no save yet).
 
 ## Files and folders
 

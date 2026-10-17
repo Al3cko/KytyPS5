@@ -498,7 +498,20 @@ struct Presenter::Impl {
 		const auto now   = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
+		if (level < 2) {
+			// (Switched down from detailed with F8: its rows go.)
+			hud.perf.rows.clear();
+			hud.perf.core_load.clear();
+			hud.perf.core_fast.clear();
+			hud.perf.core_note.clear();
+		}
 		if (level == 0) {
+			hud.title.clear();
+			hud.detail.clear();
+			hud.perf.frame_ms.clear();
+			hud.perf.busy_ms.clear();
+			hud_window = {}; // (the count starts again when it is switched on)
+			hud_frames = 0;
 			return hud.status.empty() && hud.notice.empty() ? nullptr : PlaceHud();
 		}
 		if (level >= 2 && !machine_started) {
@@ -1294,6 +1307,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			auto&             command          = m_impl->present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    (overlay_visual.active || hud != nullptr) && swapchain.PrepareSystemOverlay(hud);
+			if (FrameGen::Enabled() && (hud == nullptr || !draw_system_overlay)) {
+				FrameGen::SetStaticRect(0.0f, 0.0f, 0.0f, 0.0f); // (no panel: the whole picture moves)
+			}
 			if (hud != nullptr && draw_system_overlay && FrameGen::Enabled()) {
 				// The panel's motion vectors are zeroed (a margin around it).
 				const auto& region = hud->region;
