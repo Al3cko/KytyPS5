@@ -54,9 +54,15 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// `may_fail` (a sampled texture's lookup): no image when the GPU cannot make one (its memory full, or more layers or
+	// bytes than the format allows), an invalid id, and none tried again for that memory for a while.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false, bool may_fail = false);
 	// An image of exactly this guest texture is registered (what FindImage takes first; no lookup side effects).
 	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
+	// The layers of a one-level array a sampled view reads, `info` (slices one after another: descriptors.cpp
+	// HoldLayerRange), held by an image of other layers too: `info` becomes that image's and `first` the view's first
+	// layer in it. See the definition.
+	void                        HoldLayers(ImageInfo& info, uint32_t& first);
 	// Addresses that gained their first registered image, in registration
 	// order: a caller that proved "no image starts here" at StartEpoch() E only
 	// needs the addresses logged after E.
@@ -199,7 +205,15 @@ private:
 	// Resolution epoch of the last (un)registration per image page.
 	using ImageEpochTable = MultiLevelPageTable<uint64_t, 20, 40, 10>;
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, bool may_fail = false);
+	// Images the GPU could not make (InsertImage's `may_fail`): their memory is not asked for again for FailedRetryTicks
+	// collector runs, and meanwhile the collector takes images unused for a shorter time (RunGarbageCollector).
+	struct FailedImage {
+		uint64_t address = 0, size = 0, tick = 0;
+	};
+	std::vector<FailedImage>  m_failed_images;
+	uint64_t                  m_failed_tick = 0; // (+1: 0 is none)
+	[[nodiscard]] bool        RecentlyFailed(const ImageInfo& info) const;
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
