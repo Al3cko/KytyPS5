@@ -45,14 +45,6 @@ bool ComputeChains() {
 	return IsSupportedGame() && kyty_local_compute_chain_mode.load(std::memory_order_relaxed) != 0;
 }
 
-// The programs whose dispatches never join a chain unless KYTY_CHAIN_FENCE lists others (KYTY_CHAIN_FENCE=0 fences none:
-// Windows cannot set an empty value, PowerShell and cmd delete the variable).
-// fe938d3a2d22b5c2 is the program that continues chains most (10-14: ~50K dispatches in 10 s). 10-18, an RTX 3080
-// Laptop (NVIDIA 566.07) on the world tour's 1-1 arena save: with chains the GPU hung (TDR within the first 7 points) in
-// 3 of 4 full routes and 1 of 3 short ones; with fe93 fenced, 3 of 3 full and 3 of 3 short routes ran through, at
-// 26.2 fps instead of 26.8 (14-17 without chains). Which dispatch it overlaps with there is not found yet.
-constexpr std::array<uint64_t, 1> DefaultChainFence {0xfe938d3a2d22b5c2ULL};
-
 bool ComputeChains(uint64_t shader_hash) {
 	if (!ComputeChains()) return false;
 	static const std::vector<uint64_t> only = [] {
@@ -69,16 +61,19 @@ bool ComputeChains(uint64_t shader_hash) {
 		return list;
 	}();
 	// KYTY_CHAIN_FENCE=<hash>[;<hash>...] and KYTY_CHAIN_FENCE_RANGE=<lo>-<hi> (hex): those programs' dispatches get
-	// barriers, every other one chains (DefaultChainFence without KYTY_CHAIN_FENCE; bisections for a chain hang).
+	// barriers, every other one chains (bisections for a chain hang). None by default: 10-18, an RTX 3080 Laptop (NVIDIA
+	// 566.07) at the world tour's 1-1 arena save, the GPU hung (TDR) with chains in 3 of 8 runs of its first 15 route points
+	// and 3 of 4 full routes; fencing the program that continues chains most (fe938d3a2d22b5c2) made it rarer (1 hang in 10
+	// short runs, 0 in 4 full routes) but did not stop it, fencing the next two (abf2e4efdcec565c;c8334ecdfb41296f) not even
+	// that (2 of 5), and the fence of fe93 cost 12% of the frame rate on an RTX 5090 (114.6 -> ~100 fps): the user's call
+	// 10-18 was no fence by default. KYTY_COMPUTE_CHAIN=0 stops it there (3 of 3 full routes, at ~35% less fps).
 	struct Fence {
 		std::vector<uint64_t> list;
 		uint64_t              lo = 1, hi = 0; // (empty range)
 	};
 	static const Fence fence = [] {
-		Fence       parsed;
-		const char* value = std::getenv("KYTY_CHAIN_FENCE");
-		if (value == nullptr) parsed.list.assign(DefaultChainFence.begin(), DefaultChainFence.end());
-		for (const char* at = value; at != nullptr && *at != '\0';) {
+		Fence parsed;
+		for (const char* at = std::getenv("KYTY_CHAIN_FENCE"); at != nullptr && *at != '\0';) {
 			char*      end  = nullptr;
 			const auto hash = std::strtoull(at, &end, 16);
 			if (end == at) break;
@@ -91,10 +86,7 @@ bool ComputeChains(uint64_t shader_hash) {
 			parsed.lo = std::strtoull(range, &end, 16);
 			parsed.hi = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : parsed.lo;
 		}
-		if (value == nullptr && parsed.lo > parsed.hi)
-			std::printf("Compute chains: %zu program(s) never chained by default (KYTY_CHAIN_FENCE=0 for none)\n",
-			            parsed.list.size());
-		else if (!parsed.list.empty() || parsed.lo <= parsed.hi)
+		if (!parsed.list.empty() || parsed.lo <= parsed.hi)
 			std::printf("Compute chains: %zu programs fenced, range %016llx-%016llx (KYTY_CHAIN_FENCE)\n", parsed.list.size(),
 			            static_cast<unsigned long long>(parsed.lo), static_cast<unsigned long long>(parsed.hi));
 		return parsed;
