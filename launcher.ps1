@@ -30,10 +30,12 @@ $overlays = 'Off', 'Frame rate', 'Detailed'
 # the GPU overlap them. Slower, but it stops the GPU hangs ("device lost", the driver resetting the display) that some
 # PCs have: on an RTX 3080 Laptop with driver 566.07, 3 of 4 runs through 1-1 hung with overlap, none of 3 without it,
 # at 25-48% less frame rate there (13.9-17.7 fps instead of 26.8 at 1-1, 21-22 instead of 28.8 at 2-2).
-$safeGpuTip = "For PCs where the game stops with a GPU error: 'device lost', or the screen goes black and the graphics driver`n" +
-	"restarts (a TDR). The emulator then runs Demon's Souls' compute work one step after another instead of letting the GPU`n" +
-	"overlap the steps. That stopped these GPU hangs on a PC that had them, but costs a quarter to almost half of the`n" +
-	"frame rate. Leave it off if the game runs without such errors. Updating the graphics driver can help too."
+$safeGpuTip = "Prevents the crashes and blue screens that come from the graphics card hanging: 'device lost', the screen going`n" +
+	"black while the graphics driver restarts (a TDR), or a VIDEO_TDR_FAILURE blue screen. The emulator then runs Demon's Souls'`n" +
+	"compute work one step after another instead of letting the graphics card overlap the steps. The frame rate is about 37%`n" +
+	"lower (on a laptop RTX 3080 at Boletaria: 17 fps instead of 27). It does not help MEMORY_MANAGEMENT blue screens, which`n" +
+	"come from the RAM being full (see the README). Leave it off if the game runs without such crashes; a current graphics`n" +
+	"driver can help too."
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
 	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
@@ -244,7 +246,7 @@ $vsync = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'VSync (no
 Add-Row '' @($vsync)
 $hdr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'HDR (turn on "Use HDR" in Windows display settings first)'; AutoSize = $true; Checked = [bool]$settings.hdr }
 Add-Row '' @($hdr)
-$safeGpu = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Safe GPU mode (only if the game stops with GPU errors: lower frame rate)'; AutoSize = $true; Checked = [bool]$settings.safegpu }
+$safeGpu = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Safe GPU mode: prevents GPU-hang crashes and blue screens, but the frame rate is about 37% lower'; AutoSize = $true; Checked = [bool]$settings.safegpu }
 (New-Object System.Windows.Forms.ToolTip -Property @{ AutoPopDelay = 30000 }).SetToolTip($safeGpu, $safeGpuTip)
 Add-Row '' @($safeGpu)
 $render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
