@@ -7,15 +7,13 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
-#include <atomic>
-#include <cstdio>
-#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 // KYTY_COMPUTE_CHAIN=0: no chains (10-14, the 8 GB laptop's GPU hangs at 2-2, a TDR in ~half of the 10-minute tours
 // with chains: none in 8 tours without them, at ~25% less fps there). Fencing only the culling, list-building or atomic
@@ -45,6 +43,65 @@ bool ComputeChains() {
 	}();
 	(void)reported;
 	return IsSupportedGame() && kyty_local_compute_chain_mode.load(std::memory_order_relaxed) != 0;
+}
+
+// The programs whose dispatches never join a chain unless KYTY_CHAIN_FENCE lists others (an empty value fences none).
+// fe938d3a2d22b5c2 is the program that continues chains most (10-14: ~50K dispatches in 10 s). 10-18, an RTX 3080
+// Laptop (NVIDIA 566.07) on the world tour's 1-1 arena save: with chains the GPU hung (TDR within the first 7 points) in
+// 3 of 4 full routes and 1 of 3 short ones; with fe93 fenced, 3 of 3 full and 3 of 3 short routes ran through, at
+// 26.2 fps instead of 26.8 (14-17 without chains). Which dispatch it overlaps with there is not found yet.
+constexpr std::array<uint64_t, 1> DefaultChainFence {0xfe938d3a2d22b5c2ULL};
+
+bool ComputeChains(uint64_t shader_hash) {
+	if (!ComputeChains()) return false;
+	static const std::vector<uint64_t> only = [] {
+		std::vector<uint64_t> list;
+		for (const char* at = std::getenv("KYTY_CHAIN_ONLY"); at != nullptr && *at != '\0';) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(at, &end, 16);
+			if (end == at) break;
+			list.push_back(hash);
+			if (*end != ',' && *end != ';') break;
+			at = end + 1;
+		}
+		if (!list.empty()) std::printf("Compute chains: only %zu programs (KYTY_CHAIN_ONLY)\n", list.size());
+		return list;
+	}();
+	// KYTY_CHAIN_FENCE=<hash>[;<hash>...] and KYTY_CHAIN_FENCE_RANGE=<lo>-<hi> (hex): those programs' dispatches get
+	// barriers, every other one chains (DefaultChainFence without KYTY_CHAIN_FENCE; bisections for a chain hang).
+	struct Fence {
+		std::vector<uint64_t> list;
+		uint64_t              lo = 1, hi = 0; // (empty range)
+	};
+	static const Fence fence = [] {
+		Fence       parsed;
+		const char* value = std::getenv("KYTY_CHAIN_FENCE");
+		if (value == nullptr) parsed.list.assign(DefaultChainFence.begin(), DefaultChainFence.end());
+		for (const char* at = value; at != nullptr && *at != '\0';) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(at, &end, 16);
+			if (end == at) break;
+			parsed.list.push_back(hash);
+			if (*end != ',' && *end != ';') break;
+			at = end + 1;
+		}
+		if (const char* range = std::getenv("KYTY_CHAIN_FENCE_RANGE"); range != nullptr && *range != '\0') {
+			char* end = nullptr;
+			parsed.lo = std::strtoull(range, &end, 16);
+			parsed.hi = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : parsed.lo;
+		}
+		if (value == nullptr && parsed.lo > parsed.hi)
+			std::printf("Compute chains: %zu program(s) never chained by default (KYTY_CHAIN_FENCE= for none)\n",
+			            parsed.list.size());
+		else if (!parsed.list.empty() || parsed.lo <= parsed.hi)
+			std::printf("Compute chains: %zu programs fenced, range %016llx-%016llx (KYTY_CHAIN_FENCE)\n", parsed.list.size(),
+			            static_cast<unsigned long long>(parsed.lo), static_cast<unsigned long long>(parsed.hi));
+		return parsed;
+	}();
+	if ((shader_hash >= fence.lo && shader_hash <= fence.hi) ||
+	    std::find(fence.list.begin(), fence.list.end(), shader_hash) != fence.list.end())
+		return false;
+	return only.empty() || std::find(only.begin(), only.end(), shader_hash) != only.end();
 }
 
 // The engine's cs_memset32 shader (coredata/enginesupport/shaders/_ps5/cs_memset32) as the builds seen have it:
