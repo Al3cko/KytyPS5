@@ -42,6 +42,8 @@ public:
 	uint32_t Constant(uint32_t opcode, uint32_t type, const std::vector<uint32_t>& operands);
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, uint32_t storage_class);
 	void     DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t storage_class);
+	// (With an initial value: a Private variable's.)
+	uint32_t DefineInitializedVariable(uint32_t pointer_type, uint32_t storage_class, uint32_t initializer);
 
 	void        AddMemoryModel(std::initializer_list<uint32_t> operands);
 	void        AddEntryPoint(uint32_t execution_model, uint32_t entry_point, const char* name,

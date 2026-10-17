@@ -48,4 +48,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 // load at one address for a value the same in every lane (KYTY_LANE_LOCAL_UNIFORM_LOADS).
 bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = nullptr, bool* uniform_loads = nullptr);
 
+// What makes a wave64 program lane-local (LaneLocal.cpp): taken buffer loads at one address (uniform_loads), or, for a
+// 64-thread group whose two halves cooperate (`cooperative`), the lane reads the wave runs through workgroup memory and
+// the lane-mask branches the wave decides (by pc).
+struct LaneLocalProof {
+	bool                  uniform_loads = false;
+	std::vector<uint32_t> exchange_reads;
+	std::vector<uint32_t> wave_branches;
+	[[nodiscard]] bool    Cooperative() const { return !exchange_reads.empty() || !wave_branches.empty(); }
+};
+bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof,
+                        std::string* reason = nullptr);
+
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend
