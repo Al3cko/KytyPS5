@@ -20,7 +20,14 @@ Copy-Item "$root\_Build\windows-pgogen\kyty_emulator.exe", "$root\_Build\windows
 $params = @{ Label = 'pgotrain'; Exe = "$exe\kyty_emulator.exe"; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = 180 }
 if ($Set.Count) { $params['Set'] = $Set }
 if ($NoPrecompile) { $params['NoPrecompile'] = $true }
-& "$S\bench-run.ps1" @params | Select-Object -Last 1
+$started = & "$S\bench-run.ps1" @params | Select-Object -Last 1
+$started
+# A start-up that never reached the HUD would train the title screen: no profile then.
+if ("$started" -match 'no HUD') {
+	Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 } | Stop-Process -Force
+	'no profile: the game did not reach the HUD'
+	exit 1
+}
 function Plan([string]$plan) {
 	$walk = Start-Process powershell -ArgumentList '-NoProfile', '-File', "$S\keys.ps1", '-Plan', $plan -PassThru -WindowStyle Hidden
 	$walk.WaitForExit()
