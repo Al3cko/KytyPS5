@@ -78,6 +78,9 @@ extern "C" {
 // 1: a table set's image uses proven once are checked again only when their image or the registrations over their
 // pages changed (TableValidateSet); 2: all of them checked, those a proof held for that failed counted.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_set_proofs {1};
+// Table lookups that ask the last answer first (bits): 1 the pair cache's 4096 entries (else 256), 2 the pair's variant
+// found last, 4 the pair's image set before the last (TableTry, TableSet).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_mru {7};
 // 1: NativeXprStateKey hashes the context and the user configuration again only after a change of their registers;
 // 0: at every call; 2: as 1, each key checked against the full hash (STATE-KEY MISMATCH lines, counter
 // shortcut_mismatches).
