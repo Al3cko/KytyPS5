@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string>
 
 namespace Libs::Graphics {
 class CommandBuffer;
@@ -60,6 +61,10 @@ void Initialize();
 // After Initialize: Streamline is loaded (device creation then adds what it relies on but does
 // not add itself, VK_KHR_present_id for its VK_NV_low_latency2).
 [[nodiscard]] bool Requested();
+// Before the device is created: why Streamline says DLSS-G cannot run with this GPU, driver and Windows (e.g.
+// hardware-accelerated GPU scheduling turned off), logged; empty when it can, or when frame generation is off. A refused
+// device's error repeats it.
+[[nodiscard]] std::string SupportProblem(vk::PhysicalDevice physical_device);
 // After the device exists: checks that DLSS-G is available on it.
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device);
 // Right after the dispatcher is loaded for the device (before the recording layer copies it):

@@ -1447,14 +1447,17 @@ void WindowContext::CreateVulkan() {
 	const char* internal_cache                 = std::getenv("KYTY_PIPELINE_BINARY_INTERNAL_CACHE");
 	graphic_ctx.pipeline_binary_internal_cache = internal_cache != nullptr && std::string_view(internal_cache) == "1";
 
+	// (Streamline's own answer whether DLSS-G can run here, asked before the device: the refusal below gives it.)
+	const std::string frame_gen_problem = FrameGen::SupportProblem(graphic_ctx.physical_device);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, r, queue_family,
 	                                        device_extensions, graphic_ctx);
 	if (graphic_ctx.device == nullptr) {
 		// (Issue #32: an RTX 5080 whose driver refused the device Streamline asked for; the game runs without it.)
 		if (FrameGen::Requested()) {
-			EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline): start without "
+			EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline)%s%s: start without "
 			     "frame generation (launcher: Frame generation -> Off). KYTY_FRAMEGEN_VERBOSE=1 logs why the driver "
-			     "refused it.\n");
+			     "refused it.\n",
+			     frame_gen_problem.empty() ? "" : ": ", frame_gen_problem.c_str());
 		}
 		EXIT("Could not create device");
 	}

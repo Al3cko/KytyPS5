@@ -22,6 +22,7 @@
 #include <sl.h>
 #include <sl_consts.h>
 #include <sl_dlss_g.h>
+#include <sl_helpers.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
@@ -360,6 +361,46 @@ bool Enabled() {
 
 bool Requested() {
 	return g_generate > 0;
+}
+
+std::string SupportProblem(vk::PhysicalDevice physical_device) {
+	if (g_generate == 0) {
+		return {};
+	}
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (Streamline answers before the device too: its programming guide asks while the adapters are enumerated. Issue
+	// #45: a device refused with no word why; the driver's own refusal says nothing either.)
+	sl::AdapterInfo adapter {};
+	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+	const auto  result       = g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter);
+	std::string problem;
+	switch (result) {
+		case sl::Result::eOk: break;
+		case sl::Result::eErrorOSDisabledHWS:
+			problem = "Windows' hardware-accelerated GPU scheduling is off (Settings > System > Display > Graphics > "
+			          "Advanced graphics settings; then restart the PC)";
+			break;
+		case sl::Result::eErrorOSOutOfDate: problem = "this Windows version is too old for DLSS frame generation"; break;
+		case sl::Result::eErrorDriverOutOfDate: problem = "the NVIDIA driver is too old for DLSS frame generation"; break;
+		case sl::Result::eErrorNoSupportedAdapterFound:
+		case sl::Result::eErrorAdapterNotSupported:
+			problem = "this graphics card has no DLSS frame generation (NVIDIA RTX 40 or newer)";
+			break;
+		default: problem = std::string("Streamline does not offer DLSS frame generation here (") + sl::getResultAsStr(result) + ")"; break;
+	}
+	if (problem.empty()) {
+		LOGF("frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+		std::printf("Frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+	} else {
+		LOGF("frame generation: %s\n", problem.c_str());
+		std::printf("Frame generation: %s\n", problem.c_str());
+	}
+	std::fflush(stdout);
+	return problem;
+#else
+	(void)physical_device;
+	return {};
+#endif
 }
 
 bool WantsCamera() {
