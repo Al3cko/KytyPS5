@@ -962,12 +962,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_PROG_TRACE=<hash,...> (diagnostic, issue #52): for these programs' normal-path dispatches, a line per dispatch
 	// with each buffer binding (guest range, written, whether its bytes were CPU-dirty before it was resolved, bound from
 	// the shader upload ring or a game buffer) and each image binding (range, format, size, image serial, GPU-written).
+	// "indirect" in the list adds every indirect dispatch (who reads the arguments a traced program wrote).
 	static const std::string trace_programs = [] {
 		const char* value = std::getenv("KYTY_PROG_TRACE");
 		return value != nullptr ? std::string(value) : std::string();
 	}();
 	const bool trace = !trace_programs.empty() &&
-	                   trace_programs.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos;
+	                   (trace_programs.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos ||
+	                    (indirect_args != 0 && trace_programs.find("indirect") != std::string::npos));
 	std::vector<bool> dirty_before;
 	if (trace) {
 		for (const auto& source: bindings.buffer_sources)
@@ -978,8 +980,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 8);
 	if (trace) {
-		static std::atomic<uint32_t> lines {0};
-		if (lines.fetch_add(1, std::memory_order_relaxed) < 2000) {
+		// (At most 50 lines a program, 20000 in all: the programs asked for are not crowded out by others.)
+		static std::mutex                             lines_mutex;
+		static std::unordered_map<uint64_t, uint32_t> per_program;
+		static uint32_t                               lines = 0;
+		const bool                                    print = [&] {
+			std::lock_guard lock(lines_mutex);
+			return lines < 20000 && per_program[program.shader_hash]++ < 50 && ++lines != 0;
+		}();
+		if (print) {
 			std::string text = fmt::format("PROG-TRACE cs={:016x} tick={} groups={},{},{} indirect=0x{:x}",
 			                               program.shader_hash, m_context.GetCommandScheduler().CurrentTick(),
 			                               thread_group_x, thread_group_y, thread_group_z, indirect_args);
