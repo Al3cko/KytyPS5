@@ -1122,12 +1122,34 @@ Presenter::Frame* Presenter::PrepareLastFrame() {
 	return m_impl->frames.AcquireLast();
 }
 
+// KYTY_PRESENT_DIRECT=1 (a test for issue #37, a variable refresh rate that stopped engaging in v20261016b): each frame
+// is presented on the vblank thread as it is handed over, as before the presenter had a thread of its own (eadf554f).
+static bool PresentDirect() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PRESENT_DIRECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 void Presenter::Submit(Frame& frame, bool reuse) {
 	m_impl->frames.ValidateForPresent(&frame, reuse);
+	if (PresentDirect()) {
+		Present(frame, reuse);
+		return;
+	}
 	m_impl->Replace({.frame = &frame, .reuse = reuse});
 }
 
 void Presenter::SubmitBlank(uint32_t width, uint32_t height, bool opaque) {
+	if (PresentDirect()) {
+		// (A free frame, else none, as the presenter's thread does.)
+		if (auto* frame = m_impl->frames.Acquire(false); frame != nullptr) {
+			m_impl->ClearFrame(*frame, width, height, opaque, nullptr);
+			Present(*frame, false);
+		}
+		return;
+	}
 	m_impl->Replace({.blank = true, .width = width, .height = height, .opaque = opaque});
 }
 
