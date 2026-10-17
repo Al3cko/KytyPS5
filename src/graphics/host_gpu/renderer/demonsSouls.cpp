@@ -45,7 +45,8 @@ bool ComputeChains() {
 	return IsSupportedGame() && kyty_local_compute_chain_mode.load(std::memory_order_relaxed) != 0;
 }
 
-// The programs whose dispatches never join a chain unless KYTY_CHAIN_FENCE lists others (an empty value fences none).
+// The programs whose dispatches never join a chain unless KYTY_CHAIN_FENCE lists others (KYTY_CHAIN_FENCE=0 fences none:
+// Windows cannot set an empty value, PowerShell and cmd delete the variable).
 // fe938d3a2d22b5c2 is the program that continues chains most (10-14: ~50K dispatches in 10 s). 10-18, an RTX 3080
 // Laptop (NVIDIA 566.07) on the world tour's 1-1 arena save: with chains the GPU hung (TDR within the first 7 points) in
 // 3 of 4 full routes and 1 of 3 short ones; with fe93 fenced, 3 of 3 full and 3 of 3 short routes ran through, at
@@ -91,7 +92,7 @@ bool ComputeChains(uint64_t shader_hash) {
 			parsed.hi = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : parsed.lo;
 		}
 		if (value == nullptr && parsed.lo > parsed.hi)
-			std::printf("Compute chains: %zu program(s) never chained by default (KYTY_CHAIN_FENCE= for none)\n",
+			std::printf("Compute chains: %zu program(s) never chained by default (KYTY_CHAIN_FENCE=0 for none)\n",
 			            parsed.list.size());
 		else if (!parsed.list.empty() || parsed.lo <= parsed.hi)
 			std::printf("Compute chains: %zu programs fenced, range %016llx-%016llx (KYTY_CHAIN_FENCE)\n", parsed.list.size(),
