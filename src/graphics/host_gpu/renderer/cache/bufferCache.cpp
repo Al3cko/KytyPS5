@@ -1273,6 +1273,10 @@ bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
         vk::ComputePipelineCreateInfo pipeline {};
         pipeline.stage.stage = vk::ShaderStageFlagBits::eCompute;
         pipeline.stage.module = module; pipeline.stage.pName = "main";
+        // (The subgroup size the game's compute pipelines require here: GraphicContext::InternalComputeSubgroupSize.)
+        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {};
+        subgroup.requiredSubgroupSize = m_graphics.InternalComputeSubgroupSize();
+        if (subgroup.requiredSubgroupSize != 0) pipeline.stage.pNext = &subgroup;
         pipeline.layout = m_lod_pack_layout;
         RequireVulkanSuccess(m_graphics.device.createComputePipelines(nullptr, 1, &pipeline, nullptr, &m_lod_pack_pipeline),
                              "create LOD report pipeline");

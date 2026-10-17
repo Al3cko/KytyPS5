@@ -260,7 +260,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
-      m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
+      m_tiler(graphics, scheduler),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);

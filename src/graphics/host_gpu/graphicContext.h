@@ -133,6 +133,13 @@ struct GraphicContext {
 		return compute_subgroup_size_control_enabled ? compute_wave64_native : subgroup_size == 64u;
 	}
 
+	// The subgroup size the emulator's own compute pipelines require: 32 where compute pipelines choose one (AMD), as the
+	// game's compute pipelines there do; 0 elsewhere (the driver's). An RDNA2 driver crashed compiling the first tiler
+	// pipeline, which required none (issue #43).
+	[[nodiscard]] uint32_t InternalComputeSubgroupSize() const noexcept {
+		return compute_subgroup_size_control_enabled && min_subgroup_size <= 32u && max_subgroup_size >= 32u ? 32u : 0u;
+	}
+
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
 		const auto alignment = physical_device_properties.limits.minStorageBufferOffsetAlignment;
 		return alignment != 0 ? alignment : 1;
