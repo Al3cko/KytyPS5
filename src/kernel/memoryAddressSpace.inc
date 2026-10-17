@@ -1642,6 +1642,10 @@ private:
 	uint64_t m_alias_epoch = 1;
 };
 
+// The address range ReserveGuestRegions holds free for frame generation's device creation (ReleaseFrameGenAddressHole).
+static constexpr uint64_t FrameGenHoleSize = uint64_t {64} << 30u;
+static void*              g_frame_gen_hole = nullptr;
+
 class GuestAddressSpace;
 // (The address space while it lives: Kyty.Trim's trims go through it, TrimParkedRange.)
 static std::atomic<GuestAddressSpace*> g_trim_space {nullptr};
@@ -2459,6 +2463,20 @@ private:
 		}
 		if (ceiling != 0) {
 			guest_end = std::clamp<uint64_t>(ceiling, HOST_USER_MIN, guest_end);
+		}
+		// KYTY_FG_ADDRESS_HOLE=0|1 (default 1 with frame generation): 64 GiB right above the guest held free until the
+		// Vulkan device is made (ReleaseFrameGenAddressHole). The executable is not randomized (/DYNAMICBASE:NO), so the
+		// process's allocations after the guest's take the lowest free addresses one after another, from the guest's end
+		// up: on an RTX 5080 the device creation with frame generation failed (VK_ERROR_INITIALIZATION_FAILED) until the
+		// user turned on bottom-up address randomization for the emulator in Windows' exploit protection (issue #45),
+		// which scatters them. (The size NVIDIA's interop reserved below 1 TiB on the 5090: about 44 GiB.)
+		if (const char* framegen = std::getenv("KYTY_FRAMEGEN");
+		    framegen != nullptr && std::atoi(framegen) > 0 && guest_end <= (uint64_t {1} << 40u) - FrameGenHoleSize) {
+			const char* hole = std::getenv("KYTY_FG_ADDRESS_HOLE");
+			if (hole == nullptr || *hole != '0') {
+				g_frame_gen_hole = VirtualAlloc(reinterpret_cast<void*>(guest_end), FrameGenHoleSize, MEM_RESERVE,
+				                                PAGE_NOACCESS);
+			}
 		}
 
 		while (next_addr < guest_end) {

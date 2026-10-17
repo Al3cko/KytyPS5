@@ -1009,6 +1009,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	vk::Device device = nullptr;
 
+	// (Frame generation's device creation reserves host address space below 1 TiB: the range kept free for it, issue #45.)
+	LibKernel::Memory::ReleaseFrameGenAddressHole();
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
