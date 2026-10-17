@@ -2881,32 +2881,42 @@ static std::filesystem::path StaticCachePath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".bin");
 }
 
-// The translation features the static store's pipelines were made with (ShaderRecompiler::Frontend::TranslatorFeatures):
-// _PipelineCache/static/<title>_<version>.features, written by a precompile whose last merge made the store of its own
-// pipelines alone (--merge --prune). None (an older store, none at all): 0.
+// The translation features the static store's pipelines were made with (ShaderRecompiler::Frontend::TranslatorFeatures),
+// then those the last precompile translated with: _PipelineCache/static/<title>_<version>.features. The first are written
+// by a precompile whose last merge made the store of its own pipelines alone (--merge --prune), the second by the last
+// merge of any precompile (--stamp: with recorded play lost, or -Quick, some pipelines stay as they were: another run
+// would not make them, so the store is not out of date for that). None (an older store, none at all): 0.
 static std::filesystem::path StaticFeaturesPath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".features");
 }
 
-static uint32_t ReadStaticFeatures() {
+static std::pair<uint32_t, uint32_t> ReadStaticStamp() {
 	std::ifstream file(StaticFeaturesPath());
-	uint32_t      features = 0;
-	return file >> features ? features : 0u;
+	uint32_t      features = 0, attempted = 0;
+	if (!(file >> features)) return {0, 0};
+	return {features, file >> attempted ? attempted : features};
 }
 
-static void WriteStaticFeatures() {
+static uint32_t ReadStaticFeatures() {
+	return ReadStaticStamp().first;
+}
+
+// `made`: the store holds this precompile's pipelines alone.
+static void WriteStaticFeatures(bool made) {
 	namespace Translate = ShaderRecompiler::Frontend;
+	const auto      used      = Translate::TranslatorFeatureSet();
+	const auto      features  = made ? used : ReadStaticFeatures();
 	const auto      path      = StaticFeaturesPath();
 	auto            temporary = path;
 	std::error_code error;
 	temporary += ".tmp";
 	{
 		std::ofstream file(temporary, std::ios::trunc);
-		file << Translate::TranslatorFeatureSet() << '\n';
+		file << features << ' ' << used << '\n';
 		if (!file) return;
 	}
 	std::filesystem::rename(temporary, path, error);
-	PipelineCacheLog("Static pipeline store: made with translation features {:#x}", Translate::TranslatorFeatureSet());
+	PipelineCacheLog("Static pipeline store: made with translation features {:#x} (this precompile's: {:#x})", features, used);
 }
 
 // Its pipelines as the driver's binaries (VK_KHR_pipeline_binary), read when needed: the driver keeps a
