@@ -872,7 +872,9 @@ void SwapchainChanging() {
 }
 
 void NoteDroppedFrame() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 	g_discontinuity.store(true, std::memory_order_relaxed);
+#endif
 	static std::atomic<uint32_t> dropped {0};
 	if (const auto count = dropped.fetch_add(1, std::memory_order_relaxed) + 1; count <= 8 || count % 600 == 0)
 		LOGF("frame generation: %u frame(s) with inputs left unshown (the next resets DLSS-G's history)\n", count);
