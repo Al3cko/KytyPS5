@@ -409,12 +409,32 @@ std::string SupportProblem(vk::PhysicalDevice physical_device) {
 		LOGF("frame generation: %s\n", problem.c_str());
 		std::printf("Frame generation: %s\n", problem.c_str());
 	}
+	// (Where the driver's reservations go, for a refused device's log: RefusedDeviceAdvice.)
+	PROCESS_MITIGATION_ASLR_POLICY aslr {};
+	if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr))) {
+		std::printf("Frame generation: bottom-up ASLR %s for the emulator\n", aslr.EnableBottomUpRandomization != 0 ? "on" : "off");
+	}
 	std::fflush(stdout);
 	return problem;
 #else
 	(void)physical_device;
 	return {};
 #endif
+}
+
+std::string RefusedDeviceAdvice() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (The emulator is built with fixed addresses, so without bottom-up ASLR its host allocations pack upward from the
+	// guest's ceiling; an RTX 5080's driver refused the device until Exploit protection forced it on for the emulator.)
+	PROCESS_MITIGATION_ASLR_POLICY aslr {};
+	if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr)) &&
+	    aslr.EnableBottomUpRandomization == 0) {
+		return " If it keeps failing, in Windows Security: App & browser control > Exploit protection > Program settings > "
+		       "add kyty_emulator.exe > Randomize memory allocations (Bottom-up ASLR): Override system settings, On "
+		       "(issue #45).";
+	}
+#endif
+	return {};
 }
 
 bool WantsCamera() {

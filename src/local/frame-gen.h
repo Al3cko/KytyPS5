@@ -65,6 +65,9 @@ void Initialize();
 // hardware-accelerated GPU scheduling turned off), logged; empty when it can, or when frame generation is off. A refused
 // device's error repeats it.
 [[nodiscard]] std::string SupportProblem(vk::PhysicalDevice physical_device);
+// A refused device's advice when this process runs without bottom-up ASLR (issue #45: forcing it on for the emulator in
+// Windows' Exploit protection let the driver make the device); empty otherwise.
+[[nodiscard]] std::string RefusedDeviceAdvice();
 // After the device exists: checks that DLSS-G is available on it.
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device);
 // Right after the dispatcher is loaded for the device (before the recording layer copies it):

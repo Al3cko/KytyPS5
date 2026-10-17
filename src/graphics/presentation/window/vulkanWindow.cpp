@@ -1458,8 +1458,8 @@ void WindowContext::CreateVulkan() {
 		if (FrameGen::Requested()) {
 			EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline)%s%s: start without "
 			     "frame generation (launcher: Frame generation -> Off). KYTY_FRAMEGEN_VERBOSE=1 logs why the driver "
-			     "refused it.\n",
-			     frame_gen_problem.empty() ? "" : ": ", frame_gen_problem.c_str());
+			     "refused it.%s\n",
+			     frame_gen_problem.empty() ? "" : ": ", frame_gen_problem.c_str(), FrameGen::RefusedDeviceAdvice().c_str());
 		}
 		EXIT("Could not create device");
 	}
