@@ -21,6 +21,7 @@
 // NVIDIA Streamline SDK headers (_Build/deps/streamline/sdk/include, see CMakeLists.txt).
 #include <sl.h>
 #include <sl_consts.h>
+#include <sl_dlss.h>
 #include <sl_dlss_g.h>
 #include <sl_helpers.h>
 #include <sl_pcl.h>
@@ -51,6 +52,8 @@ struct Sources {
 
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
 bool     g_ready       = false; // Streamline loaded and the feature available
+bool     g_upscale     = false; // KYTY_UPSCALER=dlss: DLSS super resolution asked for (Streamline loaded for it)
+bool     g_upscale_ready = false; // ... and available on the device
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
 uint64_t g_guest_frame = 0;     // Kyty.Gpu
@@ -222,6 +225,9 @@ struct Api {
 	PFun_slReflexSetOptions*     reflex_set_options  = nullptr;
 	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
 	PFun_slReflexSleep*          reflex_sleep        = nullptr;
+	PFun_slEvaluateFeature*      evaluate_feature    = nullptr;
+	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr;
+	PFun_slDLSSGetOptimalSettings* dlss_get_optimal_settings = nullptr;
 };
 Api              g_api;
 sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
@@ -378,6 +384,19 @@ bool Requested() {
 }
 
 std::string SupportProblem(vk::PhysicalDevice physical_device) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_upscale) {
+		sl::AdapterInfo adapter {};
+		adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+		const auto result        = g_api.is_feature_supported(sl::kFeatureDLSS, adapter);
+		std::printf("DLSS super resolution: %s\n", result == sl::Result::eOk
+		                                               ? "Streamline offers it with this GPU and driver"
+		                                               : (std::string("not offered here (") + sl::getResultAsStr(result) +
+		                                                  "; an NVIDIA RTX GPU and a recent driver)")
+		                                                     .c_str());
+		std::fflush(stdout);
+	}
+#endif
 	if (g_generate == 0) {
 		return {};
 	}
@@ -444,7 +463,7 @@ bool WantsCamera() {
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
-	if (g_generate == 0 || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
+	if ((g_generate == 0 && !g_upscale) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
 		return;
 	}
 	// The real loader: Streamline itself forwards to it.
@@ -477,9 +496,21 @@ void BypassCommandHooks(vk::Device device) {
 void Initialize() {
 	const char* value = std::getenv("KYTY_FRAMEGEN");
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
-	if (g_generate == 0) {
+	const char* upscaler = std::getenv("KYTY_UPSCALER");
+	g_upscale            = upscaler != nullptr && std::string_view(upscaler) == "dlss";
+	if (g_generate == 0 && !g_upscale) {
 		return;
 	}
+	// (Every way out without Streamline turns both off.)
+	struct Off {
+		bool done = false;
+		~Off() {
+			if (!done) {
+				g_generate = 0;
+				g_upscale  = false;
+			}
+		}
+	} off;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// NVIDIA's Streamline runtime, which no release ships (the user's own copy: the Streamline SDK's bin\x64):
 	// KYTY_STREAMLINE_DIR (the launcher's "Streamline..." folder, run-windows -StreamlineDir), else a "streamline"
@@ -506,7 +537,6 @@ void Initialize() {
 	if (dir.empty()) {
 		LOGF("frame generation: no sl.interposer.dll (KYTY_STREAMLINE_DIR or a streamline folder next to the emulator)\n");
 		std::printf("Frame generation: NVIDIA's Streamline runtime was not found (choose its folder in the launcher)\n");
-		g_generate = 0;
 		return;
 	}
 	const auto interposer = dir / "sl.interposer.dll";
@@ -514,7 +544,6 @@ void Initialize() {
 	if (!LocalPlatform::IsNvidiaSigned(interposer.wstring())) {
 		LOGF("frame generation: %s is not signed by NVIDIA: not loaded\n", interposer.string().c_str());
 		std::printf("Frame generation: %s is not signed by NVIDIA, not loaded\n", interposer.string().c_str());
-		g_generate = 0;
 		return;
 	}
 	if (std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr) {
@@ -528,7 +557,6 @@ void Initialize() {
 	if (module == nullptr) {
 		LOGF("frame generation: cannot load %s\n", interposer.string().c_str());
 		std::printf("Frame generation: cannot load %s\n", interposer.string().c_str());
-		g_generate = 0;
 		return;
 	}
 	const auto load = [&](auto& function, const char* name) {
@@ -541,23 +569,25 @@ void Initialize() {
 	    !load(g_api.get_feature_function, "slGetFeatureFunction") ||
 	    !load(g_api.get_new_frame_token, "slGetNewFrameToken") ||
 	    !load(g_api.set_constants, "slSetConstants") ||
-	    !load(g_api.set_tag_for_frame, "slSetTagForFrame")) {
+	    !load(g_api.set_tag_for_frame, "slSetTagForFrame") ||
+	    !load(g_api.evaluate_feature, "slEvaluateFeature")) {
 		LOGF("frame generation: sl.interposer.dll lacks an entry point\n");
-		g_generate = 0;
 		return;
 	}
 	static const std::wstring plugin_dir = dir.wstring();
 	static const std::wstring log_dir    = (dir.parent_path() / "logs").wstring();
 	static const wchar_t*     plugin_paths[] {plugin_dir.c_str()};
 	// KYTY_FRAMEGEN_FEATURES=dlssg,reflex,pcl: the plugins to load (a diagnostic subset).
-	static std::vector<sl::Feature> features {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
-	if (const char* list = std::getenv("KYTY_FRAMEGEN_FEATURES"); list != nullptr) {
+	static std::vector<sl::Feature> features;
+	if (g_generate > 0) features = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+	if (const char* list = std::getenv("KYTY_FRAMEGEN_FEATURES"); list != nullptr && g_generate > 0) {
 		const std::string text = list;
 		features.clear();
 		if (text.find("dlssg") != std::string::npos) features.push_back(sl::kFeatureDLSS_G);
 		if (text.find("reflex") != std::string::npos) features.push_back(sl::kFeatureReflex);
 		if (text.find("pcl") != std::string::npos) features.push_back(sl::kFeaturePCL);
 	}
+	if (g_upscale) features.push_back(sl::kFeatureDLSS);
 	sl::Preferences           preferences {};
 	preferences.showConsole        = false;
 	preferences.logLevel           = std::getenv("KYTY_FRAMEGEN_VERBOSE") ? sl::LogLevel::eVerbose
@@ -577,24 +607,41 @@ void Initialize() {
 	if (const auto result = g_api.init(preferences, sl::kSDKVersion); result != sl::Result::eOk) {
 		LOGF("frame generation: slInit failed (%d)\n", static_cast<int>(result));
 		std::printf("Frame generation: slInit failed (%d)\n", static_cast<int>(result));
-		g_generate = 0;
 		return;
 	}
 	// SDL loads the interposer as the Vulkan loader: every instance/device/swapchain call then
 	// goes through Streamline, which adds what DLSS-G needs.
 	SetEnvironmentVariableW(L"SDL_VULKAN_LIBRARY", interposer.c_str());
 	_putenv_s("SDL_VULKAN_LIBRARY", interposer.string().c_str());
-	LOGF("frame generation: Streamline loaded from %s, %d generated frame(s)\n",
-	     dir.string().c_str(), g_generate);
+	LOGF("frame generation: Streamline loaded from %s, %d generated frame(s), DLSS super resolution %s\n",
+	     dir.string().c_str(), g_generate, g_upscale ? "asked for" : "off");
+	off.done = true;
 #else
 	LOGF("frame generation: this build has no Streamline support\n");
-	g_generate = 0;
+	std::printf("DLSS: this build has no Streamline support\n");
 #endif
 }
 
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
 	(void)instance;
 	(void)device;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_upscale) {
+		sl::AdapterInfo adapter {};
+		adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+		bool loaded              = false;
+		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) == sl::Result::eOk &&
+		    g_api.is_feature_loaded(sl::kFeatureDLSS, loaded) == sl::Result::eOk && loaded &&
+		    FeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", g_api.dlss_set_options) &&
+		    FeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", g_api.dlss_get_optimal_settings)) {
+			g_upscale_ready = true;
+			std::printf("DLSS super resolution: ready\n");
+		} else {
+			std::printf("DLSS super resolution: not available on this device (the game's image is upscaled without it)\n");
+		}
+		std::fflush(stdout);
+	}
+#endif
 	if (g_generate == 0) {
 		return;
 	}
@@ -936,6 +983,10 @@ void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId
 	g_sources = {depth, motion, depth_address, motion_address, true};
 }
 
+void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address) {
+	g_sources = {depth, motion, depth_address, motion_address, true};
+}
+
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs) {
 	inputs.valid = false;
@@ -969,6 +1020,157 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	inputs.camera        = camera;
 	inputs.guest_frame   = g_guest_frame;
 	inputs.valid         = true;
+}
+
+bool UpscalerReady() {
+	return g_upscale_ready;
+}
+
+bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_upscale_ready) return false;
+	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
+	const sl::ViewportHandle viewport {1};
+	static vk::Extent2D options_render {}, options_output {};
+	if (options_render != inputs.color.extent || options_output != inputs.output.extent) {
+		// The mode by the input's share of the output's height (DLSS takes any input size; the mode picks its model and
+		// limits): PS5 Pro's 1512 of 2160 and 1440 are quality, 1080 performance, the output's own DLAA.
+		const double share = static_cast<double>(inputs.color.extent.height) / inputs.output.extent.height;
+		sl::DLSSOptions options {};
+		options.mode = share >= 0.95   ? sl::DLSSMode::eDLAA
+		               : share >= 0.62 ? sl::DLSSMode::eMaxQuality
+		               : share >= 0.55 ? sl::DLSSMode::eBalanced
+		               : share >= 0.45 ? sl::DLSSMode::eMaxPerformance
+		                               : sl::DLSSMode::eUltraPerformance;
+		options.outputWidth     = inputs.output.extent.width;
+		options.outputHeight    = inputs.output.extent.height;
+		options.colorBuffersHDR = sl::Boolean::eTrue; // (the game's linear HDR scene, before its tone mapping)
+		options.useAutoExposure = sl::Boolean::eTrue;
+		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+			std::printf("DLSS super resolution: slDLSSSetOptions failed (%s)\n", sl::getResultAsStr(result));
+			std::fflush(stdout);
+			return false;
+		}
+		sl::DLSSOptimalSettings settings {};
+		(void)g_api.dlss_get_optimal_settings(options, settings);
+		std::printf("DLSS super resolution: %ux%u -> %ux%u, mode %u (its range %ux%u-%ux%u)\n", inputs.color.extent.width,
+		            inputs.color.extent.height, inputs.output.extent.width, inputs.output.extent.height,
+		            static_cast<uint32_t>(options.mode), settings.renderWidthMin, settings.renderHeightMin,
+		            settings.renderWidthMax, settings.renderHeightMax);
+		std::fflush(stdout);
+		options_render = inputs.color.extent;
+		options_output = inputs.output.extent;
+	}
+	static uint32_t frame = 0;
+	++frame;
+	sl::FrameToken* token = nullptr;
+	if (g_api.get_new_frame_token(token, &frame) != sl::Result::eOk || token == nullptr) return false;
+
+	sl::Constants constants {};
+	Mat4          identity;
+	for (uint32_t i = 0; i < 4; ++i) {
+		identity[i] = sl::float4(i == 0, i == 1, i == 2, i == 3);
+	}
+	Mat4 view_to_clip;
+	for (uint32_t i = 0; i < 4; ++i) {
+		view_to_clip[i] = sl::float4(inputs.view_to_clip[i * 4], inputs.view_to_clip[i * 4 + 1], inputs.view_to_clip[i * 4 + 2],
+		                             inputs.view_to_clip[i * 4 + 3]);
+	}
+	constants.cameraViewToClip = view_to_clip;
+	if (!Inverted(view_to_clip, constants.clipToCameraView)) constants.clipToCameraView = identity;
+	constants.clipToLensClip      = identity;
+	constants.clipToPrevClip      = identity;
+	constants.prevClipToClip      = identity;
+	constants.jitterOffset        = sl::float2(inputs.jitter_x, inputs.jitter_y);
+	// (Streamline's motion vectors are in render-size UV units: its scale makes them so from the game's pixels.)
+	constants.mvecScale = sl::float2(inputs.motion_scale_x / static_cast<float>(inputs.color.extent.width),
+	                                 inputs.motion_scale_y / static_cast<float>(inputs.color.extent.height));
+	constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
+	constants.cameraPos           = sl::float3(0, 0, 0);
+	constants.cameraUp            = sl::float3(0, 1, 0);
+	constants.cameraRight         = sl::float3(1, 0, 0);
+	constants.cameraFwd           = sl::float3(0, 0, 1);
+	constants.cameraNear          = inputs.near_plane;
+	constants.cameraFar           = inputs.far_plane;
+	constants.cameraFOV           = inputs.view_to_clip[5] != 0.0f ? 2.0f * std::atan(1.0f / std::fabs(inputs.view_to_clip[5])) : 1.0f;
+	constants.cameraAspectRatio   = static_cast<float>(inputs.color.extent.width) / static_cast<float>(inputs.color.extent.height);
+	constants.motionVectorsInvalidValue = sl::INVALID_FLOAT;
+	constants.depthInverted             = sl::Boolean::eTrue;
+	constants.cameraMotionIncluded      = sl::Boolean::eTrue;
+	constants.motionVectors3D           = sl::Boolean::eFalse;
+	constants.reset                     = inputs.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	constants.orthographicProjection    = sl::Boolean::eFalse;
+	constants.motionVectorsDilated      = sl::Boolean::eFalse;
+	constants.motionVectorsJittered     = sl::Boolean::eFalse;
+	if (const auto result = g_api.set_constants(constants, *token, viewport); result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slSetConstants failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	const auto resource = [](const UpscaleImage& image) {
+		sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr, static_cast<VkImageView>(image.view),
+		               static_cast<uint32_t>(static_cast<VkImageLayout>(image.layout)));
+		r.width        = image.extent.width;
+		r.height       = image.extent.height;
+		r.nativeFormat = static_cast<uint32_t>(static_cast<VkFormat>(image.format));
+		r.mipLevels    = 1;
+		r.arrayLayers  = 1;
+		r.flags        = 0;
+		r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
+		return r;
+	};
+	auto             color  = resource(inputs.color);
+	auto             depth  = resource(inputs.depth);
+	auto             motion = resource(inputs.motion);
+	auto             output = resource(inputs.output);
+	// (KYTY_SR_LOG: the first two evaluations' images and constants.)
+	static const bool describe = std::getenv("KYTY_SR_LOG") != nullptr;
+	if (static std::atomic<uint32_t> described {0}; describe && described.fetch_add(1, std::memory_order_relaxed) < 2) {
+		const std::pair<const char*, const UpscaleImage*> images[] {
+		    {"color", &inputs.color}, {"depth", &inputs.depth}, {"motion", &inputs.motion}, {"output", &inputs.output}};
+		for (const auto& [name, image]: images) {
+			std::printf("DLSS super resolution: %s image %p view %p layout %d format %d %ux%u usage 0x%x\n", name,
+			            static_cast<void*>(static_cast<VkImage>(image->image)),
+			            static_cast<void*>(static_cast<VkImageView>(image->view)), static_cast<int>(image->layout),
+			            static_cast<int>(image->format), image->extent.width, image->extent.height,
+			            static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image->usage)));
+		}
+		std::printf("DLSS super resolution: jitter %g %g, motion scale %g %g, reset %d, near %g far %g\n", inputs.jitter_x,
+		            inputs.jitter_y, inputs.motion_scale_x, inputs.motion_scale_y, inputs.reset ? 1 : 0, inputs.near_plane,
+		            inputs.far_plane);
+		std::fflush(stdout);
+	}
+	const sl::Extent render {0, 0, inputs.color.extent.width, inputs.color.extent.height};
+	const sl::Extent full {0, 0, inputs.output.extent.width, inputs.output.extent.height};
+	const sl::ResourceTag tags[] {
+	    sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	    sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &full),
+	    sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	    sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render),
+	};
+	auto* command_buffer = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
+	if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), command_buffer);
+	    result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slSetTagForFrame failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	const sl::BaseStructure* evaluate_inputs[] {&viewport};
+	if (const auto result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, evaluate_inputs, 1, command_buffer);
+	    result != sl::Result::eOk) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("DLSS super resolution: slEvaluateFeature failed (%s)\n", sl::getResultAsStr(result));
+		return false;
+	}
+	return true;
+#else
+	(void)command;
+	(void)inputs;
+	return false;
+#endif
 }
 
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {

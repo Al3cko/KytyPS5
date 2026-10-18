@@ -84,6 +84,13 @@ lines, ends sun shadows at 60 m and turns off ambient shadowing
 and the shadows of torches and other lamps. Each thing drawn costs the emulator processor time, so these
 help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing at the Gates of
 Boletaria: 21.9 fps at Standard, 25.6 at Lowest).
+"Upscaler" (Game by default, as on the PS5) with "DLSS (PS5 Pro path)" runs the game's own PS5 Pro mode:
+its 3D at the render height (1512, the PS5 Pro's 2688x1512, or the chosen one, 1080 at least) is made a real
+3840x2160 image by NVIDIA DLSS in place of Sony's PS5 Pro upscaler, and the game finishes it at 4K (bloom,
+depth of field, the HUD), instead of anti-aliasing at the render height and stretching to 4K. 1440 is DLSS's
+Quality, 1080 its Performance, 2160 DLAA. NVIDIA RTX only, with NVIDIA's Streamline runtime as for frame
+generation below (elsewhere the game's own picture stays). The in-game "Cinematic" mode stays native 4K
+without DLSS.
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's

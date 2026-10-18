@@ -2464,10 +2464,15 @@ private:
 		// With frame generation the guest stops at 512 GiB (its mappings take the lowest free
 		// addresses, tens of GiB above HOST_USER_MIN): a ceiling of 0xE0_0000_0000 left an RTX 5090
 		// enough, an RTX 5080's device creation failed until 0x80_0000_0000 (issue #32).
+		// (DLSS super resolution, KYTY_UPSCALER=dlss, makes its device through NGX the same way.)
+		const char* framegen   = std::getenv("KYTY_FRAMEGEN");
+		const char* upscaler   = std::getenv("KYTY_UPSCALER");
+		const bool  streamline = (framegen != nullptr && std::atoi(framegen) > 0) ||
+		                        (upscaler != nullptr && std::strcmp(upscaler, "dlss") == 0);
 		uint64_t ceiling = 0;
 		if (const char* value = std::getenv("KYTY_RESERVE_CEILING"); value != nullptr && *value != '\0') {
 			ceiling = std::strtoull(value, nullptr, 16);
-		} else if (const char* framegen = std::getenv("KYTY_FRAMEGEN"); framegen != nullptr && std::atoi(framegen) > 0) {
+		} else if (streamline) {
 			ceiling = 0x8000000000ull;
 		}
 		if (ceiling != 0) {
@@ -2479,8 +2484,7 @@ private:
 		// up: on an RTX 5080 the device creation with frame generation failed (VK_ERROR_INITIALIZATION_FAILED) until the
 		// user turned on bottom-up address randomization for the emulator in Windows' exploit protection (issue #45),
 		// which scatters them. (The size NVIDIA's interop reserved below 1 TiB on the 5090: about 44 GiB.)
-		if (const char* framegen = std::getenv("KYTY_FRAMEGEN");
-		    framegen != nullptr && std::atoi(framegen) > 0 && guest_end <= (uint64_t {1} << 40u) - FrameGenHoleSize) {
+		if (streamline && guest_end <= (uint64_t {1} << 40u) - FrameGenHoleSize) {
 			const char* hole = std::getenv("KYTY_FG_ADDRESS_HOLE");
 			if (hole == nullptr || *hole != '0') {
 				g_frame_gen_hole = VirtualAlloc(reinterpret_cast<void*>(guest_end), FrameGenHoleSize, MEM_RESERVE,

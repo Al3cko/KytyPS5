@@ -12,7 +12,9 @@ struct Program;
 // GPU-bound PCs (a laptop's RTX 3080: 1-1 standing 20.7 -> 24.5 fps at 1080) trade sharpness for frame rate, and 2160
 // renders the 3D at the output's own 3840x2160 (an RTX 5090 at 1-1 standing: 68 -> 55 fps, GPU-bound).
 // Unset or 1440: the game as it is. The game's own 1080p output modes (r_Wants4K 1 and 2) are no option: their UI
-// keeps the 4K layout (off screen).
+// keeps the 4K layout (off screen). With the game's super resolution path on (KYTY_UPSCALER,
+// loader/demonsSoulsSuperResolution.h) the performance mode is display mode 5: the height sizes its 3D instead
+// (unset: the PS5 Pro's 2688x1512; at least 1080), the upscaler making the 3840x2160 image from it.
 // KYTY_RENDER_ASPECT=<w>:<h> (run-windows.ps1 -Aspect, the launcher's "Aspect ratio"; 21:9 is taken as 64:27): the 3D
 // rendered wider than 16:9, up to 32:9, at the render height - 3416x1440 for 21:9 - and its projection's aspect (the
 // render setup's 16:9, AspectStore) to match: more of the world to the sides, not a stretched 16:9 view. The game's
@@ -30,10 +32,16 @@ void Install(Program* program);
 // RIP-relative pairs of 32-bit width and height, then a short jump; every build seen (01.005.000, 01.007.000) has it.
 inline constexpr std::string_view ModeCase = "c5 fb 10 0d ?? ?? ?? ?? c5 fb 10 05 ?? ?? ?? ?? eb";
 inline constexpr uint32_t         OutputWidth = 3840, OutputHeight = 2160, RenderWidth = 2560, RenderHeight = 1440;
+// Its mode 5 case (the PS5 Pro's, with super resolution: loader/demonsSoulsSuperResolution.h): the same pairs, then
+// the super resolution flag set, then the jump (01.007.000).
+inline constexpr std::string_view TrinityCase = "c5 fb 10 0d ?? ?? ?? ?? c5 fb 10 05 ?? ?? ?? ?? c6 45 ?? 01 eb";
+inline constexpr uint32_t         TrinityWidth = 2688, TrinityHeight = 1512;
+// The least render height the game's super resolution runs at (SuperResolution::IsEnabled).
+inline constexpr uint32_t SuperResolutionLeastHeight = 1080;
 // The render size query's per-mode tables (modes 1-5): widths, heights.
 inline constexpr uint32_t ModeWidths[5] {1600, 1920, 2560, 3840, 2688};
 inline constexpr uint32_t ModeHeights[5] {900, 1080, 1440, 2160, 1512};
-inline constexpr int      PerformanceMode = 2; // (index in the tables)
+inline constexpr int      PerformanceMode = 2, TrinityMode = 4; // (indexes in the tables)
 // The render setup's constructor storing the projection's aspect, 16/9 as a float: mov dword [rbx+4], 0x3fe38e39
 // (01.007.000 0x90090ae7f, 01.005.000 0x9008ef287; the only such store either build has).
 inline constexpr std::string_view AspectStore = "c7 43 04 39 8e e3 3f";

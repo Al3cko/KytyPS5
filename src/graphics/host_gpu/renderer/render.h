@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/superResolution.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -224,6 +225,8 @@ public:
 	// (predicted), as the catalog knows them.
 	void PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_group_x, uint32_t thread_group_y,
 	                     uint32_t thread_group_z, uint32_t mode, Spec::State& record);
+	// An R_SUPER_RESOLUTION packet's upscale (graphics/guest_gpu/superResolution.h; renderSuperResolution.cpp).
+	void RunSuperResolution(CommandBuffer& buffer, const SuperResolution::Packet& packet);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);

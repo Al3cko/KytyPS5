@@ -16,6 +16,9 @@
 #   .\run-windows.ps1 -FrameGen 1            DLSS frame generation, 1 generated frame per rendered
 #                                            frame (2x; up to 5, at most what the GPU makes); needs
 #                                            NVIDIA's Streamline runtime (-StreamlineDir)
+#   .\run-windows.ps1 -Upscaler dlss         DLSS super resolution: Demon's Souls' own PS5 Pro path (its 3D at
+#                                            2688x1512 or -RenderHeight, 1080 at least), DLSS in place of Sony's
+#                                            upscaler making the 3840x2160 image; NVIDIA's Streamline runtime
 #   .\run-windows.ps1 -StreamlineDir <dir>   where NVIDIA's Streamline runtime is (the Streamline SDK
 #                                            or its bin\x64; default: a "streamline" folder next to
 #                                            the emulator)
@@ -71,6 +74,7 @@ param(
 	[switch]$AspectFit,
 	[int]$Language = -1,
 	[int]$FrameGen = 0,
+	[ValidateSet('', 'dlss')][string]$Upscaler = '',
 	[string]$StreamlineDir = '',
 	[string]$Affinity = '',
 	[switch]$Prompt,
@@ -307,7 +311,8 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -m
 # -RenderHeight: the height Demon's Souls' performance mode renders its 3D at (src/loader/demonsSoulsRenderSize.h);
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
-if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
+# With -Upscaler the height is that of the PS5 Pro's display mode (2688x1512 unless given), so 1440 is passed too.
+if ($RenderHeight -gt 0 -and ($RenderHeight -ne 1440 -or $Upscaler)) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # -Aspect 21:9 (or 32:9, w:h): the 3D rendered at that aspect, its width at the render height (3416x1440), the game's
 # projection widened to match; the presenter shows those frames at the aspect and the others at 16:9.
 if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Aspect }
@@ -364,9 +369,11 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
+if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
 # Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
 # it: run.cmd -FrameGen 1 had started with frame generation off, its runtime not found (issue #38).
-if (!$StreamlineDir -and $FrameGen -gt 0 -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
+if (!$StreamlineDir -and ($FrameGen -gt 0 -or $Upscaler) -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
 	$chosen = try { [string](Get-Content "$PSScriptRoot\launcher-settings.json" -Raw | ConvertFrom-Json).streamline } catch { '' }
 	if ($chosen -and (Test-Path $chosen)) { $StreamlineDir = $chosen }
 }

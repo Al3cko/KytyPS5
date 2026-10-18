@@ -358,6 +358,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
 
+# The game's exposure on the upscaled image of its super resolution path (renderSuperResolution.cpp).
+set(sr_exposure_source "${KYTY_SOURCE_DIR}/local/sr-exposure.comp")
+set(sr_exposure_spv "${gpu_tiler_generated_dir}/sr_exposure.spv")
+set(sr_exposure_header "${gpu_tiler_generated_dir}/sr_exposure_spv.h")
+add_custom_command(
+	OUTPUT "${sr_exposure_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${sr_exposure_spv}" "${sr_exposure_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${sr_exposure_spv} -DOUTPUT=${sr_exposure_header}
+	        -DSYMBOL=SR_EXPOSURE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${sr_exposure_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${sr_exposure_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"

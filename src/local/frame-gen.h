@@ -55,8 +55,8 @@ struct FrameInputs {
 	bool          valid       = false;
 };
 
-// Process start, before the window: loads Streamline when KYTY_FRAMEGEN is set (it then becomes
-// SDL's Vulkan loader, and so the proxy of instance, device and swapchain calls).
+// Process start, before the window: loads Streamline when KYTY_FRAMEGEN or KYTY_UPSCALER=dlss is set (it then
+// becomes SDL's Vulkan loader, and so the proxy of instance, device and swapchain calls).
 void Initialize();
 // After Initialize: Streamline is loaded (device creation then adds what it relies on but does
 // not add itself, VK_KHR_present_id for its VK_NV_low_latency2).
@@ -110,10 +110,35 @@ void NoteScene();
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
                 uint64_t motion_address);
+// The game's super resolution dispatch in place of its TAA (renderSuperResolution.cpp): the same depth and motion.
+void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t motion_address);
 // At the guest flip, in the frame's command buffer: copy the gathered images into `inputs`.
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
+
+// DLSS super resolution (KYTY_UPSCALER=dlss) in place of Sony's PS5 Pro upscaler the game dispatches
+// (graphics/guest_gpu/superResolution.h, renderer/renderSuperResolution.cpp).
+struct UpscaleImage {
+	vk::Image           image  = nullptr;
+	vk::ImageView       view   = nullptr;
+	vk::ImageLayout     layout = vk::ImageLayout::eUndefined; // as the command buffer leaves it for the upscaler
+	vk::Format          format = vk::Format::eUndefined;
+	vk::Extent2D        extent {};
+	vk::ImageUsageFlags usage {};
+};
+struct UpscaleInputs {
+	UpscaleImage color, depth, motion, output; // color, depth and motion at the render size
+	float        jitter_x = 0.0f, jitter_y = 0.0f;       // the projection's offset, in render pixels
+	float        motion_scale_x = 0.0f, motion_scale_y = 0.0f; // motion vector * scale = render pixels to the previous
+	bool         reset = false;                           // no history (a cut, a level load)
+	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
+	float        near_plane = 0.1f, far_plane = 3000.0f;
+};
+// Streamline offers DLSS super resolution on this device.
+[[nodiscard]] bool UpscalerReady();
+// Records DLSS into `command` (outside a render pass; the images in their `layout`s): false when it could not.
+[[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics
