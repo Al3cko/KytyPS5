@@ -33,8 +33,10 @@ namespace {
 // The game's final composite (01.007.000), as frame captures show it: the frame's last draw and its only one into the
 // flip image, in menus and in play. Its pixel shader samples the HUD layer at CompositeHudBinding (3840x2160 RGBA16F,
 // the flip image's size) and the 3D scene after it, of the render size or, at KYTY_RENDER_HEIGHT=2160 and on the PS5
-// Pro path (its upscale's output), of the flip image's size too.
-constexpr std::array<uint64_t, 1> CompositeShaders {0x3359df0b33704924ULL};
+// Pro path (its upscale's output), of the flip image's size too. The first composite is the one of a smaller scene
+// (the PS5's 1440 and the lower render heights), the second the one of a scene of the output's size (the PS5 Pro
+// path, KYTY_UPSCALER=dlss, and KYTY_RENDER_HEIGHT=2160): both samples 3840x2160 RGBA16F there, the HUD at binding 0.
+constexpr std::array<uint64_t, 2> CompositeShaders {0x3359df0b33704924ULL, 0x1a178683189cc68bULL};
 constexpr size_t                  CompositeHudBinding = 0;
 
 bool IsCompositeShader(uint64_t hash) {
