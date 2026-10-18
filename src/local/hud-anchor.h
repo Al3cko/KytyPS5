@@ -13,6 +13,10 @@
 // canvas outside them, as it was. Widened again, each element stands at its side of the screen as drawn for 16:9. The
 // rest - menus, fades, markers over the world (lock-on, enemy health) - stays as it was (stretched, the markers on
 // their targets).
+// With the wide output (DemonsSoulsRenderSize::WideOutputWidth: the game's output as wide as the 3D, 5120x2160 at 21:9)
+// nothing is widened after: the game lays its interface out at 3840x2160 against the canvas's left edge. In a frame
+// showing the 3D the HUD's areas are moved to their sides then (unstretched as drawn), and every other draw into the
+// canvas - menus, fades, markers - is widened to the canvas (StretchScope): the same picture as the 16:9 output widened.
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -71,8 +75,23 @@ struct State {
 	std::array<MaskPatch, 32> patches {};  // (by address, round robin)
 	uint32_t                  next_patch = 0;
 	bool                      patched    = false; // any patch outstanding
+	uint64_t                  canvas     = 0;     // the wide output's interface canvas (an interface shader's target)
 };
 inline State g_state; // (the GPU thread's)
+
+// The wide output's canvas width (0: none).
+inline uint32_t WideWidth() {
+	return ::Loader::DemonsSoulsRenderSize::WideOutputWidth();
+}
+
+// The width of the interface canvas the draw goes into: the game's 3840, or the wide output's (the performance mode's;
+// its Cinematic mode keeps 3840); 0 for another target.
+inline uint32_t CanvasWidthOf(const HW::Context& ctx) {
+	const auto& target = ctx.GetRenderTarget(0);
+	const auto  width  = target.attrib2.width + 1u;
+	if (target.base.addr == 0 || target.attrib2.height + 1u != CanvasHeight) return 0;
+	return width == CanvasWidth || (WideWidth() != 0 && width == WideWidth()) ? width : 0;
+}
 
 inline uint64_t HashAt(uint64_t address) {
 	if (address == 0) return 0;
@@ -117,10 +136,9 @@ inline void RestoreMask(const HW::PixelShaderInfo& ps) {
 	}
 }
 
-// A masked icon draw squeezed around window x `anchor`: x' = anchor + (x - anchor) * squeeze, so its mask is read at
-// x = anchor + (x' - anchor) / squeeze (from its own values: rows this patched before, the game not writing them again,
-// keep theirs).
-inline void PatchMask(const HW::PixelShaderInfo& ps, float anchor, float squeeze) {
+// A masked icon draw placed at window x' = scale * x + shift, so its mask is read at x = (x' - shift) / scale (from its
+// own values: rows this patched before, the game not writing them again, keep theirs).
+inline void PatchMask(const HW::PixelShaderInfo& ps, float scale, float shift) {
 	uint64_t address = 0;
 	uint32_t stride  = 0;
 	if (!MaskRows(ps, address, stride)) return;
@@ -140,8 +158,8 @@ inline void PatchMask(const HW::PixelShaderInfo& ps, float anchor, float squeeze
 	std::memcpy(patch->patched, patch->original, sizeof(rows));
 	for (auto& row: patch->patched) {
 		const float x = row[0];
-		row[0]        = x / squeeze;
-		row[3] += x * anchor * (1.0f - 1.0f / squeeze);
+		row[0]        = x / scale;
+		row[3] -= x * shift / scale;
 	}
 	WriteRows(address, stride, patch->patched);
 	state.patched = true;
@@ -157,14 +175,18 @@ inline bool ReadVsharp(const uint32_t* words, uint64_t& base, uint32_t& stride) 
 // The areas the draw's vertices lie in (a bit each, Outside for one in none), from its vertices in guest memory; 0 when
 // it is no interface draw into the canvas in a frame showing the 3D, or its vertices are not readable.
 inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs, uint32_t first, uint32_t count) {
-	if (::Loader::DemonsSoulsRenderSize::WideAspect() <= 0.0 || !FrameGen::SceneNoted() || count == 0) return 0;
+	if (::Loader::DemonsSoulsRenderSize::WideAspect() <= 0.0 || count == 0) return 0;
 	const auto& target = ctx.GetRenderTarget(0);
-	if (target.base.addr == 0 || target.attrib2.width + 1u != CanvasWidth || target.attrib2.height + 1u != CanvasHeight)
-		return 0;
+	const auto  width  = CanvasWidthOf(ctx);
+	if (width == 0) return 0;
 	auto&          state = g_state;
 	const uint64_t hash  = HashAt(vs.es_regs.data_addr);
 	const bool     clip  = std::find(ClipShaders.begin(), ClipShaders.end(), hash) != ClipShaders.end();
 	if (!clip && hash != PixelShader) return 0;
+	// (An interface shader's target: the canvas the wide output's other draws into it are widened in, StretchScope.)
+	if (width != CanvasWidth) state.canvas = target.base.addr;
+	if (!FrameGen::SceneNoted()) return 0;
+	const auto& viewport = ctx.GetScreenViewport().viewports[0];
 	const auto& user   = vs.gs_user_sgpr;
 	uint64_t    base   = 0;
 	uint32_t    stride = 0;
@@ -202,6 +224,8 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 			xy[0] = 2.0f * xy[0] * scale[0] - 1.0f;
 			xy[1] = 1.0f - 2.0f * xy[1] * scale[1];
 		}
+		// (The wide canvas: the window x the viewport puts it at, in the 3840 wide layout's clip coordinates.)
+		if (width != CanvasWidth) xy[0] = 2.0f * (viewport.xoffset + xy[0] * viewport.xscale) / CanvasWidth - 1.0f;
 		icon = icon && xy[0] >= Icon.x0 && xy[0] <= Icon.x1 && xy[1] >= Icon.y0 && xy[1] <= Icon.y1;
 		uint32_t bit = Outside;
 		for (uint32_t a = 0; a < Areas.size(); ++a) {
@@ -231,18 +255,21 @@ inline Plan Split(uint32_t areas) {
 }
 
 // The canvas outside the areas (as drawn: the viewport unchanged) in window pixels, as rectangles: bands between the
-// areas' tops and bottoms, the gaps between the areas in each.
+// areas' tops and bottoms, the gaps between the areas in each. (The wide output's: in the 3840 wide layout at the left
+// edge, as the draw is widened after (StretchScope, Widened).)
 struct Rect {
 	int left = 0, top = 0, right = 0, bottom = 0;
 };
 inline uint32_t Complement(const HW::Context& ctx, std::array<Rect, 32>& out) {
 	const auto&                    viewport = ctx.GetScreenViewport().viewports[0];
+	const bool                     wide     = CanvasWidthOf(ctx) > CanvasWidth;
+	const auto window_x = [&](float x) { return wide ? (x + 1.0f) * (CanvasWidth / 2.0f) : viewport.xoffset + x * viewport.xscale; };
 	std::array<Rect, Areas.size()> held {};
 	std::array<int, 2 * Areas.size() + 2> ys {0, static_cast<int>(CanvasHeight)};
 	uint32_t                       ny = 2;
 	for (uint32_t a = 0; a < Areas.size(); ++a) {
 		const auto& area = Areas[a];
-		const float x0 = viewport.xoffset + area.x0 * viewport.xscale, x1 = viewport.xoffset + area.x1 * viewport.xscale;
+		const float x0 = window_x(area.x0), x1 = window_x(area.x1);
 		const float y0 = viewport.yoffset + area.y0 * viewport.yscale, y1 = viewport.yoffset + area.y1 * viewport.yscale;
 		auto&       r  = held[a];
 		r.left   = std::clamp(static_cast<int>(std::floor(std::min(x0, x1))), 0, static_cast<int>(CanvasWidth));
@@ -316,9 +343,9 @@ private:
 };
 
 // For the length of one draw of an area (the GPU thread, around both of its ways): the viewport squeezed around the
-// area's side, and with `scissor` the generic scissor around where the area then lies; restored after it. The draw
-// state the table and native ways keep is keyed by the registers: they hash them again (DrawStateObserver::g_shadow)
-// both times.
+// area's side (the wide output's: moved to it), and with `scissor` the generic scissor around where the area then lies;
+// restored after it. The draw state the table and native ways keep is keyed by the registers: they hash them again
+// (DrawStateObserver::g_shadow) both times.
 class Scope {
 public:
 	Scope(HW::Context& ctx, const HW::PixelShaderInfo& ps, uint32_t area, bool scissor) {
@@ -326,24 +353,41 @@ public:
 		if (wide <= 0.0 || area >= Areas.size()) return;
 		const auto&  screen   = ctx.GetScreenViewport();
 		const auto&  viewport = screen.viewports[0];
-		const float  squeeze  = static_cast<float>((16.0 / 9.0) / wide);
 		const auto&  a        = Areas[area];
+		const auto   width    = std::max(CanvasWidthOf(ctx), CanvasWidth);
 		m_ctx                 = &ctx;
 		m_xscale              = viewport.xscale;
 		m_xoffset             = viewport.xoffset;
-		ctx.SetViewportXScale(0, m_xscale * squeeze);
-		ctx.SetViewportXOffset(0, m_xoffset + a.side * m_xscale * (1.0f - squeeze));
+		// Where the draw lands, as a window x' = scale * x + shift of the x it is drawn at.
+		float scale = 1.0f, shift = 0.0f;
+		if (width != CanvasWidth) {
+			shift = static_cast<float>(width - CanvasWidth) * (a.side + 1.0f) / 2.0f;
+		} else {
+			scale = static_cast<float>((16.0 / 9.0) / wide);
+			shift = (m_xoffset + a.side * m_xscale) * (1.0f - scale);
+		}
+		ctx.SetViewportXScale(0, m_xscale * scale);
+		ctx.SetViewportXOffset(0, m_xoffset * scale + shift);
 		// (One area's draw: a draw of several shares its rows between them.)
-		if (!scissor) PatchMask(ps, m_xoffset + a.side * m_xscale, squeeze);
+		if (!scissor) {
+			if (scale != 1.0f || shift != 0.0f) {
+				PatchMask(ps, scale, shift);
+			} else {
+				RestoreMask(ps);
+			}
+		}
 		if (scissor) {
 			m_scissor = true;
 			m_left = screen.generic_scissor_left, m_top = screen.generic_scissor_top;
 			m_right = screen.generic_scissor_right, m_bottom = screen.generic_scissor_bottom;
 			m_window_offset = screen.generic_scissor_window_offset_enable;
-			// The area's corners in window pixels, as the squeezed viewport places them.
-			const float anchor = m_xoffset + a.side * m_xscale;
-			const auto  window_x = [&](float x) { return anchor + (m_xoffset + x * m_xscale - anchor) * squeeze; };
-			const auto  window_y = [&](float y) { return viewport.yoffset + y * viewport.yscale; };
+			// The area's corners in window pixels, where the viewport now places them (the wide output's layout: 3840
+			// wide at the left edge).
+			const auto drawn_x  = [&](float x) {
+				return width != CanvasWidth ? (x + 1.0f) * (CanvasWidth / 2.0f) : m_xoffset + x * m_xscale;
+			};
+			const auto window_x = [&](float x) { return scale * drawn_x(x) + shift; };
+			const auto window_y = [&](float y) { return viewport.yoffset + y * viewport.yscale; };
 			const int   left     = std::max(m_left, static_cast<int>(std::floor(window_x(a.x0))));
 			const int   right    = std::min(m_right, static_cast<int>(std::ceil(window_x(a.x1))));
 			const float top_y = window_y(a.y1), bottom_y = window_y(a.y0);
@@ -374,6 +418,66 @@ private:
 	float        m_xoffset = 0.0f;
 	bool         m_scissor = false, m_window_offset = false;
 	int          m_left = 0, m_top = 0, m_right = 0, m_bottom = 0;
+};
+
+// A draw into the wide output's interface canvas in a frame showing the 3D: widened (StretchScope) unless it is the HUD's.
+inline bool Stretched(const HW::Context& ctx) {
+	if (g_state.canvas == 0 || !FrameGen::SceneNoted() || CanvasWidthOf(ctx) <= CanvasWidth) return false;
+	return ctx.GetRenderTarget(0).base.addr == g_state.canvas;
+}
+
+// A rectangle of the 3840 wide layout where StretchScope's widening puts it.
+inline Rect Widened(const Rect& rect) {
+	const float k = static_cast<float>(WideWidth()) / CanvasWidth;
+	return {static_cast<int>(std::floor(rect.left * k)), rect.top, static_cast<int>(std::ceil(rect.right * k)), rect.bottom};
+}
+
+// For the length of one draw into the wide output's interface canvas that is not the HUD's (menus, fades, markers over
+// the world): widened from the 3840 wide layout at the left edge to the canvas - the viewport, a scissor narrower than
+// the canvas (the layout's) and a masked icon's mask with it -, the picture the 16:9 output widened showed; restored
+// after it.
+class StretchScope {
+public:
+	StretchScope(HW::Context& ctx, const HW::PixelShaderInfo& ps): m_ctx(&ctx), m_screen(ctx.GetScreenViewport()) {
+		const auto  width    = static_cast<int>(WideWidth());
+		const float k        = static_cast<float>(width) / CanvasWidth;
+		const auto& viewport = m_screen.viewports[0];
+		const auto  widen    = [&](int x) { return std::clamp(static_cast<int>(std::lround(x * k)), 0, width); };
+		ctx.SetViewportXScale(0, viewport.xscale * k);
+		ctx.SetViewportXOffset(0, viewport.xoffset * k);
+		if (m_screen.generic_scissor_left > 0 || m_screen.generic_scissor_right < width)
+			ctx.SetGenericScissor(widen(m_screen.generic_scissor_left), m_screen.generic_scissor_top,
+			                      widen(m_screen.generic_scissor_right), m_screen.generic_scissor_bottom,
+			                      m_screen.generic_scissor_window_offset_enable);
+		if (viewport.viewport_scissor_left > 0 || viewport.viewport_scissor_right < width)
+			ctx.SetViewportScissor(0, widen(viewport.viewport_scissor_left), viewport.viewport_scissor_top,
+			                       widen(viewport.viewport_scissor_right), viewport.viewport_scissor_bottom,
+			                       viewport.viewport_scissor_window_offset_enable);
+		PatchMask(ps, k, 0.0f); // (only a masked icon's)
+		Changed();
+	}
+	~StretchScope() {
+		const auto& viewport = m_screen.viewports[0];
+		m_ctx->SetViewportXScale(0, viewport.xscale);
+		m_ctx->SetViewportXOffset(0, viewport.xoffset);
+		m_ctx->SetGenericScissor(m_screen.generic_scissor_left, m_screen.generic_scissor_top, m_screen.generic_scissor_right,
+		                         m_screen.generic_scissor_bottom, m_screen.generic_scissor_window_offset_enable);
+		m_ctx->SetViewportScissor(0, viewport.viewport_scissor_left, viewport.viewport_scissor_top,
+		                          viewport.viewport_scissor_right, viewport.viewport_scissor_bottom,
+		                          viewport.viewport_scissor_window_offset_enable);
+		Changed();
+	}
+	KYTY_CLASS_NO_COPY(StretchScope);
+
+private:
+	static void Changed() {
+		auto& shadow = DrawStateObserver::g_shadow;
+		shadow.key_changes |= 1u;
+		shadow.dirty = true;
+	}
+
+	HW::Context*      m_ctx = nullptr;
+	HW::ScreenViewport m_screen; // (as it was)
 };
 
 } // namespace Libs::Graphics::HudAnchor

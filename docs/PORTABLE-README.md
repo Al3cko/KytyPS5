@@ -93,6 +93,11 @@ sharper picture); 1440 is its Quality, 1512 the PS5 Pro's own 2688x1512, 2160 DL
 NVIDIA's Streamline runtime as for frame generation below: on a PC without an NVIDIA RTX graphics card (AMD,
 Intel, GeForce GTX) the launcher keeps this row and frame generation off, and the game's own TAA makes the
 picture at its own render height. The in-game "Cinematic" mode stays native 4K without DLSS.
+With an "Aspect ratio" wider than 16:9, DLSS makes the picture at its full width: 5120x2160 at 21:9 (from
+2560x1080 at render height 1080), and the game finishes it at that size, with the HUD at the screen's edges,
+instead of a 3840x2160 picture widened on the screen. On an RTX 5090 at Boletaria's start that ran at 64.5 fps,
+the game's TAA at 21:9 at 59.3. Screens without the 3D (movies, the title, loading) show at 16:9 with black
+bars, as before.
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's

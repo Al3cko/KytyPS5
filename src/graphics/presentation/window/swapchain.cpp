@@ -957,11 +957,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	// KYTY_RENDER_ASPECT: the game's 3D was rendered wider and squeezed into its 16:9 output; a frame showing it is
 	// shown at that aspect, the others (movies, menus, loading screens) at their own 16:9, both fitted to the window
 	// (within 2% of the window's aspect: filling it).
+	// With the wide output (DemonsSoulsRenderSize::WideOutputWidth) the game's frames are as wide as the 3D; one without
+	// it (movies, menus, loading screens) holds its 16:9 picture at the left: that part is shown.
 	int          dst_x = 0, dst_y = 0;
 	int          dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
-	const double frame_aspect = source.extent.height != 0
-	                                ? static_cast<double>(source.extent.width) / source.extent.height
-	                                : 0.0;
+	uint32_t     src_w = source.extent.width;
+	if (!scene && Loader::DemonsSoulsRenderSize::WideOutputWidth() != 0 && source.extent.height != 0)
+		src_w = std::min(src_w, (source.extent.height * 16u + 8u) / 9u);
+	const double frame_aspect = source.extent.height != 0 ? static_cast<double>(src_w) / source.extent.height : 0.0;
 	const double wide         = Loader::DemonsSoulsRenderSize::WideAspect();
 	double       aspect       = wide > 0.0 ? (scene ? wide : frame_aspect) : aspect_fit ? frame_aspect : 0.0;
 	if (const double window = static_cast<double>(m_extent.width) / std::max(1u, m_extent.height);
@@ -994,7 +997,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	region.srcSubresource.mipLevel       = 0;
 	region.srcSubresource.baseArrayLayer = 0;
 	region.srcSubresource.layerCount     = 1;
-	region.srcOffsets[1].x               = static_cast<int>(source.extent.width);
+	region.srcOffsets[1].x               = static_cast<int>(src_w);
 	region.srcOffsets[1].y               = static_cast<int>(source.extent.height);
 	region.srcOffsets[1].z               = 1;
 	region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
