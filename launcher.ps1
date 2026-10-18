@@ -45,7 +45,7 @@ $safeGpuTip = "Prevents the crashes and blue screens that come from the graphics
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
 	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
-	hud = 0; streamline = ''; safegpu = $false; upscaler = '' }
+	hud = 0; streamline = ''; safegpu = $false; upscaler = ''; render_dlss = 1080 }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -130,8 +130,9 @@ function Get-PlayCommand {
 	# HDR10 output when Windows HDR is on for the display; SDR otherwise.
 	if ($settings.hdr) { $arguments += '-Hdr' }
 	$dlss = $frameGenAvailable -and $settings.upscaler -eq 'dlss'
-	# (With DLSS 1440 is passed too: the PS5 Pro path's own height is 1512.)
-	if ([int]$settings.render -gt 0 -and ([int]$settings.render -ne 1440 -or $dlss)) { $arguments += @('-RenderHeight', [int]$settings.render) }
+	# The upscaler's own render height (with DLSS always passed: the PS5 Pro path's own height is 1512).
+	$height = if ($dlss) { [int]$settings.render_dlss } else { [int]$settings.render }
+	if ($height -gt 0 -and ($height -ne 1440 -or $dlss)) { $arguments += @('-RenderHeight', $height) }
 	if ($settings.ratio -in '21:9', '32:9') { $arguments += @('-Aspect', $settings.ratio) }
 	if ($settings.quality -in 'low', 'lowest') {
 		$arguments += @('-Quality', $settings.quality, '-TextureReduce', $(if ($settings.quality -eq 'lowest') { 2 } else { 1 }))
@@ -259,8 +260,15 @@ $safeGpu = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Safe GP
 Add-Row '' @($safeGpu)
 $render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
 $render.Items.AddRange($renderHeights)
-$render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string][int]$settings.render } | Select-Object -First 1)
-if ($render.SelectedIndex -lt 0) { $render.SelectedItem = '1440 (PS5)' }
+# Each upscaler keeps its own render height (settings render, render_dlss): the row shows the chosen upscaler's.
+function Select-RenderHeight([int]$height, [int]$fallback) {
+	$render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string]$height } | Select-Object -First 1)
+	if ($render.SelectedIndex -lt 0) {
+		$render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string]$fallback } | Select-Object -First 1)
+	}
+}
+$renderForDlss = $frameGenAvailable -and $settings.upscaler -eq 'dlss'
+if ($renderForDlss) { Select-RenderHeight $settings.render_dlss 1080 } else { Select-RenderHeight $settings.render 1440 }
 $renderNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'Demon''s Souls 3D; higher = sharper, needs more GPU'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
 Add-Row 'Render height' @($render, $renderNote)
 $upscaler = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160; Enabled = $frameGenAvailable }
@@ -276,8 +284,17 @@ Update-UpscalerNote
 	"Game: the PS5's performance mode, its 3D anti-aliased by the game's TAA at the render height and stretched to 4K.`n" +
 	"DLSS: the game's own PS5 Pro mode, Sony's upscaler (PSSR) replaced by NVIDIA DLSS: the 3D at the render height (2688x1512`n" +
 	"at 1512, the PS5 Pro's; 1080 at least) made a 3840x2160 image the game finishes at 4K (bloom, depth of field, the HUD).`n" +
-	"Sharper than the stretch, at some GPU cost. The in-game Cinematic mode stays native 4K without DLSS.")
+	"Sharper than the stretch, at some GPU cost. The in-game Cinematic mode stays native 4K without DLSS.`n" +
+	"Each upscaler keeps its own render height. DLSS starts at 1080: on an RTX 5090 about the frame rate of the game's TAA`n" +
+	"at 1440, with a sharper 4K image.")
 Add-Row 'Upscaler' @($upscaler, $upscalerNote)
+$upscaler.Add_SelectedIndexChanged({
+	# The height shown goes back to the upscaler it was for; the newly chosen one's is shown.
+	$height = [int](([string]$render.SelectedItem -split ' ')[0])
+	if ($script:renderForDlss) { $settings.render_dlss = $height } else { $settings.render = $height }
+	$script:renderForDlss = $upscaler.SelectedIndex -eq 1
+	if ($script:renderForDlss) { Select-RenderHeight $settings.render_dlss 1080 } else { Select-RenderHeight $settings.render 1440 }
+})
 $ratio = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
 $ratio.Items.AddRange($ratios)
 $ratio.SelectedItem = ($ratios | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.ratio } | Select-Object -First 1)
@@ -365,7 +382,8 @@ function Read-Form {
 	$settings.hdr        = $hdr.Checked
 	$settings.safegpu    = $safeGpu.Checked
 	$settings.hud        = $hud.SelectedIndex
-	$settings.render     = [int](([string]$render.SelectedItem -split ' ')[0])
+	$height              = [int](([string]$render.SelectedItem -split ' ')[0])
+	if ($renderForDlss) { $settings.render_dlss = $height } else { $settings.render = $height }
 	$settings.ratio      = ([string]$ratio.SelectedItem -split ' ')[0]
 	$settings.quality    = ([string]$quality.SelectedItem -split ' ')[0].ToLowerInvariant()
 	# (Kept as it was where the DLLs are missing.)
