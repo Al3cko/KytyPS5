@@ -6,10 +6,11 @@
 
 namespace Loader {
 struct Program;
-// KYTY_RENDER_HEIGHT=<720..1440> (run-windows.ps1 -RenderHeight, the launcher's "Render resolution"): Demon's Souls'
+// KYTY_RENDER_HEIGHT=<720..2160> (run-windows.ps1 -RenderHeight, the launcher's "Render resolution"): Demon's Souls'
 // performance mode - the PS5's default, its 3D rendered at 2560x1440 and upscaled by the game to a 3840x2160 output -
 // renders its 3D at that height (16:9) instead. The output, the UI and what the game draws at output size stay 4K;
-// GPU-bound PCs (a laptop's RTX 3080: 1-1 standing 20.7 -> 24.5 fps at 1080) trade sharpness for frame rate.
+// GPU-bound PCs (a laptop's RTX 3080: 1-1 standing 20.7 -> 24.5 fps at 1080) trade sharpness for frame rate, and 2160
+// renders the 3D at the output's own 3840x2160 (an RTX 5090 at 1-1 standing: 68 -> 55 fps, GPU-bound).
 // Unset or 1440: the game as it is. The game's own 1080p output modes (r_Wants4K 1 and 2) are no option: their UI
 // keeps the 4K layout (off screen).
 // KYTY_RENDER_ASPECT=<w>:<h> (run-windows.ps1 -Aspect, the launcher's "Aspect ratio"; 21:9 is taken as 64:27): the 3D
@@ -45,7 +46,7 @@ struct Size {
 	uint32_t height = 0;
 };
 inline Size RenderSizeFor(uint32_t height, double aspect = GameAspect) {
-	if (height < 720 || height > RenderHeight) return {};
+	if (height < 720 || height > OutputHeight) return {};
 	const auto width = static_cast<uint32_t>(std::lround(height * aspect / 8.0)) * 8u;
 	return {width, height};
 }
