@@ -116,7 +116,12 @@ function Resolve-Streamline {
 	return $null
 }
 $streamline = Resolve-Streamline
-$frameGenAvailable = [bool]$streamline
+# DLSS (the upscaler and frame generation) needs an NVIDIA RTX graphics card: with none (AMD, Intel, GeForce GTX) both
+# rows stay off and the game's own TAA makes the picture, at the render height the game's TAA keeps.
+$rtxGpu = try {
+	[bool](Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' -and $_.Name -match '\bRTX\b' })
+} catch { $false }
+$frameGenAvailable = [bool]$streamline -and $rtxGpu
 
 function Get-PlayCommand {
 	$size = $settings.resolution -split 'x'
@@ -165,7 +170,7 @@ if ($DryRun) {
 	"precompile: cmd /s /c `"$(Get-PrecompileCommand)`""
 	"hints:      cmd /s /c `"$(Get-PrecompileCommand '-ExportHints')`""
 	"efficiency cores: 0x{0:X}" -f $efficiencyMask
-	"frame generation: $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline" } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
+	"frame generation: $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline" } elseif (!$rtxGpu) { 'no NVIDIA RTX graphics card (DLSS off)' } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
 	return
 }
 
@@ -276,8 +281,9 @@ $upscaler.Items.AddRange($upscalers)
 $upscaler.SelectedIndex = if ($frameGenAvailable -and $settings.upscaler -eq 'dlss') { 1 } else { 0 }
 $upscalerNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
 function Update-UpscalerNote {
-	$upscalerNote.Text = if ($frameGenAvailable) { 'DLSS: NVIDIA RTX; 1440 = Quality, 1080 = Performance, 2160 = DLAA' } else {
-		'needs NVIDIA''s Streamline SDK (choose its folder under Frame generation)' }
+	$upscalerNote.Text = if ($frameGenAvailable) { 'DLSS: NVIDIA RTX; 1440 = Quality, 1080 = Performance, 2160 = DLAA' }
+		elseif (!$rtxGpu) { 'DLSS needs an NVIDIA RTX graphics card: here the game''s own TAA' }
+		else { 'needs NVIDIA''s Streamline SDK (choose its folder under Frame generation)' }
 }
 Update-UpscalerNote
 (New-Object System.Windows.Forms.ToolTip -Property @{ AutoPopDelay = 30000 }).SetToolTip($upscaler,
@@ -317,8 +323,9 @@ if ($frameGen.SelectedIndex -lt 0) { $frameGen.SelectedIndex = 0 }
 $frameGenFolder = New-Object System.Windows.Forms.Button -Property @{ Text = 'Streamline...'; AutoSize = $true }
 $frameGenNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
 function Update-FrameGenNote {
-	$frameGenNote.Text = if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' } else {
-		'needs NVIDIA''s Streamline SDK: download it, then choose its folder' }
+	$frameGenNote.Text = if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' }
+		elseif (!$rtxGpu) { 'DLSS: needs an NVIDIA RTX 40 or newer graphics card' }
+		else { 'needs NVIDIA''s Streamline SDK: download it, then choose its folder' }
 }
 Update-FrameGenNote
 $frameGenTips = New-Object System.Windows.Forms.ToolTip
@@ -336,9 +343,10 @@ $frameGenFolder.Add_Click({
 	}
 	$settings.streamline = $dialog.SelectedPath
 	$script:streamline = $found
-	$script:frameGenAvailable = $true
-	$frameGen.Enabled = $true
-	$upscaler.Enabled = $true
+	# (Without an NVIDIA RTX graphics card the folder is kept, the rows stay off.)
+	$script:frameGenAvailable = $rtxGpu
+	$frameGen.Enabled = $rtxGpu
+	$upscaler.Enabled = $rtxGpu
 	Update-FrameGenNote
 	Update-UpscalerNote
 })

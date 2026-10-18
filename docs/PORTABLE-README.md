@@ -90,8 +90,9 @@ PS5 Pro upscaler, and the game finishes it at 4K (bloom, depth of field, the HUD
 at the render height and stretching to 4K. The launcher keeps a render height for each upscaler: DLSS starts
 at 1080, DLSS's Performance (on an RTX 5090 about the frame rate of the game's own TAA at 1440, with a
 sharper picture); 1440 is its Quality, 1512 the PS5 Pro's own 2688x1512, 2160 DLAA. NVIDIA RTX only, with
-NVIDIA's Streamline runtime as for frame generation below (elsewhere the game's own picture stays). The
-in-game "Cinematic" mode stays native 4K without DLSS.
+NVIDIA's Streamline runtime as for frame generation below: on a PC without an NVIDIA RTX graphics card (AMD,
+Intel, GeForce GTX) the launcher keeps this row and frame generation off, and the game's own TAA makes the
+picture at its own render height. The in-game "Cinematic" mode stays native 4K without DLSS.
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
