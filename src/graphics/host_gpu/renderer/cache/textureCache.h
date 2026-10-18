@@ -161,6 +161,8 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// RunGarbageCollector's line on the PC's memory, when it moved.
+	void LogPcMemory(uint64_t tick);
 	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).
 	void RetireStaleImages(uint64_t tick);
 	// The latest tick of a GPU-written image's download that will write guest memory overlapping
@@ -398,6 +400,9 @@ private:
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_logged_video_memory = 0; // RunGarbageCollector's log line
 	uint64_t                                          m_logged_shared_memory = 0;
+	uint64_t                                          m_logged_working_set   = 0; // (and its line on the PC's memory)
+	uint64_t                                          m_logged_private       = 0;
+	bool                                              m_logged_short_of_ram  = false;
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {
