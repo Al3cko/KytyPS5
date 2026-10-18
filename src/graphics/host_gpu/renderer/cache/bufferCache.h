@@ -70,6 +70,8 @@ public:
 		return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size) ? *owner : BufferId {};
 	}
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
+	// The start of each range shaders read through pointers held by a buffer with the guest's bytes (see the definition).
+	void                   EnsureBdaReadable(std::span<const GuestRange> ranges);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
