@@ -57,6 +57,8 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 // HasReadWatchers' filter: a bit per 64 KiB granule.
 constexpr uint64_t READ_GRANULE_SIZE  = 64 * 1024;
 constexpr uint64_t READ_GRANULE_PAGES = READ_GRANULE_SIZE / PAGE_SIZE;
+// The lowest 64 KiB of the address space: never guest memory (UpdateRegionWatchers).
+constexpr size_t NULL_PAGES = 64 * 1024 / PAGE_SIZE;
 
 constexpr uint32_t NO_ACCESS_PROTECTION  = PAGE_NOACCESS;
 constexpr uint32_t READ_ONLY_PROTECTION  = PAGE_READONLY;
@@ -334,6 +336,21 @@ struct PageManager::Impl {
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
+		// The lowest 64 KiB hold no guest memory (no mapping is ever made there): a range a stale descriptor put there
+		// is not watched, both ways alike. Watched, the deferred write protection of its region's first pages started
+		// at address 0, an invalid range, and the upload worker's protection job ended the emulator ("invalid range
+		// vaddr=0x0, size=0x400000", issue #70 and a 1-1 tour, both with DLSS super resolution on).
+		if (base_addr == 0 && first < NULL_PAGES) {
+			static std::atomic<bool> reported {false};
+			if (!reported.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Page watchers: pages below 64 KiB (%s 0x%llx-0x%llx) left unwatched: no guest memory there\n",
+				            is_read ? "read" : "write", static_cast<unsigned long long>(first * PAGE_SIZE),
+				            static_cast<unsigned long long>(last * PAGE_SIZE));
+				std::fflush(stdout);
+			}
+			first = NULL_PAGES;
+			if (first >= last) return;
+		}
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
