@@ -1046,6 +1046,12 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		options.outputHeight    = inputs.output.extent.height;
 		options.colorBuffersHDR = sl::Boolean::eTrue; // (the game's linear HDR scene, before its tone mapping)
 		options.useAutoExposure = sl::Boolean::eTrue;
+		// KYTY_DLSS_PRESET=<letter> (a test): that DLSS model for every mode instead of the mode's default.
+		if (const char* preset = std::getenv("KYTY_DLSS_PRESET"); preset != nullptr && *preset >= 'A' && *preset <= 'O') {
+			const auto value = static_cast<sl::DLSSPreset>(*preset - 'A' + 1);
+			options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset =
+			    options.ultraPerformancePreset = options.ultraQualityPreset = value;
+		}
 		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
 			std::printf("DLSS super resolution: slDLSSSetOptions failed (%s)\n", sl::getResultAsStr(result));
 			std::fflush(stdout);

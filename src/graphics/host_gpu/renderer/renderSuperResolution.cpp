@@ -131,6 +131,8 @@ struct UpscaleRecord {
 	vk::Buffer              exposure_buffer = nullptr;    // the game's exposure: its float at exposure_index
 	vk::DeviceSize          exposure_base = 0, exposure_range = 0;
 	uint32_t                exposure_index = 0;
+	struct Timing*          timing         = nullptr;     // (KYTY_SR_TIMING)
+	uint32_t                timing_entry   = 0;
 };
 
 // The output (general) multiplied by the exposure in place, after the upscale's writes (compute or transfer); left
@@ -216,13 +218,75 @@ void Stretch(const UpscaleRecord& record, const vk::detail::DispatchLoaderDynami
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 }
 
+// KYTY_SR_TIMING=1 (diagnostic): the GPU time of the upscale and of the exposure pass, from timestamps written around
+// them (three per dispatch, a ring of 16), read back 8 dispatches later; their means printed every 300.
+struct Timing {
+	static constexpr uint32_t Entries = 16, Stamps = 3;
+	vk::Device     device;
+	vk::QueryPool  pool;
+	double         period_ns = 1.0;
+	uint64_t       written   = 0; // (dispatches timed: the next entry)
+	uint64_t       read      = 0;
+	double         upscale_ms = 0.0, exposure_ms = 0.0;
+	uint32_t       samples    = 0;
+};
+Timing* SrTiming(GraphicContext& graphics) {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_SR_TIMING");
+		return value != nullptr && *value == '1';
+	}();
+	if (!on) return nullptr;
+	static Timing* timing = [&]() -> Timing* {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = Timing::Entries * Timing::Stamps;
+		vk::QueryPool pool;
+		if (graphics.device.createQueryPool(&info, nullptr, &pool) != vk::Result::eSuccess) return nullptr;
+		auto* made      = new Timing;
+		made->device    = graphics.device;
+		made->pool      = pool;
+		made->period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		return made;
+	}();
+	return timing;
+}
+// GPU thread: the results of entries 8 or more dispatches old that the GPU wrote.
+void ReadTiming(Timing& timing) {
+	while (timing.read + 8 <= timing.written) {
+		const auto entry = static_cast<uint32_t>(timing.read % Timing::Entries);
+		std::array<uint64_t, Timing::Stamps> stamps {};
+		if (timing.device.getQueryPoolResults(timing.pool, entry * Timing::Stamps, Timing::Stamps, sizeof(stamps), stamps.data(),
+		                                      sizeof(uint64_t), vk::QueryResultFlagBits::e64) != vk::Result::eSuccess)
+			break;
+		timing.upscale_ms += static_cast<double>(stamps[1] - stamps[0]) * timing.period_ns / 1e6;
+		timing.exposure_ms += static_cast<double>(stamps[2] - stamps[1]) * timing.period_ns / 1e6;
+		++timing.read;
+		if (++timing.samples == 300) {
+			std::printf("Super resolution GPU: upscale %.3f ms, exposure %.3f ms (means of 300)\n", timing.upscale_ms / 300.0,
+			            timing.exposure_ms / 300.0);
+			std::fflush(stdout);
+			timing.samples    = 0;
+			timing.upscale_ms = timing.exposure_ms = 0.0;
+		}
+	}
+}
+
 void RunUpscale(const UpscaleRecord& record, const vk::detail::DispatchLoaderDynamic& dispatch) {
+	const auto stamp = [&](uint32_t index) {
+		if (record.timing == nullptr) return;
+		const auto first = record.timing_entry * Timing::Stamps;
+		if (index == 0) record.command.resetQueryPool(record.timing->pool, first, Timing::Stamps, dispatch);
+		record.command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, record.timing->pool, first + index, dispatch);
+	};
+	stamp(0);
 	const bool upscaled = FrameGen::Upscale(record.command, record.inputs);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::InvalidateReplayState(); // (what DLSS bound)
 #endif
 	if (!upscaled) Stretch(record, dispatch);
+	stamp(1);
 	ApplyExposure(record, dispatch);
+	stamp(2);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::InvalidateReplayState(); // (the pass's pipeline)
 #endif
@@ -372,6 +436,11 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		std::printf("Super resolution: %s, the game's exposure %s\n", dlss ? "DLSS" : "stretch",
 		            record.exposure_pass.pipeline != nullptr ? "applied" : "not applied");
 		std::fflush(stdout);
+	}
+	if (auto* timing = SrTiming(m_context.GetGraphics()); timing != nullptr && dlss) {
+		ReadTiming(*timing);
+		record.timing       = timing;
+		record.timing_entry = static_cast<uint32_t>(timing->written++ % Timing::Entries);
 	}
 	if (dlss) {
 		color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, range(bindings[0]), vk_buffer);
