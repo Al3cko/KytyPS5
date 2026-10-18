@@ -5,7 +5,8 @@
 // flip image with one draw (the composite) that samples the HUD layer and the 3D scene from separate textures. On the
 // renderer thread that draw is recorded once more just before it, with the HUD texture cleared to transparent; the
 // result is copied aside, and the flip image and the HUD texture are put back as they were, so the game's own draw
-// follows unchanged. The copy goes with the presented frame (FrameInputs::hudless).
+// follows unchanged. The copy goes with the presented frame (FrameInputs::hudless); the present thread lays it out as
+// the backbuffer (ScaleHudless), which BeforePresent tags as kBufferTypeHUDLessColor.
 //
 // KYTY_FG_HUDLESS_UI=n: the HUD texture is the composite's candidate n (the log lists them), not the one its pixel
 // shader or the guess gives.
@@ -60,6 +61,10 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, const 
 
 // At the guest flip of `flip`, after PrepareInputs: the composite's HUD-less image goes with `inputs`.
 void PrepareHudless(FrameInputs& inputs, const Image& flip);
+// Present thread, in the present's command buffer after RecordPresentCommands: the frame's HUD-less image laid out as
+// the backbuffer (`region`: where the game image is, black around it), for BeforePresent's tag.
+void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
+                  vk::Rect2D region, vk::Format format);
 // A frame's HUD-less images (DestroyInputs); at shutdown, the capture's own.
 void DestroyHudlessInputs(GraphicContext& graphics, FrameInputs& inputs);
 void DestroyHudless(GraphicContext& graphics);

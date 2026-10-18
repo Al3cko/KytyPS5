@@ -441,8 +441,9 @@ void PrepareHudless(FrameInputs& inputs, const Image& flip) {
 	const bool taken = g_taken.exchange(false, std::memory_order_relaxed);
 	// The composite drawn into this flip image goes with a frame DLSS-G generates from: the frame's image and the
 	// capture's trade places (the frame's former one, idle since the frame was acquired, takes the next capture).
-	auto& hudless     = inputs.hudless;
-	hudless.has_image = taken && inputs.valid && g_capture != nullptr && g_capture_flip == address;
+	auto& hudless       = inputs.hudless;
+	hudless.has_image   = taken && inputs.valid && g_capture != nullptr && g_capture_flip == address;
+	hudless.has_display = false;
 	if (hudless.has_image) {
 		std::swap(hudless.image, g_capture);
 	}
@@ -455,9 +456,59 @@ void PrepareHudless(FrameInputs& inputs, const Image& flip) {
 	}
 }
 
+void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
+                  vk::Rect2D region, vk::Format format) {
+	auto& hudless       = inputs.hudless;
+	hudless.has_display = false;
+	if (!inputs.valid || !hudless.has_image) {
+		return;
+	}
+	auto& source  = *hudless.image;
+	auto& display = hudless.display;
+	// A sampled copy target of the backbuffer's size and format, as DLSS-G's other inputs (one made for another went
+	// with the swapchain's recreation, which waited for its queues).
+	VulkanImage backbuffer_like;
+	backbuffer_like.format = format;
+	backbuffer_like.extent = vk::Extent3D {backbuffer.width, backbuffer.height, 1};
+	Configure(graphics, display, hudless.display_view, backbuffer_like);
+	Transition(command, source, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	Transition(command, display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	// Where RecordPresentCommands put the frame image, black around it as there.
+	if (region.offset.x != 0 || region.offset.y != 0 || region.extent != backbuffer) {
+		const vk::ClearColorValue       black {std::array<float, 4> {0.0f, 0.0f, 0.0f, 1.0f}};
+		const vk::ImageSubresourceRange whole {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(display.image, vk::ImageLayout::eTransferDstOptimal, &black, 1, &whole);
+		Transition(command, display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	}
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(source.extent.width),
+	                                    static_cast<int32_t>(source.extent.height), 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstOffsets[0]  = vk::Offset3D {region.offset.x, region.offset.y, 0};
+	blit.dstOffsets[1]  = vk::Offset3D {region.offset.x + static_cast<int32_t>(region.extent.width),
+	                                    region.offset.y + static_cast<int32_t>(region.extent.height), 1};
+	command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal, display.image,
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
+	Transition(command, display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	hudless.has_display = true;
+}
+
 void DestroyHudlessInputs(GraphicContext& graphics, FrameInputs& inputs) {
-	Delete(graphics, inputs.hudless.image);
-	inputs.hudless.has_image = false;
+	auto& hudless = inputs.hudless;
+	if (hudless.display_view != nullptr) {
+		graphics.device.destroyImageView(hudless.display_view, nullptr);
+		hudless.display_view = nullptr;
+	}
+	if (hudless.display.image != nullptr) {
+		graphics.DeleteImage(hudless.display);
+	}
+	Delete(graphics, hudless.image);
+	hudless.has_image = hudless.has_display = false;
 }
 
 void DestroyHudless(GraphicContext& graphics) {

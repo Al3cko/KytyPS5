@@ -1339,6 +1339,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene);
+			if (FrameGen::HudlessOn() && !frame.reusing_last) {
+				// DLSS-G's HUD-less image, where the frame image went.
+				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(),
+				                       swapchain.PresentRegion(), swapchain.Format());
+			}
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
 #if defined(_WIN32)

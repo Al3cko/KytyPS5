@@ -45,10 +45,13 @@ struct Camera {
 	bool                  valid = false;
 };
 
-// KYTY_FG_HUDLESS (frame-gen-hudless.h): a frame's game image without its HUD, its pixels as the frame image's.
+// KYTY_FG_HUDLESS (frame-gen-hudless.h): a frame's game image without its HUD, its pixels as the frame image's
+// (`image`), and that laid out as the backbuffer (`display`, the present's: DLSS-G's HUD-less color).
 struct HudlessImages {
 	std::unique_ptr<VulkanImage> image;
-	bool                         has_image = false;
+	VulkanImage                  display;
+	vk::ImageView                display_view = nullptr;
+	bool                         has_image = false, has_display = false;
 };
 
 // One presented frame's inputs, owned by the presenter's frame.
@@ -127,8 +130,12 @@ void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t m
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
-// Frame generation's own images (not the texture cache's; frame-gen-hudless.cpp's too): a barrier from `image`'s state
-// to `layout`, `access` at `stage`.
+
+// Frame generation's own images (not the texture cache's; frame-gen-hudless.cpp's too), on the thread that records
+// them: `image` (re)made as a sampled copy target like `source`, with its view (with `attachment`, a color attachment
+// too where the format allows it, *attachment tells); a barrier from `image`'s state to `layout`, `access` at `stage`.
+void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view, const VulkanImage& source,
+               bool* attachment = nullptr);
 void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
                 vk::AccessFlags2 access, vk::PipelineStageFlags2 stage);
 
