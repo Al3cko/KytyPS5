@@ -97,6 +97,8 @@ struct MemoryUse {
 };
 MemoryUse ProcessMemory();
 uint64_t  PhysicalMemory();
+// The physical memory the system can still give without paging (free and standby; Linux: MemAvailable). 0: unknown.
+uint64_t AvailablePhysicalMemory();
 // Diagnostics: the busy blocks of every heap of the process by size ("size<TAB>count<TAB>bytes" lines to `path`, the
 // heaps locked while walked: a pause of a second or so), by size and first qword (<path>.sig.tsv: SPIR-V, a vtable as
 // module+offset, zero, data) and the committed private allocations (<path>.vm.tsv, the heaps' marked); false where

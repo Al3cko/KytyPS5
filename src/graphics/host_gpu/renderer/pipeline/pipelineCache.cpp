@@ -1035,6 +1035,7 @@ struct PipelineCache::ProgramCache {
 				continue;
 			}
 			if (worker >= p.gentle_threads && p.next.load(std::memory_order_relaxed) >= p.recorded_groups) break;
+			if (WaitForMemory(p)) continue; // (a program play just met first)
 			const size_t n = p.next.fetch_add(1, std::memory_order_relaxed);
 			if (n >= p.groups.size()) break;
 			(void)RunGroup(p, *p.groups[n]);
@@ -1055,6 +1056,30 @@ struct PipelineCache::ProgramCache {
 				                 p.spill_verify_failures.load(std::memory_order_relaxed));
 			}
 		}
+	}
+
+	// While the PC has less physical memory left than KYTY_PREFETCH_MIN_AVAIL_MB (default 1024 MiB), the prefetch makes
+	// none of the programs play has not met (they are for later): its translations, SPIR-V and plan file add to the paging
+	// the PC is doing then, the game loading beside it on 16 GB (issue #50: a bug check 0x1A in a protection change of the
+	// game's memory, while a level loaded with the prefetch translating 20,000 programs). True when one play met came up.
+	static bool WaitForMemory(Prefetch& p) {
+		static const uint64_t minimum = [] {
+			const char* value = std::getenv("KYTY_PREFETCH_MIN_AVAIL_MB");
+			return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) << 20u;
+		}();
+		static std::atomic<uint32_t> reports {0};
+		bool                         waited = false;
+		while (!p.stop.load(std::memory_order_relaxed)) {
+			const uint64_t available = LocalPlatform::AvailablePhysicalMemory();
+			if (available == 0 || available >= minimum) break;
+			if (!waited && reports.fetch_add(1, std::memory_order_relaxed) < 8)
+				PipelineCacheLog("Shader prefetch: waits, {} MiB of physical memory left (below {} MiB)", available >> 20u,
+				                 minimum >> 20u);
+			waited = true;
+			if (p.Followed() != nullptr) return true;
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+		}
+		return false;
 	}
 
 	// The group translated here unless another thread took it.

@@ -1478,6 +1478,12 @@ uint64_t PhysicalMemory() {
 	return GlobalMemoryStatusEx(&status) != 0 ? status.ullTotalPhys : 0;
 }
 
+uint64_t AvailablePhysicalMemory() {
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	return GlobalMemoryStatusEx(&status) != 0 ? status.ullAvailPhys : 0;
+}
+
 static IDXGIAdapter3* g_video_memory_adapter = nullptr;
 
 bool OpenVideoMemoryAdapter(const uint8_t* luid) {
@@ -1785,6 +1791,22 @@ uint64_t PhysicalMemory() {
 	const long pages = sysconf(_SC_PHYS_PAGES);
 	const long size  = sysconf(_SC_PAGESIZE);
 	return pages > 0 && size > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(size) : 0;
+}
+
+uint64_t AvailablePhysicalMemory() {
+	uint64_t available = 0;
+	if (FILE* file = std::fopen("/proc/meminfo", "r")) {
+		char line[256];
+		while (std::fgets(line, sizeof(line), file) != nullptr) {
+			unsigned long long kib = 0;
+			if (std::sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
+				available = static_cast<uint64_t>(kib) << 10u;
+				break;
+			}
+		}
+		std::fclose(file);
+	}
+	return available;
 }
 
 bool OpenVideoMemoryAdapter(const uint8_t* /*luid*/) {
