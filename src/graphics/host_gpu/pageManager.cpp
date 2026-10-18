@@ -62,11 +62,24 @@ constexpr uint32_t NO_ACCESS_PROTECTION  = PAGE_NOACCESS;
 constexpr uint32_t READ_ONLY_PROTECTION  = PAGE_READONLY;
 constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 
+// The raw return addresses of a fatal end, on stderr (resolve them with the build's map: the end itself names no
+// caller; 10-18 a 1-1 tour ended on "invalid range vaddr=0, size=0x400000" with nothing else).
+void WriteBacktrace() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void*      frames[32];
+	const auto count = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+	std::fprintf(stderr, "--- Backtrace --- (exe base %p)\n", static_cast<void*>(GetModuleHandleW(nullptr)));
+	for (USHORT i = 0; i < count; ++i) std::fprintf(stderr, "  %p\n", frames[i]);
+	std::fflush(stderr);
+#endif
+}
+
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
 	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+	WriteBacktrace();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
 #endif
@@ -81,6 +94,7 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 	va_end(args);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+	WriteBacktrace();
 	std::_Exit(322);
 }
 
