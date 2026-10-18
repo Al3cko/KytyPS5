@@ -1368,6 +1368,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+// A dynamic storage binding's levels and the level of its view `mip`: a null image's (bind_null: no image could be made,
+// issue #53) one level stands for each level the shader picks. (Out of AcquireImages, whose control flow and so its PGO
+// profile stay as they were.)
+[[gnu::noinline]] static uint32_t DynamicStorageLevels(const TextureBinding& binding, uint32_t mip_count) {
+	return binding.desc.info.data.Empty() ? mip_count : binding.desc.view_info.level_count;
+}
+[[gnu::noinline]] static uint32_t DynamicStorageLevel(const TextureBinding& binding, uint32_t mip) {
+	return binding.desc.info.data.Empty() ? 0u : mip;
+}
+
 bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 	const auto& program       = *prepared.runtime->program;
 	auto&       images        = prepared.images;
@@ -1379,15 +1389,12 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
-			// (A null image - bind_null: no image could be made, issue #53 - has one level, which stands for each level
-			// the shader picks.)
-			const bool null_image = binding.desc.info.data.Empty();
 			EXIT_IF(resource.mip_count == 0u ||
-			        (!null_image && resource.mip_count != binding.desc.view_info.level_count));
+			        resource.mip_count != DynamicStorageLevels(binding, resource.mip_count));
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				if (!null_image) desc.view_info.base_level += mip;
+				desc.view_info.base_level += DynamicStorageLevel(binding, mip);
 				desc.view_info.level_count = 1;
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}

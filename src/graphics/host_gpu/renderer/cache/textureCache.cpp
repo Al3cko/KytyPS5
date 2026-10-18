@@ -4396,6 +4396,7 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 }
 
 [[gnu::noinline]] void TextureCache::LogPcMemory(uint64_t tick) {
+	if (tick % 60 != 30) return;
 	const auto     use       = LocalPlatform::ProcessMemory();
 	const auto     available = LocalPlatform::AvailablePhysicalMemory();
 	const uint64_t step      = uint64_t {1} << 30u;
@@ -4482,7 +4483,7 @@ void TextureCache::RunGarbageCollector() {
 	// And one on the PC's memory when the emulator's working set or private bytes moved by 1 GiB, or the memory the
 	// system has left went under 2 GiB or back (checked every 60 flips; issue #47: "the emulator uses all 32 GB of my
 	// RAM", with spiky frame times, and nothing in its log said how much it held).
-	if (tick % 60 == 30) LogPcMemory(tick);
+	LogPcMemory(tick);
 	// Over the budget: the images no draw or dispatch used for StaleTicks flips (~10 s), least recently used first, at
 	// most MaxDeletions a flip. What the game stops drawing it stops binding: 1-1 standing, 3.2 GiB of images were used
 	// in the last 2 flips, 3.0 GiB not for 160 and more, 0.05 GiB in between; turning the camera, images behind it
