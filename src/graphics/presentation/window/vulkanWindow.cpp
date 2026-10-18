@@ -619,10 +619,18 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	// tested: an RX 6800 XT (RDNA2, its wave64 compute emulated on 32-lane subgroups as NVIDIA's; Adrenalin 26.8.1) drew
 	// black squares across the scene with them, compiled by the game or precompiled alike (issue #64). Elsewhere those
 	// programs translate as before them, and a store made with them stays in use for the rest.
+	// AMD GPUs always load a table mode slot where the shader reads it, whatever the store was made with: 4 table mode
+	// compute shaders at the Vanguard read 1049-1078 slots, which loaded at the entry reset an RX 9070 XT and an RX 9060
+	// XT (RDNA4, Linux RADV: page faults or a ring timeout) at their first dispatches; with them loaded at use, or those
+	// 4 on the normal path, the fight passed (issue #51). A store made without it is out of date there (precompile
+	// again); until then its table mode pipelines are compiled at their first use.
 	namespace Translate = ShaderRecompiler::Frontend;
 	if (device_properties.vendorID != 0x10deu) {
-		Translate::SetTranslatorDeviceFeatures(Translate::TranslatorFeatures & ~Translate::TranslatorFeatureCooperativeHalves);
-		std::printf("Cooperative halves: off on this GPU (tested on NVIDIA GPUs; KYTY_LANE_LOCAL_COOP=1 forces them)\n");
+		const bool amd = device_properties.vendorID == 0x1002u;
+		Translate::SetTranslatorDeviceFeatures(Translate::TranslatorFeatures & ~Translate::TranslatorFeatureCooperativeHalves,
+		                                       amd ? Translate::TranslatorFeatureTableSlotsAtUse : 0u);
+		std::printf("Cooperative halves: off on this GPU (tested on NVIDIA GPUs; KYTY_LANE_LOCAL_COOP=1 forces them)%s\n",
+		            amd ? "; table mode slots loaded at use" : "");
 	}
 	std::fflush(stdout);
 

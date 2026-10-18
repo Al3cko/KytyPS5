@@ -19,13 +19,15 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 static std::atomic<uint32_t> g_translator_features {TranslatorFeatures};
 static std::atomic<uint32_t> g_device_features {TranslatorFeatures};
+static std::atomic<uint32_t> g_device_required {0};
 
 void SetTranslatorFeatures(uint32_t features) {
 	g_translator_features.store(features & TranslatorFeatures, std::memory_order_relaxed);
 }
 
-void SetTranslatorDeviceFeatures(uint32_t features) {
+void SetTranslatorDeviceFeatures(uint32_t features, uint32_t required) {
 	g_device_features.store(features & TranslatorFeatures, std::memory_order_relaxed);
+	g_device_required.store(required & features & TranslatorFeatures, std::memory_order_relaxed);
 }
 
 uint32_t TranslatorDeviceFeatures() {
@@ -41,8 +43,9 @@ uint32_t TranslatorFeatureSet() {
 	};
 	static const int cooperative  = forced("KYTY_LANE_LOCAL_COOP");
 	static const int slots_at_use = forced("KYTY_TABLE_SLOTS_AT_USE");
-	auto             features     = g_translator_features.load(std::memory_order_relaxed) &
-	                     g_device_features.load(std::memory_order_relaxed);
+	const auto       stored       = g_translator_features.load(std::memory_order_relaxed);
+	auto             features     = (stored & g_device_features.load(std::memory_order_relaxed)) |
+	                     g_device_required.load(std::memory_order_relaxed);
 	const auto       apply        = [&](int value, uint32_t feature) {
 		if (value >= 0) features = value != 0 ? features | feature : features & ~feature;
 	};
