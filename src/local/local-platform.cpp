@@ -1484,6 +1484,51 @@ uint64_t AvailablePhysicalMemory() {
 	return GlobalMemoryStatusEx(&status) != 0 ? status.ullAvailPhys : 0;
 }
 
+void LogAddressSpace(const char* label, uint64_t begin, uint64_t end) {
+	struct Allocation {
+		uint64_t base = 0, size = 0, committed = 0;
+		DWORD    type = 0;
+	};
+	std::vector<Allocation>                    allocations;
+	std::vector<std::pair<uint64_t, uint64_t>> gaps;
+	for (uint64_t address = begin; address < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0) break;
+		const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
+		const auto size = std::min<uint64_t>(static_cast<uint64_t>(info.RegionSize), end - base);
+		if (info.State == MEM_FREE) {
+			if (size >= (uint64_t {1} << 30u)) gaps.emplace_back(base, size);
+		} else {
+			const auto allocation = reinterpret_cast<uint64_t>(info.AllocationBase);
+			if (allocations.empty() || allocations.back().base != allocation)
+				allocations.push_back({.base = allocation, .type = info.Type});
+			allocations.back().size += size;
+			if (info.State == MEM_COMMIT) allocations.back().committed += size;
+		}
+		address = base + static_cast<uint64_t>(info.RegionSize);
+	}
+	std::printf("Address space %s (0x%llx-0x%llx):\n", label, static_cast<unsigned long long>(begin),
+	            static_cast<unsigned long long>(end));
+	uint64_t small_count = 0, small_bytes = 0;
+	for (const auto& allocation: allocations) {
+		if (allocation.size < (uint64_t {16} << 20u)) {
+			++small_count;
+			small_bytes += allocation.size;
+			continue;
+		}
+		const char* type = allocation.type == MEM_IMAGE ? "image" : allocation.type == MEM_MAPPED ? "mapped" : "private";
+		std::printf("  0x%012llx %9.2f GiB %s, %.2f GiB committed\n", static_cast<unsigned long long>(allocation.base),
+		            static_cast<double>(allocation.size) / (1u << 30u), type,
+		            static_cast<double>(allocation.committed) / (1u << 30u));
+	}
+	std::printf("  and %llu allocations under 16 MiB (%.2f GiB)\n", static_cast<unsigned long long>(small_count),
+	            static_cast<double>(small_bytes) / (1u << 30u));
+	for (const auto& [base, size]: gaps)
+		std::printf("  free 0x%012llx %9.2f GiB\n", static_cast<unsigned long long>(base),
+		            static_cast<double>(size) / (1u << 30u));
+	std::fflush(stdout);
+}
+
 static IDXGIAdapter3* g_video_memory_adapter = nullptr;
 
 bool OpenVideoMemoryAdapter(const uint8_t* luid) {
@@ -1792,6 +1837,8 @@ uint64_t PhysicalMemory() {
 	const long size  = sysconf(_SC_PAGESIZE);
 	return pages > 0 && size > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(size) : 0;
 }
+
+void LogAddressSpace(const char* /*label*/, uint64_t /*begin*/, uint64_t /*end*/) {}
 
 uint64_t AvailablePhysicalMemory() {
 	uint64_t available = 0;
