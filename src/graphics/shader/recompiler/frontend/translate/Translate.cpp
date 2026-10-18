@@ -18,21 +18,31 @@
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 static std::atomic<uint32_t> g_translator_features {TranslatorFeatures};
+static std::atomic<uint32_t> g_device_features {TranslatorFeatures};
 
 void SetTranslatorFeatures(uint32_t features) {
 	g_translator_features.store(features & TranslatorFeatures, std::memory_order_relaxed);
 }
 
+void SetTranslatorDeviceFeatures(uint32_t features) {
+	g_device_features.store(features & TranslatorFeatures, std::memory_order_relaxed);
+}
+
+uint32_t TranslatorDeviceFeatures() {
+	return g_device_features.load(std::memory_order_relaxed);
+}
+
 uint32_t TranslatorFeatureSet() {
 	// (KYTY_LANE_LOCAL_COOP=0/1: the cooperative halves off or on, KYTY_TABLE_SLOTS_AT_USE=0/1 the table slots' loads
-	// at the entry or where they are read, whatever the store was made with.)
+	// at the entry or where they are read, whatever the store was made with and the GPU allows.)
 	const auto forced = [](const char* name) {
 		const char* value = std::getenv(name);
 		return value == nullptr ? -1 : std::string_view(value) != "0" ? 1 : 0;
 	};
 	static const int cooperative  = forced("KYTY_LANE_LOCAL_COOP");
 	static const int slots_at_use = forced("KYTY_TABLE_SLOTS_AT_USE");
-	auto             features     = g_translator_features.load(std::memory_order_relaxed);
+	auto             features     = g_translator_features.load(std::memory_order_relaxed) &
+	                     g_device_features.load(std::memory_order_relaxed);
 	const auto       apply        = [&](int value, uint32_t feature) {
 		if (value >= 0) features = value != 0 ? features | feature : features & ~feature;
 	};

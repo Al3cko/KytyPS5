@@ -1037,10 +1037,11 @@ bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::file
 		                    ("hints-" + PipelineCacheGameId() + ".hints");
 		const auto hinted = std::filesystem::last_write_time(hints, error);
 		if (!error && written < hinted) return false;
-		// Made without a translation feature of this emulator's, and no precompile with it tried since: one makes the
-		// pipelines it changes.
+		// Made without a translation feature of this emulator's for this GPU, and no precompile with it tried since: one
+		// makes the pipelines it changes.
 		namespace Translate = ShaderRecompiler::Frontend;
-		if ((ReadStaticStamp().second & Translate::TranslatorFeatures) != Translate::TranslatorFeatures) return false;
+		const auto wanted = Translate::TranslatorDeviceFeatures();
+		if ((ReadStaticStamp().second & wanted) != wanted) return false;
 	}
 	if (graphics.pipeline_binaries_enabled) {
 		return PipelineBinaries::Open(graphics.device, StaticBinariesPath(), StaticBinariesSignature(graphics)) != nullptr;

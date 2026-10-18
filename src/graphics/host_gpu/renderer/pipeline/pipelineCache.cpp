@@ -3042,7 +3042,7 @@ void PipelineCache::InitializeStaticCache(bool create) {
 	if (!create) {
 		namespace Translate = ShaderRecompiler::Frontend;
 		Translate::SetTranslatorFeatures(ReadStaticFeatures());
-		if (const auto off = Translate::TranslatorFeatures & ~Translate::TranslatorFeatureSet(); off != 0)
+		if (const auto off = Translate::TranslatorDeviceFeatures() & ~Translate::TranslatorFeatureSet(); off != 0)
 			PipelineCacheLog("Translation features {:#x} off: the static pipeline store was made without them (precompile "
 			                 "again to use them)",
 			                 off);

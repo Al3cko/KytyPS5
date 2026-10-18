@@ -35,6 +35,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -614,6 +615,15 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	            : amd_rdna3_or_later                    ? "AMD RDNA3 or later"
 	                                                    : "default",
 	            device_properties.vendorID, id);
+	// The cooperative halves (ShaderRecompiler::Frontend::TranslatorFeatures) only on NVIDIA GPUs, where they were
+	// tested: an RX 6800 XT (RDNA2, its wave64 compute emulated on 32-lane subgroups as NVIDIA's; Adrenalin 26.8.1) drew
+	// black squares across the scene with them, compiled by the game or precompiled alike (issue #64). Elsewhere those
+	// programs translate as before them, and a store made with them stays in use for the rest.
+	namespace Translate = ShaderRecompiler::Frontend;
+	if (device_properties.vendorID != 0x10deu) {
+		Translate::SetTranslatorDeviceFeatures(Translate::TranslatorFeatures & ~Translate::TranslatorFeatureCooperativeHalves);
+		std::printf("Cooperative halves: off on this GPU (tested on NVIDIA GPUs; KYTY_LANE_LOCAL_COOP=1 forces them)\n");
+	}
 	std::fflush(stdout);
 
 	graphics.fragment_wave64_requirable =
