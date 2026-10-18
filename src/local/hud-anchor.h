@@ -5,9 +5,11 @@
 // 3840x2160 interface canvas with three vertex shaders, in batches: one draw holds the text of the health bars and the
 // souls, another the item names and the boss's name. In a frame showing the 3D, each vertex of such a draw is placed in
 // one of the HUD's areas (Areas: the top left - health, magic, stamina -, the bottom left - equipment, items -, the top
-// right - souls - and the bottom middle - boss health, prompts) while the HUD shows (its round icon in the top left
-// corner, its first draw, was drawn in the frame or the one before; menus draw none). A draw wholly in one area gets
-// its viewport squeezed back to 16:9 around the area's side (the left edge, the right edge, the centre); a draw over
+// right - souls, the items picked up under them - and the bottom middle - boss health, prompts) when it comes after the
+// HUD's first draw in the frame,
+// its round icon in the top left corner (menus draw none; the markers over the world come before it, often inside the
+// areas). A draw wholly in one area gets its viewport squeezed back to 16:9 around the area's side (the left edge, the
+// right edge, the centre); a draw over
 // several is drawn once for each, with its viewport and a scissor around where the area then lies (the areas stay
 // apart, squeezed), and what it has outside them (a dialogue's text in the same batch) once for each rectangle of the
 // canvas outside them, as it was. Widened again, each element stands at its side of the screen as drawn for 16:9. The
@@ -47,11 +49,12 @@ constexpr uint32_t                MaxVertices = 8192;
 struct Area {
 	float x0, x1, y0, y1, side;
 };
-constexpr std::array<Area, 4> Areas {{
+constexpr std::array<Area, 5> Areas {{
     {-1.1f, 0.3f, 0.6f, 1.1f, -1.0f},     // health, magic, stamina, their buffs
     {-1.1f, -0.55f, -1.1f, -0.25f, -1.0f}, // equipment, item counts and names
     {0.4f, 1.1f, 0.7f, 1.1f, 1.0f},        // souls
     {-0.55f, 0.55f, -0.95f, -0.35f, 0.0f}, // boss health, prompts
+    {0.3f, 1.1f, 0.3f, 0.7f, 1.0f},        // the items picked up, under the souls (their top reaches into the souls')
 }};
 constexpr uint32_t Outside = 1u << Areas.size(); // (Classify: a vertex in none of them)
 
@@ -237,9 +240,12 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 		}
 		areas |= bit;
 	}
+	// The HUD is what the frame draws from its round icon on: the markers over the world (enemies' health bars and the
+	// damage dealt, the lock-on) come before it, at their targets, often inside the HUD's areas (a bar above an enemy in
+	// the top left one), and are no HUD.
 	const auto frame = FrameGen::GuestFlips() + 1;
 	if (icon) state.icon_frame = frame;
-	return state.icon_frame != 0 && frame - state.icon_frame <= 1 ? areas : 0u;
+	return state.icon_frame == frame ? areas : 0u;
 }
 
 // The draws a draw is drawn as: once for each of `areas` (Scope), and with `outside` once for each rectangle of the
