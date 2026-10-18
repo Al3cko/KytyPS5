@@ -35,8 +35,10 @@ void Install(Program* program);
 [[nodiscard]] uint32_t WideOutputWidth();
 
 // The video settings' mode 3 case (the setter's and the constructor's): the output size, then the render size, as
-// RIP-relative pairs of 32-bit width and height, then a short jump; every build seen (01.005.000, 01.007.000) has it.
-inline constexpr std::string_view ModeCase = "c5 fb 10 0d ?? ?? ?? ?? c5 fb 10 05 ?? ?? ?? ?? eb";
+// RIP-relative pairs of 32-bit width and height (vmovsd), then a short jump (01.007.000); 01.005.000 loads the same
+// pairs with vmovddup (0x8eea7b, 0x8ef5e5), which found no case there before (issue #69: its render height kept).
+inline constexpr std::string_view ModeCase           = "c5 fb 10 0d ?? ?? ?? ?? c5 fb 10 05 ?? ?? ?? ?? eb";
+inline constexpr std::string_view ModeCaseDuplicated = "c5 fb 12 0d ?? ?? ?? ?? c5 fb 12 05 ?? ?? ?? ?? eb";
 inline constexpr uint32_t         OutputWidth = 3840, OutputHeight = 2160, RenderWidth = 2560, RenderHeight = 1440;
 // Its mode 5 case (the PS5 Pro's, with super resolution: loader/demonsSoulsSuperResolution.h): the same pairs, then
 // the super resolution flag set, then the jump (01.007.000).

@@ -165,7 +165,8 @@ void Install(Program* program) {
 		            game_width, game_height);
 		return;
 	}
-	const auto constant = FindRenderConstant(*program, trinity ? TrinityCase : ModeCase, game_width, game_height);
+	auto constant = FindRenderConstant(*program, trinity ? TrinityCase : ModeCase, game_width, game_height);
+	if (!constant && !trinity) constant = FindRenderConstant(*program, ModeCaseDuplicated, game_width, game_height);
 	const auto widths   = FindUniqueData(*program, std::span(reinterpret_cast<const uint8_t*>(ModeWidths), sizeof(ModeWidths)));
 	const auto heights  = FindUniqueData(*program, std::span(reinterpret_cast<const uint8_t*>(ModeHeights), sizeof(ModeHeights)));
 	// (The render setup's 16:9: the one such store in the code.)
