@@ -253,6 +253,19 @@ $begin = Get-Date
 
 # Each process gets an empty NVIDIA disk cache of its own (nothing trained yet), removed when it is done.
 $nvidiaCaches = Join-Path ([IO.Path]::GetTempPath()) "kyty-precompile-$stamp"
+# Windows 11 guesses the quality of service of a process without a window of its own from its priority and its
+# console's visibility, and may run low ones on the efficiency cores only: an i7-12700's 4 E-cores at 100% and its 16
+# P-core threads idle (#63). Each shard is tagged HighQoS (power throttling of its execution speed off), which comes
+# before those guesses; it stays below normal priority, and -Affinity still decides the CPUs.
+Add-Type -Namespace KytyPrecompile -Name Qos -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] public struct PowerThrottlingState { public uint Version, ControlMask, StateMask; }
+[DllImport("kernel32.dll", SetLastError = true)] static extern bool SetProcessInformation(IntPtr process, int infoClass, ref PowerThrottlingState state, uint size);
+public static bool High(IntPtr process) {
+	// ProcessPowerThrottling (4), PROCESS_POWER_THROTTLING_CURRENT_VERSION (1), EXECUTION_SPEED (1) controlled and off.
+	var state = new PowerThrottlingState { Version = 1, ControlMask = 1, StateMask = 0 };
+	return SetProcessInformation(process, 4, ref state, (uint)Marshal.SizeOf(state));
+}
+'@
 function Start-Precompile([string]$name, [string[]]$arguments) {
 	$env:__GL_SHADER_DISK_CACHE_PATH = Join-Path $nvidiaCaches $name
 	New-Item -ItemType Directory -Force $env:__GL_SHADER_DISK_CACHE_PATH | Out-Null
@@ -260,7 +273,7 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
 	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
 	$process.ProcessorAffinity = [IntPtr]$mask
-	$null = $process.Handle # keeps the exit code readable after the process ends
+	$null = [KytyPrecompile.Qos]::High($process.Handle) # also keeps the exit code readable after the process ends
 	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru
 }
 function Remove-NvidiaCache($process) { Remove-Item -Recurse -Force $process.NvidiaCache -ErrorAction SilentlyContinue }
