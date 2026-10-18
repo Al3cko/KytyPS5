@@ -1072,8 +1072,10 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		                             width, height, desc.info.resources.layers, levels, static_cast<uint32_t>(format),
 		                             descriptor.BaseArray5(), address));
 	}
-	// (A sampled texture the GPU cannot make, its memory full: a null image, not the end of the emulator.)
-	auto id = texture_cache.FindImage(desc, shader_conversion, !storage);
+	// (A texture or storage image the GPU cannot make, its memory full: a null image, not the end of the emulator; a
+	// storage view loses its writes until the collector made room. Issue #53: a 320x180x61 storage image of the cinematic
+	// mode on a 16 GB RX 7800 XT whose video memory the 4K targets had filled.)
+	auto id = texture_cache.FindImage(desc, shader_conversion, true);
 	if (!id) {
 		return bind_null(fmt::format("no image could be made for the texture: {}x{} layers={} levels={} format={} "
 		                             "addr=0x{:016x} size=0x{:x}",
@@ -1377,12 +1379,15 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+			// (A null image - bind_null: no image could be made, issue #53 - has one level, which stands for each level
+			// the shader picks.)
+			const bool null_image = binding.desc.info.data.Empty();
 			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			        (!null_image && resource.mip_count != binding.desc.view_info.level_count));
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
+				if (!null_image) desc.view_info.base_level += mip;
 				desc.view_info.level_count = 1;
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}

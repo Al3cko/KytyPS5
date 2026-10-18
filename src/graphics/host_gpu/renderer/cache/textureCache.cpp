@@ -3793,6 +3793,10 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	}
 	const auto range    = image.info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	// (Larger than the download buffer, it could not be mapped: not downloaded, and kept by the caller.)
+	if (range.size > download.Size() / 2) {
+		return false;
+	}
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
@@ -4392,7 +4396,8 @@ void TextureCache::RunGarbageCollector() {
 	constexpr size_t   MaxDeletions = 40;
 	// For a while after the GPU could not make an image (InsertImage), images unused for FailedRetryTicks go too: the
 	// superseded ones whose memory it needs (issue #49: a 16 GB GPU full of texture-pool images).
-	const uint64_t stale_ticks = m_failed_tick != 0 && tick < m_failed_tick + StaleTicks ? FailedRetryTicks : StaleTicks;
+	const bool     failing     = m_failed_tick != 0 && tick < m_failed_tick + StaleTicks;
+	const uint64_t stale_ticks = failing ? FailedRetryTicks : StaleTicks;
 	// Less the room game buffers in use that got system memory need back (BufferCache::MoveSpilledBufferBack).
 	const uint64_t collect_above = m_trigger_gc_memory - std::min(m_trigger_gc_memory, m_buffer_cache.SpilledRoom());
 	if (m_total_used_memory < collect_above || tick < stale_ticks) {
@@ -4402,12 +4407,18 @@ void TextureCache::RunGarbageCollector() {
 	// for its data) is passed over, not counted: never used again, kept images stay at the front of the list, and the
 	// first images from the front were only those (until 10-09 no image was collected on any GPU). Deleting depth
 	// deletes its stencil association too, so the traversal ends first.
+	// In that while, images the GPU wrote, tiled, go too, their bytes downloaded to guest memory first (TryDownloadImage,
+	// which takes no image larger than its buffer): a switch of the graphics mode leaves the old mode's targets bound by
+	// nothing, and kept they left no room for the new mode's (issue #53: a 16 GB RX 7800 XT switching to the cinematic
+	// mode, its images unable to go to system memory).
+	const uint64_t       download_max = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2;
 	std::vector<ImageId> candidates;
 	candidates.reserve(MaxDeletions);
 	m_lru_cache.ForEachItemBelow(tick - stale_ticks, [&](ImageId id) {
 		const auto* owner = m_slot_images.try_get(id);
 		if (owner == nullptr || !owner->registered || owner->depth_id ||
-		    (owner->IsGpuModified() && owner->info.IsTiled() && SafeToDownload(*owner))) {
+		    (owner->IsGpuModified() && owner->info.IsTiled() && SafeToDownload(*owner) &&
+		     !(failing && owner->info.data.size <= download_max))) {
 			return false;
 		}
 		candidates.push_back(id);
