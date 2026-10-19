@@ -18,6 +18,7 @@
 #include "vulkan-recording.h"
 #endif
 #include "frame-gen.h"
+#include "frame-gen-hudless.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #if defined(_WIN32)
@@ -78,6 +79,7 @@ public:
 			}
 			FrameGen::DestroyInputs(m_window.graphic_ctx, frame->fg);
 		}
+		FrameGen::DestroyHudless(m_window.graphic_ctx);
 	}
 	KYTY_CLASS_NO_COPY(FramePool);
 
@@ -1129,6 +1131,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	if (FrameGen::Enabled()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
 		                        buffer, frame->fg);
+		if (FrameGen::HudlessOn()) {
+			FrameGen::PrepareHudless(frame->fg, image);
+		}
 	}
 	return *frame;
 }
@@ -1334,6 +1339,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene);
+			if (FrameGen::HudlessOn() && !frame.reusing_last) {
+				// DLSS-G's HUD-less image, where the frame image went.
+				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(),
+				                       swapchain.PresentRegion(), swapchain.Format());
+			}
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
 #if defined(_WIN32)

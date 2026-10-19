@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 
@@ -44,6 +45,15 @@ struct Camera {
 	bool                  valid = false;
 };
 
+// KYTY_FG_HUDLESS (frame-gen-hudless.h): a frame's game image without its HUD, its pixels as the frame image's
+// (`image`), and that laid out as the backbuffer (`display`, the present's: DLSS-G's HUD-less color).
+struct HudlessImages {
+	std::unique_ptr<VulkanImage> image;
+	VulkanImage                  display;
+	vk::ImageView                display_view = nullptr;
+	bool                         has_image = false, has_display = false;
+};
+
 // One presented frame's inputs, owned by the presenter's frame.
 struct FrameInputs {
 	VulkanImage   depth, motion;
@@ -52,6 +62,7 @@ struct FrameInputs {
 	Camera        camera;
 	uint64_t      guest_frame = 0;
 	bool          motion_attachment = false; // the motion copy is a color attachment too
+	HudlessImages hudless;                   // KYTY_FG_HUDLESS
 	bool          valid       = false;
 };
 
@@ -107,6 +118,9 @@ void NoteScene();
 // The current guest frame has no camera yet: its next G-buffer draw goes the normal way (the table way's draws have
 // no constants on the CPU), whose hook reads it.
 [[nodiscard]] bool WantsCamera();
+// The current guest frame has DLSS-G's inputs so far (the camera, the TAA pass's or the upscale's depth and motion),
+// which its flip takes (PrepareInputs).
+[[nodiscard]] bool InputsGathered();
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
                 uint64_t motion_address);
@@ -116,6 +130,14 @@ void OnUpscale(ImageId depth, uint64_t depth_address, ImageId motion, uint64_t m
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
+
+// Frame generation's own images (not the texture cache's; frame-gen-hudless.cpp's too), on the thread that records
+// them: `image` (re)made as a sampled copy target like `source`, with its view (with `attachment`, a color attachment
+// too where the format allows it, *attachment tells); a barrier from `image`'s state to `layout`, `access` at `stage`.
+void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view, const VulkanImage& source,
+               bool* attachment = nullptr);
+void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
+                vk::AccessFlags2 access, vk::PipelineStageFlags2 stage);
 
 // DLSS super resolution (KYTY_UPSCALER=dlss) in place of Sony's PS5 Pro upscaler the game dispatches
 // (graphics/guest_gpu/superResolution.h, renderer/renderSuperResolution.cpp).

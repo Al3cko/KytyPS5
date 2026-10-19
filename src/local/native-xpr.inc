@@ -3109,6 +3109,10 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 // now), and a newer image with the same backing as a target is what the registers now select: the
 // normal path captures the state again.
 bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_state) {
+	// KYTY_FG_HUDLESS: the game's composite into the flip image is drawn on the normal path (frame-gen-hudless.h).
+	if (FrameGen::HudlessCapturing())
+		for (const auto& target: draw_state.targets)
+			if (FrameGen::IsFlipTarget(target.requested.data.address)) return false;
 	auto&      textures = m_context.GetTextureCache();
 	const auto checked  = textures.ResolutionEpoch();
 	// (Every table draw asked: a slot lookup and a cold image object per target, ~28K a frame at 1-1.)
