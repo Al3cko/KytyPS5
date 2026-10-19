@@ -15,8 +15,11 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 	'Portuguese (Portugal)', 'Russian', 'Korean', 'Chinese (Traditional)', 'Chinese (Simplified)', 'Finnish', 'Swedish',
 	'Danish', 'Norwegian', 'Polish', 'Portuguese (Brazil)', 'English (United Kingdom)', 'Turkish', 'Spanish (Latin America)',
 	'Arabic', 'French (Canada)', 'Czech', 'Hungarian', 'Greek', 'Romanian', 'Thai', 'Vietnamese', 'Indonesian'
-$resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160', '2560x1080', '3440x1440', '3840x1600', '5120x2160',
-	'3840x1080', '5120x1440'
+# The window's sizes for each aspect ratio of the 3D (below).
+$resolutionsByRatio = @{
+	'16:9' = '1280x720', '1920x1080', '2560x1440', '3840x2160'
+	'21:9' = '2560x1080', '3440x1440', '3840x1600', '5120x2160'
+	'32:9' = '3840x1080', '5120x1440', '7680x2160' }
 # The height Demon's Souls renders its 3D at (run-windows.ps1 -RenderHeight); its output and UI stay 3840x2160.
 $renderHeights = '2160 (native 4K)', '1800', '1620', '1512 (PS5 Pro)', '1440 (PS5)', '1296', '1152', '1080', '900'
 # What makes the 3840x2160 image of the 3D (run-windows.ps1 -Upscaler): the game's TAA and stretch (the PS5's), or DLSS in
@@ -239,12 +242,116 @@ $browseZar.Add_Click({
 $game.Add_TextChanged({ Update-Title })
 Update-Title
 
-$resolution = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
-$resolution.Items.AddRange($resolutions)
-$resolution.SelectedItem = if ($resolutions -contains $settings.resolution) { $settings.resolution } else { '2560x1440' }
+# The picture's size, shape and detail, side by side: the aspect ratio offers the resolutions of its shape (a 21:9
+# picture in a 3840x2160 window was stretched back to 16:9) and the render heights whose 3D the game holds (no larger
+# than its own 3840x2160 in GPU tiles: 21:9 at 2160 ended it at start-up, 1864 drew it red; src/loader/demonsSoulsRenderSize.h).
+$ratio = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 205 }
+$ratio.Items.AddRange($ratios)
+$ratio.SelectedItem = ($ratios | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.ratio } | Select-Object -First 1)
+if ($ratio.SelectedIndex -lt 0) { $ratio.SelectedIndex = 0 }
+$ratioNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0'
+	Text = '21:9 and 32:9 show more to the sides; the HUD keeps its shape, menus and movies are stretched' }
+function Get-Ratio { ([string]$ratio.SelectedItem -split ' ')[0] }
+function Get-RatioAspect { switch (Get-Ratio) { '21:9' { 64.0 / 27.0 } '32:9' { 32.0 / 9.0 } default { 16.0 / 9.0 } } }
+$resolution = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 205 }
+# The ratio's resolutions; `wanted` kept when it is one of them, else the one nearest its height.
+function Update-Resolutions([string]$wanted) {
+	$list = $resolutionsByRatio[(Get-Ratio)]
+	$resolution.Items.Clear()
+	$resolution.Items.AddRange($list)
+	$height = [int](($wanted -split 'x')[1])
+	$resolution.SelectedItem = if ($list -contains $wanted) { $wanted } else {
+		$list | Sort-Object { [Math]::Abs([int](($_ -split 'x')[1]) - $height) } | Select-Object -First 1
+	}
+}
+Update-Resolutions $settings.resolution
+$render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 205 }
+# The highest render height whose 3D at the ratio fits the game's render target memory, made for 3840x2160: no more of
+# the GPU's 64 KiB tiles (256x128, 128x128, 128x64, 64x64 pixels) than 3840x2160 (the emulator's FitsRenderTargets).
+function Get-MaxRenderHeight {
+	$aspectValue = Get-RatioAspect
+	for ($h = 2160; $h -ge 720; $h -= 8) {
+		$w = [Math]::Floor($h * $aspectValue / 8.0 + 0.5) * 8
+		$fits = $true
+		foreach ($tile in @(@(256, 128), @(128, 128), @(128, 64), @(64, 64))) {
+			$tiles = [Math]::Ceiling($w / $tile[0]) * [Math]::Ceiling($h / $tile[1])
+			if ($tiles -gt [Math]::Ceiling(3840 / $tile[0]) * [Math]::Ceiling(2160 / $tile[1])) { $fits = $false }
+		}
+		if ($fits) { return $h }
+	}
+	720
+}
+# Each upscaler keeps its own render height (settings render, render_dlss): the row shows the height last chosen for the
+# chosen upscaler ($renderWanted) among those the ratio allows; one above them shows as the highest allowed (and comes
+# back with a ratio that allows it), one not in the list as the upscaler's default.
+function Get-RenderFallback { if ($script:renderForDlss) { 1080 } else { 1440 } }
+function Select-RenderHeight {
+	$most = Get-MaxRenderHeight
+	$allowed = @($renderHeights | Where-Object { [int](($_ -split ' ')[0]) -le $most })
+	$script:fillingRender = $true
+	try {
+		$render.Items.Clear()
+		$render.Items.AddRange($allowed)
+		if ($script:renderWanted -gt $most) { $render.SelectedIndex = 0; return }
+		foreach ($wanted in @($script:renderWanted, (Get-RenderFallback))) {
+			$render.SelectedItem = ($allowed | Where-Object { ($_ -split ' ')[0] -eq [string]$wanted } | Select-Object -First 1)
+			if ($render.SelectedIndex -ge 0) { return }
+		}
+		$render.SelectedIndex = 0
+	} finally {
+		$script:fillingRender = $false
+	}
+}
+$renderNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+function Update-RenderNote {
+	$h = [int](([string]$render.SelectedItem -split ' ')[0])
+	$w = [Math]::Floor($h * (Get-RatioAspect) / 8.0 + 0.5) * 8
+	$renderNote.Text = "Demon's Souls' 3D at ${w}x${h}; higher = sharper, needs more GPU"
+}
+$render.Add_SelectedIndexChanged({
+	if (!$script:fillingRender) { $script:renderWanted = [int](([string]$render.SelectedItem -split ' ')[0]) }
+	Update-RenderNote
+})
+$renderForDlss = $frameGenAvailable -and $settings.upscaler -eq 'dlss'
+$renderWanted = [int]$(if ($renderForDlss) { $settings.render_dlss } else { $settings.render })
+Select-RenderHeight
+Update-RenderNote
+$ratio.Add_SelectedIndexChanged({
+	Update-Resolutions ([string]$resolution.SelectedItem)
+	Select-RenderHeight
+	Update-RenderNote
+})
+$upscaler = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 205; Enabled = $frameGenAvailable }
+$upscaler.Items.AddRange($upscalers)
+$upscaler.SelectedIndex = if ($frameGenAvailable -and $settings.upscaler -eq 'dlss') { 1 } else { 0 }
+$upscalerNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+function Update-UpscalerNote {
+	$upscalerNote.Text = if ($frameGenAvailable) { 'DLSS: NVIDIA RTX; 1440 = Quality, 1080 = Performance, 2160 = DLAA' }
+		elseif (!$rtxGpu) { 'DLSS needs an NVIDIA RTX graphics card: here the game''s own TAA' }
+		else { 'needs NVIDIA''s Streamline SDK (choose its folder under Frame generation)' }
+}
+Update-UpscalerNote
+(New-Object System.Windows.Forms.ToolTip -Property @{ AutoPopDelay = 30000 }).SetToolTip($upscaler,
+	"Game: the PS5's performance mode, its 3D anti-aliased by the game's TAA at the render height and stretched to 4K.`n" +
+	"DLSS: the game's own PS5 Pro mode, Sony's upscaler (PSSR) replaced by NVIDIA DLSS: the 3D at the render height (2688x1512`n" +
+	"at 1512, the PS5 Pro's; 1080 at least) made a 3840x2160 image the game finishes at 4K (bloom, depth of field, the HUD).`n" +
+	"Sharper than the stretch, at some GPU cost. The in-game Cinematic mode stays native 4K without DLSS.`n" +
+	"Each upscaler keeps its own render height. DLSS starts at 1080: on an RTX 5090 about the frame rate of the game's TAA`n" +
+	"at 1440, with a sharper 4K image.")
+$upscaler.Add_SelectedIndexChanged({
+	# The height chosen goes back to the upscaler it was for; the newly chosen one's is shown.
+	if ($script:renderForDlss) { $settings.render_dlss = $script:renderWanted } else { $settings.render = $script:renderWanted }
+	$script:renderForDlss = $upscaler.SelectedIndex -eq 1
+	$script:renderWanted = [int]$(if ($script:renderForDlss) { $settings.render_dlss } else { $settings.render })
+	Select-RenderHeight
+	Update-RenderNote
+})
 Add-Row 'Resolution' @($resolution)
+Add-Row 'Aspect ratio' @($ratio, $ratioNote)
+Add-Row 'Render height' @($render, $renderNote)
+Add-Row 'Upscaler' @($upscaler, $upscalerNote)
 $fullscreen = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Fullscreen'; AutoSize = $true; Checked = [bool]$settings.fullscreen }
-$aspect = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Keep 16:9 (black bars)'; AutoSize = $true; Checked = [bool]$settings.aspect }
+$aspect = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Keep the aspect ratio (black bars)'; AutoSize = $true; Checked = [bool]$settings.aspect }
 $aspect.Enabled = $fullscreen.Checked
 $fullscreen.Add_CheckedChanged({ $aspect.Enabled = $fullscreen.Checked })
 Add-Row '' @($fullscreen, $aspect)
@@ -263,51 +370,6 @@ Add-Row '' @($hdr)
 $safeGpu = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Safe GPU mode: prevents GPU-hang crashes and blue screens, but the frame rate is about 37% lower'; AutoSize = $true; Checked = [bool]$settings.safegpu }
 (New-Object System.Windows.Forms.ToolTip -Property @{ AutoPopDelay = 30000 }).SetToolTip($safeGpu, $safeGpuTip)
 Add-Row '' @($safeGpu)
-$render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
-$render.Items.AddRange($renderHeights)
-# Each upscaler keeps its own render height (settings render, render_dlss): the row shows the chosen upscaler's.
-function Select-RenderHeight([int]$height, [int]$fallback) {
-	$render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string]$height } | Select-Object -First 1)
-	if ($render.SelectedIndex -lt 0) {
-		$render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string]$fallback } | Select-Object -First 1)
-	}
-}
-$renderForDlss = $frameGenAvailable -and $settings.upscaler -eq 'dlss'
-if ($renderForDlss) { Select-RenderHeight $settings.render_dlss 1080 } else { Select-RenderHeight $settings.render 1440 }
-$renderNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'Demon''s Souls 3D; higher = sharper, needs more GPU'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
-Add-Row 'Render height' @($render, $renderNote)
-$upscaler = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160; Enabled = $frameGenAvailable }
-$upscaler.Items.AddRange($upscalers)
-$upscaler.SelectedIndex = if ($frameGenAvailable -and $settings.upscaler -eq 'dlss') { 1 } else { 0 }
-$upscalerNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
-function Update-UpscalerNote {
-	$upscalerNote.Text = if ($frameGenAvailable) { 'DLSS: NVIDIA RTX; 1440 = Quality, 1080 = Performance, 2160 = DLAA' }
-		elseif (!$rtxGpu) { 'DLSS needs an NVIDIA RTX graphics card: here the game''s own TAA' }
-		else { 'needs NVIDIA''s Streamline SDK (choose its folder under Frame generation)' }
-}
-Update-UpscalerNote
-(New-Object System.Windows.Forms.ToolTip -Property @{ AutoPopDelay = 30000 }).SetToolTip($upscaler,
-	"Game: the PS5's performance mode, its 3D anti-aliased by the game's TAA at the render height and stretched to 4K.`n" +
-	"DLSS: the game's own PS5 Pro mode, Sony's upscaler (PSSR) replaced by NVIDIA DLSS: the 3D at the render height (2688x1512`n" +
-	"at 1512, the PS5 Pro's; 1080 at least) made a 3840x2160 image the game finishes at 4K (bloom, depth of field, the HUD).`n" +
-	"Sharper than the stretch, at some GPU cost. The in-game Cinematic mode stays native 4K without DLSS.`n" +
-	"Each upscaler keeps its own render height. DLSS starts at 1080: on an RTX 5090 about the frame rate of the game's TAA`n" +
-	"at 1440, with a sharper 4K image.")
-Add-Row 'Upscaler' @($upscaler, $upscalerNote)
-$upscaler.Add_SelectedIndexChanged({
-	# The height shown goes back to the upscaler it was for; the newly chosen one's is shown.
-	$height = [int](([string]$render.SelectedItem -split ' ')[0])
-	if ($script:renderForDlss) { $settings.render_dlss = $height } else { $settings.render = $height }
-	$script:renderForDlss = $upscaler.SelectedIndex -eq 1
-	if ($script:renderForDlss) { Select-RenderHeight $settings.render_dlss 1080 } else { Select-RenderHeight $settings.render 1440 }
-})
-$ratio = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
-$ratio.Items.AddRange($ratios)
-$ratio.SelectedItem = ($ratios | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.ratio } | Select-Object -First 1)
-if ($ratio.SelectedIndex -lt 0) { $ratio.SelectedIndex = 0 }
-$ratioNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0'
-	Text = 'the 3D wider (more to the sides); the HUD keeps its shape, menus are stretched, movies stay 16:9' }
-Add-Row 'Aspect ratio' @($ratio, $ratioNote)
 $quality = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 205 }
 $quality.Items.AddRange($qualities)
 $quality.SelectedItem = ($qualities | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.quality } | Select-Object -First 1)

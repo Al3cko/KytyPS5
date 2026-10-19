@@ -954,11 +954,11 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 		const char* value = std::getenv("KYTY_PRESENT_ASPECT");
 		return value != nullptr && std::string_view(value) == "fit";
 	}();
-	// KYTY_RENDER_ASPECT: the game's 3D was rendered wider and squeezed into its 16:9 output; a frame showing it is
-	// shown at that aspect, the others (movies, menus, loading screens) at their own 16:9, both fitted to the window
-	// (within 2% of the window's aspect: filling it).
+	// KYTY_RENDER_ASPECT: the game's 3D was rendered wider and squeezed into its 16:9 output; every frame is shown at that
+	// aspect, fitted to the window (within 2% of the window's aspect: filling it): the 3D as it was rendered, the others
+	// (movies, menus, loading screens) stretched from their 16:9 (the user, 10-19: the opening movie filling the screen).
 	// With the wide output (DemonsSoulsRenderSize::WideOutputWidth) the game's frames are as wide as the 3D; one without
-	// it (movies, menus, loading screens) holds its 16:9 picture at the left: that part is shown.
+	// it (movies, menus, loading screens) holds its 16:9 picture at the left: that part is shown, stretched.
 	int          dst_x = 0, dst_y = 0;
 	int          dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
 	uint32_t     src_w = source.extent.width;
@@ -966,7 +966,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 		src_w = std::min(src_w, (source.extent.height * 16u + 8u) / 9u);
 	const double frame_aspect = source.extent.height != 0 ? static_cast<double>(src_w) / source.extent.height : 0.0;
 	const double wide         = Loader::DemonsSoulsRenderSize::WideAspect();
-	double       aspect       = wide > 0.0 ? (scene ? wide : frame_aspect) : aspect_fit ? frame_aspect : 0.0;
+	double       aspect       = wide > 0.0 ? wide : aspect_fit ? frame_aspect : 0.0;
 	if (const double window = static_cast<double>(m_extent.width) / std::max(1u, m_extent.height);
 	    wide > 0.0 && std::fabs(aspect / window - 1.0) < 0.02) {
 		aspect = 0.0;

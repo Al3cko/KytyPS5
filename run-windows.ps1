@@ -29,7 +29,7 @@
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
 #   .\run-windows.ps1 -Aspect 21:9           Demon's Souls renders its 3D wider (21:9 = 64:27, up to 32:9; 3416x1440
 #                                            at 21:9), seeing more to the sides; shown at that aspect (the HUD at
-#                                            its sides unstretched, in-game menus stretched), movies at 16:9
+#                                            its sides unstretched; menus and movies stretched)
 #   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: shorter shadows and
 #                                            distant detail): faster where the CPU limits
 #   .\run-windows.ps1 -TextureReduce 1       large textures without their largest level: half the size per side
@@ -314,7 +314,7 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -m
 # With -Upscaler the height is that of the PS5 Pro's display mode (2688x1512 unless given), so 1440 is passed too.
 if ($RenderHeight -gt 0 -and ($RenderHeight -ne 1440 -or $Upscaler)) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # -Aspect 21:9 (or 32:9, w:h): the 3D rendered at that aspect, its width at the render height (3416x1440), the game's
-# projection widened to match; the presenter shows those frames at the aspect and the others at 16:9.
+# projection widened to match; the presenter shows every frame at the aspect (movies and menus stretched).
 if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Aspect }
 # -Quality low|lowest: Demon's Souls engine settings that cut what a frame draws, for PCs whose CPU limits the frame
 # rate (each draw costs the emulator CPU time). low: levels of detail chosen as for a 720-line picture (1080), sun

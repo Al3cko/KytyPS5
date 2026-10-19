@@ -61,8 +61,9 @@ folder (usually named `PPSA01341-app0`).
 
 ## Starting the game
 
-**Double-click `launcher.cmd`** for a small settings window: the game folder, the resolution,
-fullscreen (optionally keeping 16:9 with black bars), the console language and red-zone protection,
+**Double-click `launcher.cmd`** for a small settings window: the game folder, the resolution with the
+aspect ratio, render height and upscaler beside it, fullscreen (optionally keeping the aspect ratio with
+black bars), the console language and red-zone protection,
 with buttons to play, to precompile the shaders (optionally on the efficiency cores only, so the PC
 stays responsive), and to open the logs folder. It remembers the settings (`launcher-settings.json`).
 "Up to 120 fps" (off by default) lets the game render up to 120 frames a second instead of the
@@ -75,9 +76,12 @@ less sharp. The interface stays 4K either way.
 "Aspect ratio" (16:9 by default, as on the PS5) renders the 3D wider for ultrawide displays: 21:9
 (3416x1440 at render height 1440) or 32:9, seeing more to the sides, not a stretched 16:9 picture. In
 play the HUD keeps its shape: health, magic, stamina and the equipment at the left edge, the souls at
-the right edge, the boss's health in the middle. The in-game menus are stretched to the width; the lock-on
-and enemy health bars stay on their targets; pre-rendered movies and loading screens are shown at 16:9
-with black bars. Pick the matching resolution (2560x1080, 3440x1440, 5120x2160, ...) or full screen.
+the right edge, the boss's health in the middle. The in-game menus, pre-rendered movies and loading
+screens are stretched to the width; the lock-on and enemy health bars stay on their targets. The
+"Resolution" list follows the aspect ratio (2560x1080, 3440x1440, 3840x1600, 5120x2160 at 21:9), and
+"Render height" offers the heights whose 3D the game's render target memory holds (it was made for its own
+3840x2160): up to 1800 at 21:9 (4264x1800), 1512 at 32:9 (5376x1512). Larger ones drew the 3D red or broken, and
+2160 at 21:9 ended the game at start-up; the emulator now lowers such a height by itself.
 "Graphics" (Standard by default, as on the PS5) sets how much the game draws. Low picks the level of
 detail as for a 720-line picture and ends sun shadows at 125 m (250 m); Lowest picks detail as for 480
 lines, ends sun shadows at 60 m and turns off ambient shadowing
@@ -96,8 +100,8 @@ picture at its own render height. The in-game "Cinematic" mode stays native 4K w
 With an "Aspect ratio" wider than 16:9, DLSS makes the picture at its full width: 5120x2160 at 21:9 (from
 2560x1080 at render height 1080), and the game finishes it at that size, with the HUD at the screen's edges,
 instead of a 3840x2160 picture widened on the screen. On an RTX 5090 at Boletaria's start that ran at 64.5 fps,
-the game's TAA at 21:9 at 59.3. Screens without the 3D (movies, the title, loading) show at 16:9 with black
-bars, as before.
+the game's TAA at 21:9 at 59.3. Screens without the 3D (movies, the title, loading) are stretched to the
+width, as without DLSS.
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
@@ -152,7 +156,7 @@ shortcut):
 | `-Game <folder>` | The game folder (or a `.zar` archive of it) |
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
 | `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
-| `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides, in-game menus are stretched, movies stay 16:9 |
+| `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides; in-game menus, movies and loading screens are stretched to the width |
 | `-Quality low` | How much the game draws: `low` or `lowest` (shorter shadows, simpler distant detail), faster where the processor limits the frame rate |
 
 ## Shader precompile (without it the game stutters)
