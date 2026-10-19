@@ -582,6 +582,8 @@ if ($shaders -and !$inputsReady) {
 foreach ($entry in $environment.GetEnumerator()) { Set-Item "env:$($entry.Key)" $entry.Value }
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $out = "$logDir\$stamp.out.log"
+# (Named to the emulator too: F9's debug snapshot, src/local/debug-snapshot.h, notes the run's log.)
+$env:KYTY_RUN_LOG = $out
 $process = Start-Process -FilePath $Exe -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -PassThru `
 	-RedirectStandardOutput $out -RedirectStandardError "$logDir\$stamp.err.log"
 if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }

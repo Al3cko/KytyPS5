@@ -216,6 +216,7 @@ Default keyboard layout:
 | F7 | Camera with the mouse (press again to release the mouse) |
 | Space | **Pause / resume the emulation** (careful not to hit it by accident) |
 | F8 | The emulator's overlay: Off, Frame rate, Detailed (the launcher's "Overlay" is where it starts) |
+| F9 | **Debug snapshot**: pauses the game and saves the picture on screen and where you are (`_DebugSnapshots\<date-time>\`: `screen.png`, `info.txt` with the position, the run's log and the switches); F9 again resumes. Attach the folder to an issue when something looks wrong |
 | F11, Alt+Enter | Toggle full screen |
 
 The keyboard has no L2 / R2 by default: use a gamepad when you need them.

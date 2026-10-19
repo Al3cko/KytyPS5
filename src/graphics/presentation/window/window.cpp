@@ -34,6 +34,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
+#include "debug-snapshot.h"
 #include "perf-overlay.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -248,6 +249,20 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 	if (key.down) {
 		switch (key.key_code) {
 			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			// F9: a debug snapshot of the picture shown (src/local/debug-snapshot.h), the game paused; F9 again resumes.
+			case SDLK_F9:
+				if (!key.repeat) {
+					if (!game.paused.load(std::memory_order_acquire)) {
+						const auto folder = DebugSnapshot::Take(g_window != nullptr ? g_window->window : nullptr);
+						SetPause(game, true);
+						Loader::DemonsSoulsWarp::ShowNotice(folder.empty() ? "Snapshot failed; paused (F9 resumes)"
+						                                                   : "Paused: snapshot " + folder + " (F9 resumes)",
+						                                    5);
+					} else {
+						SetPause(game, false);
+					}
+				}
+				break;
 			// F8: the emulator's overlay off, the frame rate, detailed, off... (it starts as the launcher's Overlay).
 			case SDLK_F8:
 				if (!key.repeat) {
