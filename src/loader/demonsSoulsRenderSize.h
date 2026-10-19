@@ -83,6 +83,32 @@ inline Size RenderSizeFor(uint32_t height, double aspect = GameAspect) {
 	return {width, height};
 }
 
+// Whether a 3D of `size` fits the game's render target memory, made for its own largest 3D, the Cinematic mode's
+// 3840x2160: its targets laid out in the GPU's 64 KiB tiles (at 2, 4, 8 and 16 bytes a pixel: 256x128, 128x128, 128x64
+// and 64x64 pixels) take no more tiles than at 3840x2160. A target taking more writes past its memory into what
+// follows: 4416x1864 at 21:9 (525 tiles at 4 bytes, 3840x2160 510) showed the 3D in red only, 4776x2016 and 32:9's
+// 5760x1620 in yellow with black models, 4952x2088 and 5120x2160 ended the game at start-up (eboot+0x803e3a, a tree
+// of its own whose node was overwritten); 4264x1800 (510 tiles) and 5120x1440 are right (the RTX 5090, 01.007.000, the
+// game's TAA). The pixels alone are no measure: 4416x1864 has fewer than 3840x2160.
+inline bool FitsRenderTargets(Size size) {
+	constexpr uint32_t tiles[4][2] {{256, 128}, {128, 128}, {128, 64}, {64, 64}};
+	for (const auto& tile: tiles) {
+		const auto count = [&](uint32_t width, uint32_t height) {
+			return static_cast<uint64_t>((width + tile[0] - 1) / tile[0]) * ((height + tile[1] - 1) / tile[1]);
+		};
+		if (count(size.width, size.height) > count(OutputWidth, OutputHeight)) return false;
+	}
+	return true;
+}
+// The highest render height (a multiple of 8) whose size at `aspect` fits (FitsRenderTargets): 2160 at 16:9, 1832 at
+// 21:9 (4344x1832), 1512 at 32:9 (5376x1512).
+inline uint32_t MaxRenderHeight(double aspect) {
+	for (uint32_t height = OutputHeight; height >= 720; height -= 8) {
+		if (FitsRenderTargets(RenderSizeFor(height, aspect))) return height;
+	}
+	return 720;
+}
+
 // KYTY_RENDER_ASPECT's value: "<w>:<h>" or a number; 21:9 is the displays' 64:27. 0 when unset, at most 16:9 or wider
 // than 32:9 (wider is untested: the game's targets were made for 3840 at most).
 inline double ParseAspect(std::string_view text) {

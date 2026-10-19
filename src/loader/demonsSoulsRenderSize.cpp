@@ -159,7 +159,14 @@ void Install(Program* program) {
 		requested = SuperResolutionLeastHeight;
 	}
 	if (requested == game_height && aspect == 0.0) return;
-	const auto size = RenderSizeFor(requested, aspect != 0.0 ? aspect : GameAspect);
+	auto size = RenderSizeFor(requested, aspect != 0.0 ? aspect : GameAspect);
+	if (const auto most = MaxRenderHeight(aspect != 0.0 ? aspect : GameAspect); size.height > most) {
+		const auto lower = RenderSizeFor(most, aspect != 0.0 ? aspect : GameAspect);
+		std::printf("Demon's Souls render size: %ux%u does not fit the game's render target memory (made for 3840x2160: "
+		            "a red or broken picture, or a crash); %ux%u instead\n",
+		            size.width, size.height, lower.width, lower.height);
+		size = lower;
+	}
 	if (size.height == 0) {
 		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%s is not 720-2160; the game's %ux%u kept\n", setting,
 		            game_width, game_height);
