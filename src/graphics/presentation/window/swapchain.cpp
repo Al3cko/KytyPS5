@@ -541,15 +541,19 @@ struct Presenter::Impl {
 		// The graph: the last 300 frames (5 seconds at 60 fps).
 		PerfOverlay::RecentFrames(300, &hud.perf.frame_ms, level >= 2 ? &hud.perf.busy_ms : nullptr);
 		const double seconds = std::chrono::duration<double>(now - hud_window).count();
-		if (seconds >= 1.0) {
+		// (Switched on with F8: the panel at once, from the last second's flips, then refreshed each second. It had
+		// waited a second empty, which looked like a level without a panel, the user 10-19.)
+		const bool first = hud.title.empty();
+		if (seconds >= 1.0 || first) {
 			// The emulator's own frame rate (the game's flips) is the number; with frame generation, the frames DLSS-G
 			// presents (those it got, each with its generated ones) are, and the game's rate is below it.
-			const double   game     = PerfOverlay::Summarize(seconds).fps;
+			const double   game     = PerfOverlay::Summarize(std::max(seconds, 1.0)).fps;
 			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
 			std::array<char, 32>  title {};
 			std::array<char, 128> detail {};
 			if (presents > 1) {
-				std::snprintf(title.data(), title.size(), "%.0f FPS", hud_frames / seconds * presents);
+				std::snprintf(title.data(), title.size(), "%.0f FPS",
+				              (seconds >= 1.0 ? hud_frames / seconds : game) * presents);
 				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps", presents, game);
 			} else {
 				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
