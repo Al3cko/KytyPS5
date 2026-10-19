@@ -650,6 +650,10 @@ add_kyty_full_emulator_test(kernel_file_system_tests
 add_executable(save_data_capacity_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataCapacityTests.cpp")
 target_include_directories(save_data_capacity_tests PRIVATE ${inc_headers})
+add_executable(save_data_backup_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataBackupTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/saveDataBackup.cpp")
+target_include_directories(save_data_backup_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(fiber_migration_tests
 	"${KYTY_TESTS_DIR}/FiberMigrationTests.cpp")
 
@@ -733,6 +737,7 @@ if(BUILD_TESTING)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME save_data_capacity COMMAND $<TARGET_FILE:save_data_capacity_tests>)
+	add_test(NAME save_data_backup COMMAND $<TARGET_FILE:save_data_backup_tests>)
 	add_test(NAME fiber_migration COMMAND $<TARGET_FILE:fiber_migration_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
@@ -812,6 +817,7 @@ if(BUILD_TESTING)
 		kernel_file_system_tests
 		fiber_migration_tests
 		save_data_capacity_tests
+		save_data_backup_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests

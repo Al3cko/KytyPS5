@@ -231,7 +231,7 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 | --- | --- |
 | `run.cmd` | Starts the game |
 | `precompile.cmd` | Full shader precompile |
-| `_SaveData` | **Saves** (created by the first run; back them up now and then) |
+| `_SaveData` | **Saves** (created by the first run; back them up now and then). Each save the game makes is also kept in `_SaveData\.kyty-backup\<game>\<slot>\<date-time>` (the last 4, at least 5 minutes apart); a save left broken by a crash while saving (a file of zeros) gets the newest good one back when the game opens it, the broken files kept beside the backups, and the log says so |
 | `_PipelineCache` | Shader caches (valid only for this PC's graphics card and driver: do not copy them to other PCs) |
 | `logs` | Run logs |
 | `game-path.txt` | The remembered game location |
