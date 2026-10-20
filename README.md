@@ -19,6 +19,7 @@
 > the rest. Use only a game dump made from your own copy of the game. To build it yourself, see
 > [Building with build-windows.cmd](#building-with-build-windowscmd-windows).
 
+LAUNCHER - Also includes a toggle to manyally adjust each world's tendency before loading into a given save file. 
 
 ## Fixes worth cherry-picking
 
