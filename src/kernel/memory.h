@@ -126,6 +126,11 @@ bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t
 const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);
 // The end of the backing mapping `vaddr` is in (0: none): a range up to it has one backing pointer.
 uint64_t               BackingMappingEnd(uint64_t vaddr);
+// The backing view (every guest mapping's bytes, at their backing offset): its base and size; false when there is none.
+bool                   BackingView(uint64_t* base, uint64_t* size);
+// The guest's protection over [vaddr, vaddr + size): whether some of it lets the GPU access it, whether some lets the
+// CPU write it. False when the range is not all mapped.
+bool                   GuestRangeAccess(uint64_t vaddr, uint64_t size, bool* gpu, bool* cpu_write);
 // The same for a range that spans mappings: one (pointer, bytes) piece per mapping, in order.
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
 bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size);

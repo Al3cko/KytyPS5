@@ -509,16 +509,20 @@ static int SceneFreeFloor() {
 	return floor;
 }
 
-// Frame generation above 60 Hz: the game's frames too keep 60 (KYTY_FRAMEGEN_BASE=<Hz>: another rate, 0: none). DLSS-G
-// paces the frames it generates from the intervals between the game's own; on the 120 Hz vblanks a game between 60 and
-// 120 fps flipped after one vblank or two by turns (8.3 or 16.7 ms, 3-25 ms with late vblanks; at 60 Hz 16.7 +- 0.3 ms),
-// and its frames stuttered (issue #29).
+// Adapted from chenxiao07 bb338d6e48: at 120 Hz, DLSS-G otherwise receives real
+// frames alternating between one and two vblanks (8.3/16.7 ms). Keep at least
+// two ticks between them without changing the guest clock. 0 restores uncapped
+// behavior for comparison; this does not change host VSync or the FG multiplier.
 static int FrameGenFloor() {
 	static const int floor = [] {
 		const char* value = std::getenv("KYTY_FRAMEGEN_BASE");
-		const int   base  = value != nullptr ? std::max(0, std::atoi(value)) : 60;
+		const int base = value != nullptr ? std::max(0, std::atoi(value)) : 60;
 		if (base == 0) return 0;
-		return std::max(0, static_cast<int>(std::lround(static_cast<double>(Config::GetVblankFrequency()) / base)) - 1);
+		const int result = std::max(0, static_cast<int>(std::lround(
+		    static_cast<double>(Config::GetVblankFrequency()) / base)) - 1);
+		std::printf("Frame generation: real-frame pacing %u Hz (%d vblank ticks, KYTY_FRAMEGEN_BASE=%d)\n",
+		            Config::GetVblankFrequency() / static_cast<uint32_t>(result + 1), result + 1, base);
+		return result;
 	}();
 	return floor;
 }

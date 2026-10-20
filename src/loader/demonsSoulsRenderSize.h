@@ -43,6 +43,8 @@ inline constexpr uint32_t         OutputWidth = 3840, OutputHeight = 2160, Rende
 // Its mode 5 case (the PS5 Pro's, with super resolution: loader/demonsSoulsSuperResolution.h): the same pairs, then
 // the super resolution flag set, then the jump (01.007.000).
 inline constexpr std::string_view TrinityCase = "c5 fb 10 0d ?? ?? ?? ?? c5 fb 10 05 ?? ?? ?? ?? c6 45 ?? 01 eb";
+// 01.005.000 falls through to fixed-output stores after the flag, without a short jump.
+inline constexpr std::string_view TrinityCaseDuplicated = "c5 fb 12 0d ?? ?? ?? ?? c5 fb 12 05 ?? ?? ?? ?? c6 45 ?? 01";
 inline constexpr uint32_t         TrinityWidth = 2688, TrinityHeight = 1512;
 // The least render height the game's super resolution runs at (SuperResolution::IsEnabled).
 inline constexpr uint32_t SuperResolutionLeastHeight = 1080;

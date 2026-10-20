@@ -166,7 +166,8 @@ if ($ExportHints) {
 	$arguments = @('--game', $Game, '--seeds', $Seeds, '--make-hints', $out)
 	foreach ($file in $recordings) { $arguments += @('--recorded', $file.FullName) }
 	& $Exe @arguments
-	if ($LASTEXITCODE) { throw 'making the hints failed (kyty_shader_precompile --make-hints)' }
+	if ($LASTEXITCODE -eq 2) { Write-Warning 'Some recordings could not be read; the exported hints contain only the readable recordings.' }
+	elseif ($LASTEXITCODE) { throw 'making the hints failed (kyty_shader_precompile --make-hints)' }
 	Write-Host "hints: $out ($([math]::Ceiling((Get-Item $out).Length / 1KB)) KiB, no game code in it): attach it to an issue"
 	Start-Process explorer.exe "/select,`"$out`""
 	exit 0
@@ -189,11 +190,14 @@ if ($Recorded -eq '*') {
 	if (Test-Path $hints) {
 		$released = Join-Path (Split-Path $Seeds) "released-$gameId.seeds"
 		& $Exe --game $Game --seeds $Seeds --apply-hints $hints --out $released
-		if ($LASTEXITCODE) { Write-Host 'the release''s specialization hints could not be applied (kyty_shader_precompile --apply-hints)' }
+		if ($LASTEXITCODE) {
+			Write-Host 'the release''s specialization hints could not be applied (kyty_shader_precompile --apply-hints); keeping older cached pipelines'
+			$recordedLost = $true
+		}
 		else { $sources += $released }
 	}
-	# Through the pipeline: `@(...).FullName` of no recording is $null, a source that made --make-hints fail, and then
-	# a PC without recorded play (a new install) compiled the seeds alone, none of the release's hints (issue #28).
+	# Empty property enumeration must not append a null recording and make the
+	# hint union fail on a new installation (upstream issue #28).
 	$sources += @(Get-ChildItem "$PSScriptRoot\_PipelineCache\warmup-v2\*\$gameId.shaders" -File -ErrorAction SilentlyContinue |
 		ForEach-Object { $_.FullName })
 	$manual = Join-Path (Split-Path $Seeds) "recorded-$gameId.seeds"
@@ -206,11 +210,17 @@ if ($Recorded -eq '*') {
 		$arguments = @('--game', $Game, '--seeds', $Seeds, '--make-hints', $together)
 		foreach ($source in $sources) { $arguments += @('--recorded', $source) }
 		& $Exe @arguments
-		if (!$LASTEXITCODE) {
+		$hintResult = $LASTEXITCODE
+		if ($hintResult -eq 2) {
+			Write-Host 'some recordings could not be read; using the readable recordings and keeping older cached pipelines'
+			$recordedLost = $true
+		}
+		if ($hintResult -eq 0 -or $hintResult -eq 2) {
 			$Recorded = Join-Path (Split-Path $Seeds) "hinted-$gameId.seeds"
 			& $Exe --game $Game --seeds $Seeds --apply-hints $together --out $Recorded
+			$hintResult = $LASTEXITCODE
 		}
-		if ($LASTEXITCODE) {
+		if ($hintResult) {
 			Write-Host 'the specializations of recorded play could not be gathered (kyty_shader_precompile --make-hints/--apply-hints): the seeds alone'
 			$Recorded = ''
 			$recordedLost = $true

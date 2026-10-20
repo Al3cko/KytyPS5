@@ -1,5 +1,6 @@
 #include "frame-gen.h"
 #include "frame-gen-hudless.h"
+#include "frame-gen-lifecycle.h"
 
 #include "common/logging/log.h"
 #include "local-platform.h"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 #ifndef NOMINMAX
@@ -236,18 +238,37 @@ struct Api {
 };
 Api              g_api;
 sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
-uint32_t         g_frame_index = 0;
+// SR and presentation share Streamline's finite token/tag rings.
+std::mutex g_streamline_mutex;
+std::unique_lock<std::mutex> g_present_lock; // present thread, through AfterPresent
+uint32_t g_next_frame_id = 0, g_present_frame_id = 0;
+uint32_t NextFrameId() { // under g_streamline_mutex
+    if (++g_next_frame_id == 0) ++g_next_frame_id;
+    return g_next_frame_id;
+}
+sl::FrameToken* PresentFrameToken() {
+    sl::FrameToken* token = nullptr;
+    if (g_present_frame_id == 0 || g_api.get_new_frame_token(token, &g_present_frame_id) != sl::Result::eOk)
+        return nullptr;
+    return token;
+}
+void ReflexMarker(sl::PCLMarker marker, sl::FrameToken& token) {
+    if (const auto result = g_api.pcl_set_marker(marker, token); result != sl::Result::eOk) {
+        static uint64_t failures = 0;
+        if (++failures <= 3 || failures % 300 == 0)
+            LOGF("Reflex: marker failed (%d), failures=%llu\n", static_cast<int>(result),
+                 static_cast<unsigned long long>(failures));
+    }
+}
 bool             g_options_set = false;
 vk::Extent2D     g_options_backbuffer {};
 vk::Extent2D     g_options_render {};
 vk::Format       g_options_format = vk::Format::eUndefined; // SDR or HDR10 swapchain
 uint64_t         g_presents = 0;
-// DLSS-G on (generating) or off with its resources kept (eRetainResourcesWhenOff): off after TurnOffAfter presents in a
-// row without inputs (menus, movies, loading), on after TurnOnAfter with them, so a fade or a cut does not flap it. On
-// with null tags it was asked to generate frames it had no inputs for (Streamline "Failed to find global tag").
-constexpr uint32_t TurnOffAfter = 30, TurnOnAfter = 10;
-bool               g_mode_on    = false;
-uint32_t           g_run_with   = 0, g_run_without = 0; // presents in a row with inputs, without them
+// Preserve r16's missing-input and failed-present handling.
+PresentationHistory g_history;
+bool g_mode_on = false, g_present_usable = false;
+uint64_t g_present_guest_frame = 0;
 // A frame with inputs the presenter left unshown (NoteDroppedFrame): the next one's motion spans two game frames.
 std::atomic<bool>  g_discontinuity {false};
 
@@ -693,17 +714,59 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		return;
 	}
 	// (Required with DLSS-G, whatever the Reflex mode: Streamline's DLSS-G and Reflex guides.)
-	(void)FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
+	if (!FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep)) return;
 	sl::ReflexOptions reflex {};
 	reflex.mode = sl::ReflexMode::eLowLatency;
 	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
+        return;
 	}
+    LOGF("Reflex: LowLatency enabled; sleep before host presentation recording (not guest simulation)\n");
 	g_ready = true;
 	InitializeHudless();
 	LOGF("frame generation: DLSS-G ready\n");
 	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame)\n", g_generate);
 	std::fflush(stdout);
+#endif
+}
+
+void BeginPresentFrame() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+    if (!g_ready) return;
+    std::scoped_lock lock(g_streamline_mutex);
+    g_present_frame_id = NextFrameId();
+    if (auto* token = PresentFrameToken()) {
+        // Host presentation pacing: guest simulation/rendering already happened.
+        // Called before taking renderer/queue locks or recording host commands.
+        if (g_api.reflex_sleep != nullptr) {
+            if (const auto result = g_api.reflex_sleep(*token); result != sl::Result::eOk) {
+                static uint64_t failures = 0;
+                if (++failures <= 3 || failures % 300 == 0)
+                    LOGF("Reflex: sleep failed (%d), failures=%llu\n", static_cast<int>(result),
+                         static_cast<unsigned long long>(failures));
+            }
+        }
+        ReflexMarker(sl::PCLMarker::eSimulationStart, *token);
+    }
+#endif
+}
+
+void BeginPresentCommands() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+    if (!g_ready) return;
+    std::scoped_lock lock(g_streamline_mutex);
+    if (auto* token = PresentFrameToken()) {
+        ReflexMarker(sl::PCLMarker::eSimulationEnd, *token);
+        ReflexMarker(sl::PCLMarker::eRenderSubmitStart, *token);
+    }
+#endif
+}
+
+void EndPresentCommands() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+    if (!g_ready) return;
+    std::scoped_lock lock(g_streamline_mutex);
+    if (auto* token = PresentFrameToken()) ReflexMarker(sl::PCLMarker::eRenderSubmitEnd, *token);
 #endif
 }
 
@@ -713,11 +776,14 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	if (!g_ready) {
 		return;
 	}
+	g_present_lock = std::unique_lock<std::mutex>(g_streamline_mutex);
 	const sl::ViewportHandle viewport {0};
 	const bool               usable = inputs != nullptr && inputs->valid;
-	g_run_with    = usable ? g_run_with + 1 : 0;
-	g_run_without = usable ? 0 : g_run_without + 1;
-	const bool mode_on = g_mode_on ? g_run_without < TurnOffAfter : g_run_with >= TurnOnAfter;
+    g_present_usable = usable;
+    g_present_guest_frame = usable ? inputs->guest_frame : 0;
+    const auto decision = g_history.Next(usable, g_present_guest_frame);
+    const bool mode_on = decision.generate;
+    const bool resuming = mode_on && !g_mode_on;
 	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.
 	if (!g_options_set || g_options_format != format || mode_on != g_mode_on ||
 	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
@@ -751,18 +817,9 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		}
 	}
 
-	++g_frame_index;
-	if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
-		g_token = nullptr;
-		return;
-	}
-	auto& token = *g_token;
-	// The frame's Reflex sleep, then its markers (all at its present: the game's frame was made before).
-	if (g_api.reflex_sleep != nullptr && kyty_local_framegen_sleep.load(std::memory_order_relaxed) != 0)
-		g_api.reflex_sleep(token);
-	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
-	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
-	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
+	g_token = PresentFrameToken();
+    if (g_token == nullptr) return;
+    auto& token = *g_token;
 
 	sl::Constants constants {};
 	const auto    camera = usable ? Decompose(inputs->camera.view_proj) : CameraFrame {};
@@ -793,7 +850,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	// (A frame left unshown before this one: its motion and matrices are to the game's previous frame, not to the one
 	// presented last.)
 	const bool discontinuity      = g_discontinuity.exchange(false, std::memory_order_relaxed);
-	constants.reset               = usable && !discontinuity ? sl::Boolean::eFalse : sl::Boolean::eTrue;
+	constants.reset               = decision.reset || resuming || discontinuity ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	constants.orthographicProjection = sl::Boolean::eFalse;
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
@@ -893,8 +950,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		};
 		g_api.set_tag_for_frame(token, viewport, tags, static_cast<uint32_t>(std::size(tags)), nullptr);
 	}
-	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
-	g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
+	ReflexMarker(sl::PCLMarker::ePresentStart, token);
 #else
 	(void)inputs;
 	(void)backbuffer;
@@ -904,12 +960,17 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 #endif
 }
 
-void AfterPresent() {
+void AfterPresent(bool presented) {
+    (void)presented;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+    // Move ownership to an automatic guard so every early return releases it.
+    auto present_lock = std::move(g_present_lock);
+    g_present_frame_id = 0;
+    g_history.Presented(presented && g_token != nullptr, g_present_usable, g_present_guest_frame);
 	if (!g_ready || g_token == nullptr) {
 		return;
 	}
-	g_api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *g_token);
+	ReflexMarker(sl::PCLMarker::ePresentEnd, *g_token);
 	const auto presents = ++g_presents;
 	if (presents % 30 != 1) {
 		return;
@@ -942,8 +1003,12 @@ void AfterPresent() {
 
 void SwapchainChanging() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+    std::scoped_lock lock(g_streamline_mutex);
 	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
-	if (!g_ready || !g_mode_on) return;
+	if (!g_ready) return;
+    g_history.Reset();
+    g_options_set = false;
+    if (!g_mode_on) return;
 	sl::DLSSGOptions options {};
 	options.mode                = sl::DLSSGMode::eOff;
 	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
@@ -951,7 +1016,7 @@ void SwapchainChanging() {
 	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
 		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
 	g_mode_on     = false;
-	g_run_with    = 0;
+	g_history.Reset();
 	g_options_set = false; // (the next present sends its sizes again)
 #endif
 }
@@ -1067,6 +1132,7 @@ bool UpscalerReady() {
 bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (!g_upscale_ready) return false;
+    std::scoped_lock lock(g_streamline_mutex);
 	// Its own viewport: DLSS-G's (0) takes its constants and tags at the present.
 	const sl::ViewportHandle viewport {1};
 	static vk::Extent2D options_render {}, options_output {};
@@ -1105,8 +1171,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		options_render = inputs.color.extent;
 		options_output = inputs.output.extent;
 	}
-	static uint32_t frame = 0;
-	++frame;
+	const uint32_t frame = NextFrameId();
 	sl::FrameToken* token = nullptr;
 	if (g_api.get_new_frame_token(token, &frame) != sl::Result::eOk || token == nullptr) return false;
 
@@ -1202,8 +1267,13 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs) {
 		return false;
 	}
 	const sl::BaseStructure* evaluate_inputs[] {&viewport};
-	if (const auto result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, evaluate_inputs, 1, command_buffer);
-	    result != sl::Result::eOk) {
+    const auto result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, evaluate_inputs, 1, command_buffer);
+    if (result == sl::Result::eWarnOutOfVRAM) {
+        static uint64_t warnings = 0;
+        if (++warnings <= 3 || warnings % 600 == 0)
+            LOGF("DLSS super resolution: evaluation succeeded with VRAM budget warning; count=%llu\n",
+                 static_cast<unsigned long long>(warnings));
+    } else if (result != sl::Result::eOk) {
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
 			std::printf("DLSS super resolution: slEvaluateFeature failed (%s)\n", sl::getResultAsStr(result));

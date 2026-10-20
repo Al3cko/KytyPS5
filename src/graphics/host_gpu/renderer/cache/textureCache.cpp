@@ -15,8 +15,10 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
+#include "fresh-memory.h"
 #include "live-counters.h"
 #include "local-platform.h"
+#include "perf-overlay.h"
 #include "native-resource-state.h"
 
 #include <algorithm>
@@ -386,6 +388,19 @@ bool TextureCache::SafeToDownload(const Image& image) {
 // Collector runs (flips) before memory an image could not be made for is asked for again.
 constexpr uint64_t FailedRetryTicks = 30;
 
+TextureCache::ReclaimPins::ReclaimPins(TextureCache& cache, ImageId id)
+    : m_cache(cache), m_begin(cache.m_reclaim_pins.size()) {
+	Add(id);
+}
+
+TextureCache::ReclaimPins::~ReclaimPins() {
+	m_cache.m_reclaim_pins.resize(m_begin);
+}
+
+void TextureCache::ReclaimPins::Add(ImageId id) {
+	if (id) m_cache.m_reclaim_pins.push_back(id);
+}
+
 // KYTY_TEST_RECLAIM=<n>: the first n images that must exist, of 1 MiB and more, asked for from the 600th flip on, are
 // taken as not made once (ReclaimImageMemory, then made again).
 [[gnu::noinline]] static bool TestReclaim(const ImageInfo& info, uint64_t tick) {
@@ -445,7 +460,8 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 	if (m_gc_tick >= UnusedTicks) {
 		m_lru_cache.ForEachItemBelow(m_gc_tick - UnusedTicks, [&](ImageId id) {
 			const auto* owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id || owner->IsGpuModified()) return false;
+			if (owner == nullptr || !owner->registered || owner->depth_id || owner->IsGpuModified() ||
+			    std::ranges::find(m_reclaim_pins, id) != m_reclaim_pins.end()) return false;
 			victims.push_back(id);
 			freed += owner->AccountedSize();
 			return freed >= goal;
@@ -539,7 +555,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	++image.registrations;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
-	m_total_used_memory += image.AccountedSize();
+	m_registered_memory += image.AccountedSize();
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -570,10 +586,10 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
-	if (accounted > m_total_used_memory) {
+	if (accounted > m_registered_memory) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
-	m_total_used_memory -= accounted;
+	m_registered_memory -= accounted;
 	image.registered = false;
 }
 
@@ -1366,6 +1382,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	LiveCounters::Add(LiveCounters::DepthOverlaps);
 	LiveCounters::Add(LiveCounters::DepthOverlapBytes, cached.info.data.size);
+	ReclaimPins pins {*this, cached_id};
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -1623,6 +1640,7 @@ ImageId TextureCache::ResolveBlockTexelOverlap(const ImageInfo& requested, Image
 		    requested.mip_layout[level].size != cached.mip_layout[level].size)
 			return {};
 	}
+	ReclaimPins pins {*this, cached_id};
 	RefreshCopySource(cached_id);
 	auto texel_id = TakeParkedImage(requested);
 	if (!texel_id) texel_id = InsertImage(requested);
@@ -1650,6 +1668,7 @@ ImageId TextureCache::ResolveBlockTexelOverlap(const ImageInfo& requested, Image
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	ReclaimPins pins {*this, source_id};
 	RefreshCopySource(source_id);
 	// (The blocks' image parked for these texels: ResolveBlockTexelOverlap.)
 	auto expanded_id = TakeParkedImage(info);
@@ -2910,6 +2929,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
 	}
+	ReclaimPins pins {*this, depth_id};
 	auto& depth = m_slot_images[depth_id];
 	if (!depth.info.IsDepth() || !depth.info.HasStencil()) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
@@ -3122,6 +3142,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fai
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
+			// ResolveOverlap can allocate an expanded image and reclaim memory. Every candidate remains live until
+			// this walk is done, including ones a later iteration has not inspected yet.
+			ReclaimPins pins {*this};
+			for (const auto candidate: candidates) pins.Add(candidate);
 			for (const auto candidate: candidates) {
 				view_mip                = -1;
 				view_layer              = -1;
@@ -3862,18 +3886,22 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	if (!plan.valid || !SafeToDownload(image)) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-	// (Larger than the download buffer, it could not be mapped: not downloaded, and kept by the caller.)
-	if (range.size > download.Size() / 2) {
-		return false;
-	}
+	const auto range  = image.info.data;
+	auto&      stream = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	    stream.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		// Oversized images cannot fit the reusable ring. Detiling can write via
+		// compute, so the fallback needs the ring's storage usage as well.
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     AllFlags, range.size);
+		mapped = temporary->Mapped().data();
+		offset = 0;
+	} else {
+		stream.Commit();
 	}
-	download.Commit();
+	Buffer& download = temporary ? *temporary : stream;
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
@@ -3905,8 +3933,8 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 		m_pending_downloads.push_back(
 		    {range.address, range.size, tick, first_page, std::vector<bool>((end_page - first_page) / TRACKER_PAGE_SIZE, true)});
 	}
-	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tick] {
-		download.Invalidate(offset, range.size);
+	m_scheduler.DeferPriorityOperation([this, &stream, owner = std::move(temporary), range, mapped, offset, tick] {
+		(owner ? *owner : stream).Invalidate(offset, range.size);
 		std::lock_guard lock(m_download_mutex);
 		const auto done = std::ranges::find_if(m_pending_downloads, [&](const PendingDownload& pending) {
 			return pending.address == range.address && pending.size == range.size && pending.tick == tick;
@@ -4413,6 +4441,13 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 	            static_cast<unsigned long long>(tick), static_cast<unsigned long long>(use.working_set >> 20u),
 	            static_cast<unsigned long long>(use.private_bytes >> 20u), static_cast<unsigned long long>(available >> 20u),
 	            static_cast<unsigned long long>(LocalPlatform::PhysicalMemory() >> 20u));
+	if (const auto* fresh = FreshMemory::Get())
+		std::printf("Fresh memory: %llu MiB of uploads were never-written bytes (zeros, not read); %llu MiB watched, %llu MiB "
+		            "written at a first write, %llu MiB by other writes\n",
+		            static_cast<unsigned long long>(fresh->zero_upload_bytes.load() >> 20u),
+		            static_cast<unsigned long long>(fresh->watched_bytes.load() >> 20u),
+		            static_cast<unsigned long long>(fresh->faults.load() >> 20u),
+		            static_cast<unsigned long long>(fresh->marked.load() >> 20u));
 	std::fflush(stdout);
 }
 
@@ -4427,17 +4462,24 @@ void TextureCache::RunGarbageCollector() {
 		return true;
 	});
 	RetireStaleImages(tick);
+	// Use a pass-local pressure estimate. Registered image sizes can include views
+	// sharing backing and must remain independent of driver residency.
+	auto used_memory = m_graphics.CanReportMemoryUsage()
+	                       ? m_graphics.GetDeviceMemoryUsage() : m_registered_memory;
 	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (KytyGcLiveBudget() && m_graphics.CanReportMemoryUsage()) {
 		static auto   kyty_budget_window = std::chrono::steady_clock::time_point {};
 		const auto    now                = std::chrono::steady_clock::now();
-		const uint64_t budget            = KytyGcLiveBudgetValue(m_graphics);
 		if (now - kyty_budget_window >= std::chrono::seconds(2)) {
 			kyty_budget_window = now;
-			uint64_t trigger = 0, pressure = 0, critical = 0;
-			KytyTextureGcThresholds(budget, trigger, pressure, critical);
+			// Pipelines and Streamline allocate outside VMA. Refresh even when no new
+			// VMA allocations occur, and stop using the budget captured at startup.
+			m_graphics.RefreshMemoryBudget();
+			m_graphics.UpdateImagePoolBudget();
+			used_memory = m_graphics.GetDeviceMemoryUsage();
+			const uint64_t budget = KytyGcLiveBudgetValue(m_graphics);
+			if (budget == 0) return;
+			uint64_t trigger = budget, pressure = budget, critical = budget;
+			if (KytyGcLiveBudget()) KytyTextureGcThresholds(budget, trigger, pressure, critical);
 			const auto moved = [](uint64_t a, uint64_t b) { return (a > b ? a - b : b - a) >= (uint64_t {64} << 20u); };
 			if (moved(trigger, m_trigger_gc_memory)) {
 				std::printf("KYTYGCBUDGET texture budget=%lluMB trigger=%lluMB pressure=%lluMB critical=%lluMB "
@@ -4445,10 +4487,53 @@ void TextureCache::RunGarbageCollector() {
 				            static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(trigger >> 20),
 				            static_cast<unsigned long long>(pressure >> 20),
 				            static_cast<unsigned long long>(critical >> 20),
-				            static_cast<unsigned long long>(m_total_used_memory >> 20));
+				            static_cast<unsigned long long>(used_memory >> 20));
 				std::fflush(stdout);
 			}
 			m_trigger_gc_memory = trigger;
+			static auto health_window = std::chrono::steady_clock::time_point {};
+			if (now - health_window >= std::chrono::seconds(30)) {
+				health_window = now;
+				m_graphics.LogVideoMemory("periodic");
+				std::printf("CACHE_MEMORY texture_registered_mib=%llu texture_retired_count=%llu "
+				            "buffer_registered_mib=%llu buffer_retired_count=%llu; registered sizes are logical, not VRAM residency\n",
+				            static_cast<unsigned long long>(m_registered_memory >> 20u),
+				            static_cast<unsigned long long>(m_retired.size()),
+				            static_cast<unsigned long long>(m_buffer_cache.RegisteredBytes() >> 20u),
+				            static_cast<unsigned long long>(m_buffer_cache.RetiredCount()));
+				const auto memory = LocalPlatform::ProcessMemory();
+				const auto system = LocalPlatform::SystemMemory();
+				uint64_t video_used = 0, video_budget = 0, shared_gpu = 0;
+				const bool video_known = m_graphics.QueryLocalVideoMemory(&video_used, &video_budget);
+				const bool shared_known = LocalPlatform::QuerySharedGpuMemory(&shared_gpu);
+				const auto headroom = static_cast<int64_t>(video_budget) - static_cast<int64_t>(video_used);
+				const auto frames = PerfOverlay::Summarize(5.0);
+				const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				    std::chrono::system_clock::now().time_since_epoch()).count();
+				std::printf("MEMORY_HEALTH flip=%llu private_mib=%llu resident_mib=%llu texture_gc_mib=%llu "
+				            "unix_ms=%lld game_fps5=%.2f low1_fps5=%.2f max_frame_ms5=%.2f "
+				            "ram_known=%u ram_total_mib=%llu ram_available_mib=%llu "
+				            "commit_known=%u system_commit_mib=%llu system_commit_limit_mib=%llu "
+				            "gpu_known=%u gpu_used_mib=%llu gpu_budget_mib=%llu gpu_headroom_mib=%lld "
+				            "shared_gpu_known=%u shared_gpu_mib=%llu\n",
+				            static_cast<unsigned long long>(tick),
+				            static_cast<unsigned long long>(memory.private_bytes >> 20u),
+				            static_cast<unsigned long long>(memory.working_set >> 20u),
+				            static_cast<unsigned long long>(m_trigger_gc_memory >> 20u),
+				            static_cast<long long>(unix_ms), frames.fps, frames.low1, frames.max_ms,
+				            static_cast<unsigned>(system.physical_known),
+				            static_cast<unsigned long long>(system.physical_total >> 20u),
+				            static_cast<unsigned long long>(system.physical_available >> 20u),
+				            static_cast<unsigned>(system.commit_known),
+				            static_cast<unsigned long long>(system.commit_total >> 20u),
+				            static_cast<unsigned long long>(system.commit_limit >> 20u),
+				            static_cast<unsigned>(video_known),
+				            static_cast<unsigned long long>(video_used >> 20u),
+				            static_cast<unsigned long long>(video_budget >> 20u),
+				            static_cast<long long>(headroom / (int64_t {1} << 20u)),
+				            static_cast<unsigned>(shared_known), static_cast<unsigned long long>(shared_gpu >> 20u));
+				std::fflush(stdout);
+			}
 		}
 	} else if (m_graphics.CanReportMemoryUsage() && !m_graphics.small_video_memory) {
 		// The budget Windows gives now, not the one at start-up: another program's video memory lowers it (a Discord
@@ -4496,7 +4581,7 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t stale_ticks = failing ? FailedRetryTicks : StaleTicks;
 	// Less the room game buffers in use that got system memory need back (BufferCache::MoveSpilledBufferBack).
 	const uint64_t collect_above = m_trigger_gc_memory - std::min(m_trigger_gc_memory, m_buffer_cache.SpilledRoom());
-	if (m_total_used_memory < collect_above || tick < stale_ticks) {
+	if (used_memory < collect_above || tick < stale_ticks) {
 		return;
 	}
 	// An image the collector keeps (a depth image with its stencil association; one the GPU wrote, tiled: no download
@@ -4522,7 +4607,7 @@ void TextureCache::RunGarbageCollector() {
 	});
 	for (const auto id: candidates) {
 		auto owner = m_slot_images.try_get(id);
-		if (m_total_used_memory < collect_above) {
+		if (used_memory < collect_above) {
 			break;
 		}
 		if (owner == nullptr || !owner->registered) {
@@ -4539,10 +4624,14 @@ void TextureCache::RunGarbageCollector() {
 			            static_cast<unsigned long long>(__rdtsc()),
 			            static_cast<unsigned long long>(owner->info.data.address),
 			            static_cast<unsigned long long>(owner->info.data.size),
-			            static_cast<unsigned long long>(m_total_used_memory));
+			            static_cast<unsigned long long>(used_memory));
 			std::fflush(stdout);
 		}
+		const auto before = m_registered_memory;
 		DeleteImage(id);
+		// Include recursive stencil unregistration, saturating the pressure estimate.
+		// This is estimated reclamation, not a claim that deferred GPU frees have completed.
+		used_memory -= std::min(used_memory, before - m_registered_memory);
 		LiveCounters::Add(LiveCounters::GcImageDeletes);
 	}
 }

@@ -85,6 +85,10 @@ const Case Cases[] = {
     {"scc_mask", "SCC made from", {0x7d8a0080, 0x87866a7e, 0x8588807e, 0xbf810000}},
     // the same with s_mov_b32 s5, s4 (SCC kept) before the select
     {"scc_kept", "SCC made from", {0x7d8a0080, 0x87866a7e, 0xbe850304, 0x8588807e, 0xbf810000}},
+    // v_cmp_eq_u32 vcc, 5, v0; s_and_saveexec_b64 s[2:3], vcc;
+    // s_mov_b64 exec, s[2:3]; s_cbranch_scc0 L; v_mov_b32 v1, 1; L:
+    {"saveexec_scc", "SCC made from",
+     {0x7d840085, 0xbe82246a, 0xbefe0402, 0xbf840001, 0x7e020281, 0xbf810000}},
     // s_mov_b64 s[10:11], 0; L: v_cmp_ne_u32 vcc, 0, v0; s_or_b64 s[10:11], s[10:11], vcc;
     // s_andn2_b64 exec, exec, vcc; s_cbranch_execnz L; s_or_b64 exec, exec, s[10:11]; v_mov_b32 v1, 1
     {"loop_acc", "", {0xbe8a0480, 0x7d8a0080, 0x888a6a0a, 0x8afe6a7e, 0xbf89fffc, 0x88fe0a7e, 0x7e020281, 0xbf810000}},
@@ -123,6 +127,51 @@ const Case Cases[] = {
     {"half32", "", {0x7e020300, 0x7e040205, 0x06020404, 0x7e0c0501, 0xbf810000}},
 };
 
+int TestCooperativeProofs() {
+	int failed = 0;
+	// Reuse the RDNA2 fixtures above. The PCs are byte offsets, as in AMD 70648's
+	// SOPP/VOP1 formats: an exchange behind EXECZ also needs a wave-wide branch.
+	struct Expected {
+		const char* name;
+		bool accepted;
+		std::vector<uint32_t> reads, branches;
+	};
+	const Expected cases[] = {
+	    {"rfl_empty", true, {8}, {}},
+	    {"rfl_skip", true, {}, {}},
+	    {"half16", true, {12}, {}},
+	    {"barrier", true, {}, {4}},
+	    {"vcc_lane", true, {}, {4}},
+	    {"escape_s5", true, {}, {4}},
+	    {"exec_half", false, {}, {}},
+	    {"literal_mask", false, {}, {}},
+	    {"mask_half", false, {}, {}},
+	    {"scc_mask", false, {}, {}},
+	    {"saveexec_scc", false, {}, {}},
+	};
+	for (const auto& expected: cases) {
+		const auto fixture = std::ranges::find_if(Cases, [&](const Case& test) {
+			return std::string_view(test.name) == expected.name;
+		});
+		Decoder::Program decoded;
+		Decoder::DecodeProgram(fixture->code, decoded);
+		Frontend::LaneLocalProof proof;
+		std::string reason;
+		const bool accepted = Frontend::ProveWaveLaneLocal(decoded, true, proof, &reason);
+		std::ranges::sort(proof.exchange_reads);
+		std::ranges::sort(proof.wave_branches);
+		if (accepted != expected.accepted ||
+		    (accepted && (proof.exchange_reads != expected.reads || proof.wave_branches != expected.branches))) {
+			std::printf("FAIL cooperative %s: %s (%zu reads, %zu branches)\n", expected.name,
+			            reason.c_str(), proof.exchange_reads.size(), proof.wave_branches.size());
+			++failed;
+		}
+	}
+	std::printf("%d of %d cooperative proof cases passed\n", static_cast<int>(std::size(cases)) - failed,
+	            static_cast<int>(std::size(cases)));
+	return failed;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -138,6 +187,7 @@ int main(int argc, char** argv) {
 		}
 		std::printf("%d of %d lane-local cases passed\n", static_cast<int>(std::size(Cases)) - failed,
 		            static_cast<int>(std::size(Cases)));
+		failed += TestCooperativeProofs();
 		return failed == 0 ? 0 : 1;
 	}
 	// (-d first: the decoded programs too; -c first: cooperative halves allowed.)

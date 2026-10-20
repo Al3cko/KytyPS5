@@ -1,3 +1,4 @@
+#define SDL_MAIN_HANDLED
 #include "SDL.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -11,6 +12,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <array>
+#include <barrier>
 
 #include <chrono>
 #include <cstdio>
@@ -21,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace Libs::LibKernelApr {
@@ -297,6 +300,57 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
+
+  // Distinct files must retain separate IDs and ID-based metadata, even when
+  // their first resolutions race and later batches visit them in reverse order.
+  const auto *stat_symbol = symbols.FindByNid("ApkYaHb8Sek", Loader::SymbolType::Func);
+  const auto *size_symbol = symbols.FindByNid("WvEu7yl3Ivg", Loader::SymbolType::Func);
+  Check(stat_symbol && size_symbol, "APR metadata exports are registered");
+  using GetStat = int (KYTY_SYSV_ABI *)(uint32_t, FileSystem::FileStat *);
+  using GetSize = int (KYTY_SYSV_ABI *)(uint32_t, uint64_t *);
+  const auto get_stat = reinterpret_cast<GetStat>(stat_symbol->vaddr);
+  const auto get_size = reinterpret_cast<GetSize>(size_symbol->vaddr);
+  const std::array<std::string_view, 2> contents {"first", "second-file-content"};
+  const std::array<const char *, 2> identity_paths {"/app0/apr-first.dat", "/app0/apr-second.dat"};
+  for (size_t i = 0; i < identity_paths.size(); ++i) {
+    Check(fixture.Create(root / std::filesystem::path(identity_paths[i]).filename()),
+          "create distinct APR identity fixture");
+    fixture.Write(contents[i].data(), contents[i].size());
+    fixture.Close();
+  }
+  std::barrier ready(2);
+  std::array<std::array<uint32_t, 2>, 2> resolved_ids {};
+  const auto resolve_order = [&](size_t worker) {
+    const std::array<const char *, 2> ordered {identity_paths[worker], identity_paths[1 - worker]};
+    uint32_t local_error = 0xffffffffu;
+    std::array<uint64_t, 2> local_sizes {};
+    ready.arrive_and_wait();
+    Check(resolve("", ordered.data(), 2, resolved_ids[worker].data(), local_sizes.data(), &local_error) == OK,
+          "concurrent first APR resolutions succeed");
+    Check(local_sizes[0] == contents[worker].size() && local_sizes[1] == contents[1 - worker].size(),
+          "concurrent APR resolution returns each file's size");
+  };
+  std::thread forward(resolve_order, 0), reverse(resolve_order, 1);
+  forward.join();
+  reverse.join();
+  Check(resolved_ids[0][0] != resolved_ids[0][1] &&
+            resolved_ids[0][0] != expected_id && resolved_ids[0][1] != expected_id &&
+            resolved_ids[0][0] != 0xffffffffu && resolved_ids[0][1] != 0xffffffffu,
+        "distinct APR files receive distinct valid IDs");
+  Check(resolved_ids[0][0] == resolved_ids[1][1] && resolved_ids[0][1] == resolved_ids[1][0],
+        "concurrent resolutions preserve each file's identity regardless of order");
+  const char *reverse_paths[] = {identity_paths[1], identity_paths[0]};
+  Check(resolve("", reverse_paths, 2, ids, sizes, &error_index) == OK &&
+            ids[0] == resolved_ids[0][1] && ids[1] == resolved_ids[0][0],
+        "cached reverse resolution preserves APR identities");
+  for (size_t i = 0; i < contents.size(); ++i) {
+    uint64_t by_id_size = 0;
+    FileSystem::FileStat stat {};
+    Check(get_size(resolved_ids[0][i], &by_id_size) == OK && by_id_size == contents[i].size(),
+          "APR cached size is routed by the correct file ID");
+    Check(get_stat(resolved_ids[0][i], &stat) == OK && stat.st_size == static_cast<int64_t>(contents[i].size()),
+          "APR stat resolves each ID to the correct host file");
+  }
   FileSystem::Umount("/app0");
 }
 
@@ -366,7 +420,9 @@ void CheckSocketWakeup() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  const bool apr_only = argc == 2 && std::strcmp(argv[1], "--apr-only") == 0;
+  Check(argc == 1 || apr_only, "usage: kernel_file_system_tests [--apr-only]");
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -375,6 +431,7 @@ int main() {
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
 
+  SDL_SetMainReady();
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO) == 0, "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
   graphics->graphic_ctx.screen_width = 64;
@@ -386,17 +443,21 @@ int main() {
 
   TempDirectory temporary;
   FileSystem::Initialize();
-  CheckMountRoot(temporary.Path());
-  CheckDirectoryStream(temporary.Path());
+  if (!apr_only) {
+    CheckMountRoot(temporary.Path());
+    CheckDirectoryStream(temporary.Path());
+  }
   CheckAprPaths(temporary.Path());
-  FileSystem::Mount(temporary.Path(), "/savedata0");
-  CheckSaveRename(temporary.Path(), "first-save");
-  CheckSaveRename(temporary.Path(), "replacement-save");
+  if (!apr_only) {
+    FileSystem::Mount(temporary.Path(), "/savedata0");
+    CheckSaveRename(temporary.Path(), "first-save");
+    CheckSaveRename(temporary.Path(), "replacement-save");
+  }
   FileSystem::Shutdown();
-  CheckSocketWakeup();
+  if (!apr_only) CheckSocketWakeup();
   graphics.reset();
   subsystems.Destroy();
 
-  std::printf("KernelFileSystemTests: all cases passed\n");
+  std::printf("KernelFileSystemTests: %s cases passed\n", apr_only ? "APR" : "all");
   return 0;
 }

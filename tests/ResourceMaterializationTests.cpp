@@ -646,7 +646,58 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+void TestLightTableSync() {
+  using namespace Libs::Graphics;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  struct Memory {
+    bool clean_table = true, far_ready = false;
+    uint32_t far_syncs = 0;
+    static bool Read(void* opaque, uint64_t address, uint32_t* value) {
+      auto& self = *static_cast<Memory*>(opaque);
+      if (address == 0x1000) { *value = 1; return true; }
+      if (address == 0x1004) { *value = 0x100000; return true; }
+      if (address >= 0x2000 && address < 0x2040) {
+        const auto word = ((address - 0x2000) % 32) / 4;
+        *value = word == 0 ? 0x100 : word == 1 ? uint32_t(Prospero::BufferFormat::k32Float) << 20 :
+                 word == 3 ? DstSel(4, 5, 6, 7) | (uint32_t(Prospero::ImageType::kColor2D) << 28) : 0;
+        return true;
+      }
+      if (address >= 0x2002000 && address < 0x2002020 && self.far_ready) { *value = 0; return true; }
+      return false;
+    }
+    static bool Span(void* opaque, uint64_t address, uint32_t* values, uint32_t count, bool) {
+      if (address == 0x2000 && !static_cast<Memory*>(opaque)->clean_table) return false;
+      for (uint32_t i = 0; i < count; ++i) if (!Read(opaque, address + 4 * i, values + i)) return false;
+      return true;
+    }
+    static bool Sync(void* opaque, uint64_t address, uint64_t) {
+      auto& self = *static_cast<Memory*>(opaque);
+      if (address == 0x2002000) { ++self.far_syncs; self.far_ready = true; }
+      return true;
+    }
+  } memory;
+  SrtRuntime runtime{.userdata = &memory, .read_specialization_memory = Memory::Read,
+                     .sync_memory = Memory::Sync, .try_read_memory_span = Memory::Span};
+  DescriptorSource::IndirectImage probe{};
+  probe.item_bound = 2; probe.selector_stride = 4;
+  ImageResource image{};
+  image.resource_class = ImageResourceClass::Sampled;
+  image.numeric_class = Prospero::TextureNumericClass::Float;
+  image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  AddressProbeCandidates clean, fallback;
+  Check(EnumerateAddressProbe(probe, image, 0x1000, 0x2000, runtime, clean), "clean light-table probe failed");
+  Check(memory.far_syncs == 0 && !memory.far_ready, "stale key drained GPU output despite clean table");
+  Check(clean.keys == std::vector<uint32_t>{0, 1, 0x100000}, "light-table key order changed");
+  Check(clean.descriptors[clean.candidates[0]].dwords[0] == 0x100 &&
+        clean.descriptors[clean.candidates[2]].dwords[0] == 0, "valid descriptor lost or stale entry retained");
+  memory.clean_table = false;
+  Check(EnumerateAddressProbe(probe, image, 0x1000, 0x2000, runtime, fallback), "GPU-owned table fallback failed");
+  Check(memory.far_syncs == 1 && clean.candidates == fallback.candidates && clean.descriptors == fallback.descriptors,
+        "dirty-table synchronization or descriptor equivalence lost");
+}
+
 int main() {
+  TestLightTableSync();
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
   TestSpecializationGuard();
   TestPreparationStorageTransactions();

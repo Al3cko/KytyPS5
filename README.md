@@ -1,4 +1,10 @@
 > [!NOTE]
+> **Al3cko r19 source snapshot.** This branch carries the local Demon's Souls renderer,
+> memory, Reflex, haptics and launcher changes described in [R19-SHARING.txt](R19-SHARING.txt).
+> It builds on Chen's v20261019 release. The links and measurements in the upstream
+> documentation below describe Chen's releases; this branch has no published binary release yet.
+
+> [!NOTE]
 > **This fork is tuned for Demon's Souls.** Its renderer, shader and memory paths are optimized for
 > **Demon's Souls (PS5, PPSA01341), game versions 1.07 (01.007.000) and 1.05 (01.005.000)**: both are
 > supported, with the same performance patches (each version precompiles its own shader caches); other

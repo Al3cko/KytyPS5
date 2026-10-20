@@ -1531,6 +1531,25 @@ void LogAddressSpace(const char* label, uint64_t begin, uint64_t end) {
 
 static IDXGIAdapter3* g_video_memory_adapter = nullptr;
 
+SystemMemoryUse SystemMemory() {
+	SystemMemoryUse use;
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	if (GlobalMemoryStatusEx(&status) != 0) {
+		use.physical_total = status.ullTotalPhys;
+		use.physical_available = status.ullAvailPhys;
+		use.physical_known = true;
+	}
+	PERFORMANCE_INFORMATION counters {};
+	counters.cb = sizeof(counters);
+	if (K32GetPerformanceInfo(&counters, sizeof(counters)) != 0) {
+		use.commit_total = static_cast<uint64_t>(counters.CommitTotal) * counters.PageSize;
+		use.commit_limit = static_cast<uint64_t>(counters.CommitLimit) * counters.PageSize;
+		use.commit_known = true;
+	}
+	return use;
+}
+
 bool OpenVideoMemoryAdapter(const uint8_t* luid) {
 	HMODULE dxgi = LoadLibraryA("dxgi.dll");
 	if (dxgi == nullptr || g_video_memory_adapter != nullptr) return g_video_memory_adapter != nullptr;
@@ -1858,6 +1877,16 @@ uint64_t AvailablePhysicalMemory() {
 
 bool OpenVideoMemoryAdapter(const uint8_t* /*luid*/) {
 	return false;
+}
+
+SystemMemoryUse SystemMemory() {
+	SystemMemoryUse use;
+	use.physical_total = PhysicalMemory();
+	use.physical_available = AvailablePhysicalMemory();
+	use.physical_known = use.physical_total != 0 && use.physical_available != 0;
+	// Windows commit accounting has no equivalent with identical guarantees on
+	// every supported host. Leave it explicitly unknown here.
+	return use;
 }
 
 bool QueryVideoMemory(uint64_t* /*usage*/, uint64_t* /*budget*/) {

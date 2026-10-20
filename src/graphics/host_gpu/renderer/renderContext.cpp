@@ -6,6 +6,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 #include "local-platform.h"
+#include "frame-gen.h"
 
 #include <algorithm>
 #include <thread>

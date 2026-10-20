@@ -76,6 +76,8 @@ struct RenderExecutor::TableImageSet {
 	vk::DescriptorSet     set  = nullptr;
 	vk::DescriptorPool    pool = nullptr;
 	std::vector<Image>    images;
+	// BufferCache::BdaTableGeneration when the set got the BDA page table: made again once the table grew.
+	uint64_t              bda_generation = 0;
 	// Proven current in that frame under those registrations, by role (RenderExecutor::Role: [0] also the frame it was
 	// made or refused in); used in that frame (by any executor).
 	std::array<uint64_t, Roles> validated_frame = NoRoles();
@@ -790,6 +792,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 	std::vector<vk::DescriptorImageInfo>  image_infos;
 	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
 	const auto fixed = [](const Buffer* value) -> vk::DescriptorBufferInfo { return {value->Handle(), 0, value->Size()}; };
+	set->bda_generation = BufferCache::BdaTableGeneration(); // (read before the table: BufferCache::GrowBdaTable)
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = set->program != nullptr ? *set->program : *pair.programs[st];
 		std::vector<uint32_t> occurrences(prepared[st].images.size(), 0);
@@ -865,6 +868,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	auto&      textures   = m_context.GetTextureCache();
 	const auto frame      = m_context.FrameNumber();
 	const auto resolution = textures.ResolutionEpoch();
+	if (set.bda_generation != BufferCache::BdaTableGeneration()) return false; // (the page table grew since)
 	if (set.validated_frame[Role()] == frame && set.resolution_epoch[Role()] == resolution) return true;
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 7);
 	const auto mode  = kyty_local_table_set_proofs.load(std::memory_order_relaxed);
@@ -2024,9 +2028,14 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
-	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
+	// Only emitted indirect groups need storage. A std::pair array default-initializes all
+	// 64 entries, including on the much more frequent direct path, where groups stays zero.
+	struct Argument { Buffer* owner; uint64_t offset; };
+	std::array<Argument, 64> arguments;
+	if (kyty_local_draw_argument_scratch.load(std::memory_order_relaxed) == 0) arguments.fill({nullptr, 0});
 	std::array<uint32_t, 64>                     group_sizes;
 	uint32_t                                     groups = 0;
+	EXIT_IF(commands.size() > arguments.size() || (direct != nullptr && !commands.empty()));
 	for (size_t first = 0; first < commands.size();) {
 		size_t count = 1;
 		while (first + count < commands.size() && commands[first + count] == commands[first] + count * stride) ++count;
@@ -2136,7 +2145,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			vk_buffer.draw(direct->index_count, direct->instance_count, vertex_offset, first_instance);
 	}
 	for (uint32_t group = 0; group < groups; ++group)
-		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
+		vk_buffer.drawIndexedIndirect(arguments[group].owner->Handle(), arguments[group].offset, group_sizes[group],
 		                              static_cast<uint32_t>(stride));
 	// As the normal path's: shaders that write buffers end the rendering, and a barrier orders their writes.
 	if (writes) {

@@ -1,3 +1,6 @@
+// Upstream reserved driver window for Streamline initialization.
+static constexpr uint64_t FrameGenHoleSize = uint64_t {64} << 30u;
+static void* g_frame_gen_hole = nullptr;
 // Internal memory address-space helpers included by memory.cpp.
 // Kept in the same translation unit because they depend on memory.cpp-local helpers.
 
@@ -352,6 +355,7 @@ public:
 		return TryTransferBacking<true>(vaddr, size,
 		                          [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			                          std::memcpy(backing, source + data_offset, bytes);
+			                          FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(backing), bytes);
 		                          });
 	}
 
@@ -377,6 +381,7 @@ public:
 		}
 		DataWriteFence fence(*this, begin, begin + size, m_cpu_write_pages);
 		std::memcpy(m_backing_base + begin, data, size);
+		FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(m_backing_base + begin), size);
 		return true;
 	}
 
@@ -1519,6 +1524,9 @@ private:
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;
 		}
+		// (A view mapped again comes back without the trackers' protection until it is applied: a write meanwhile goes
+		// unseen, so its write-watched never-written granules count as written.)
+		FreshMemory::MarkArmedBacking(GetBackingBase() + backing_offset, size);
 		return ptr;
 	}
 
@@ -1642,13 +1650,19 @@ private:
 	uint64_t m_alias_epoch = 1;
 };
 
-// The address range ReserveGuestRegions holds free for frame generation's device creation (ReleaseFrameGenAddressHole).
-static constexpr uint64_t FrameGenHoleSize = uint64_t {64} << 30u;
-static void*              g_frame_gen_hole = nullptr;
-
 class GuestAddressSpace;
 // (The address space while it lives: Kyty.Trim's trims go through it, TrimParkedRange.)
-static std::atomic<GuestAddressSpace*> g_trim_space {nullptr};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct TrimAddressSpace {
+	std::shared_mutex mutex;
+	GuestAddressSpace* space = nullptr;
+};
+static TrimAddressSpace& TrimTarget() {
+	// The detached trim worker may outlive other static objects.
+	static auto* target = new TrimAddressSpace;
+	return *target;
+}
+#endif
 
 class GuestAddressSpace {
 	// m_mutex held exclusively, counted with its time (address_space_holds, address_space_hold_kt): every protection
@@ -1677,7 +1691,9 @@ public:
 #endif
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
-		g_trim_space.store(this, std::memory_order_release);
+		#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		{ std::unique_lock trim_lock(TrimTarget().mutex); TrimTarget().space = this; }
+#endif
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
@@ -1688,10 +1704,19 @@ public:
 			     backing_size / (1024U * 1024U));
 #endif
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		std::unique_lock trim_lock(TrimTarget().mutex);
+		TrimTarget().space = this;
+#endif
 	}
 
 	~GuestAddressSpace() {
-		g_trim_space.store(nullptr, std::memory_order_release);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Drain an active trim before destroying its address space; an atomic
+		// pointer alone would allow a callback to retain a freed object.
+		std::unique_lock trim_lock(TrimTarget().mutex);
+		TrimTarget().space = nullptr;
+#endif
 		delete m_backing;
 		m_backing = nullptr;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1799,6 +1824,10 @@ public:
 			return false;
 		}
 		ExclusiveLock lock(m_mutex);
+		// A mapping or trim may be doing its system calls outside m_mutex.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		WaitNotBusy(lock.Lock(), vaddr, size, BusyRangeOperation::Protection);
+#endif
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -1820,6 +1849,9 @@ public:
 		thread_local std::vector<Graphics::PageManager::WatchedRun> runs;
 		runs.clear();
 		ExclusiveLock lock(m_mutex);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		WaitNotBusy(lock.Lock(), vaddr, size, BusyRangeOperation::Protection);
+#endif
 		if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) g_gpu_resources->WatchedRuns(vaddr, size, &runs);
 		uint64_t at = vaddr;
 		for (const auto& run: runs) {
@@ -1854,7 +1886,7 @@ public:
 			LiveCounters::Add(LiveCounters::AddressSpaceWaitKt, waited);
 			if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::AddressSpaceWaitKtRender, waited);
 		}
-		WaitNotBusy(lock, vaddr, size);
+		WaitNotBusy(lock, vaddr, size, BusyRangeOperation::Protection);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -1867,7 +1899,7 @@ public:
 		{
 			ExclusiveLock lock(m_mutex);
 			// (Guest maps and unmaps run one at a time: another one over the range is only waited for here.)
-			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size); });
+			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(vaddr, size, BusyRangeOperation::Mutation); });
 			if (!ConsumeDeferredUnlocked(vaddr, size, &split)) {
 				if (failure_reason != nullptr) {
 					*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
@@ -1876,7 +1908,7 @@ public:
 			}
 			m_busy.emplace_back(vaddr, vaddr + size);
 		}
-		// The system calls without the lock (BusyUnlocked): the trackers' protections of other ranges go on.
+		// System calls without the lock; BusyUnlocked keeps protection changes out while this range is busy.
 		const bool split_done = SplitPlaceholders(split, vaddr, size);
 		const auto host_mode  = VirtualMemory::IsExecute(mode)
 		                            ? VirtualMemory::Mode::ExecuteReadWrite
@@ -1919,7 +1951,7 @@ public:
 					busy_begin = vaddr;
 					busy_end   = vaddr + size;
 					m_backing->ViewSpan(vaddr, size, &busy_begin, &busy_end);
-					if (!BusyUnlocked(busy_begin, busy_end - busy_begin)) {
+					if (!BusyUnlocked(busy_begin, busy_end - busy_begin, BusyRangeOperation::Mutation)) {
 						m_busy.emplace_back(busy_begin, busy_end);
 						break;
 					}
@@ -2135,23 +2167,21 @@ private:
 	// pages (2 MiB of addresses each, and the next one where it ends on one's start) as a whole. Windows' memory manager
 	// bug-checked (0x1A/0x41202, issues #5 and #50, 16 GB PCs) in a protection change of a host thread from the first page
 	// of a 2 MiB-aligned range (a texture's) while another view was mapped or unmapped: busy ranges were per view, and a
-	// protection change of a neighbouring view in the same page-table page went on during the system calls. Maps and
-	// unmaps run one at a time anyway; protection changes in those pages wait for them.
-	// Any map or unmap anywhere makes a protection change wait, not only one in its page-table pages (the views are all of
-	// one section: their prototype PTEs are shared): two reporters of #5 still bug-checked with v20261018, whose waits
-	// were per page-table page; no measurable cost (an RTX 5090 desktop and an RTX 3080 laptop, 1-1 routes A-B-A).
-	// KYTY_PROTECT_SERIAL=0: the per page-table page waits only.
-	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size) const {
-		static const bool serial = [] {
-			const char* value = std::getenv("KYTY_PROTECT_SERIAL");
-			return value == nullptr || *value != '0';
-		}();
-		if (serial && !m_busy.empty()) return true;
-		constexpr uint64_t PageTablePage = uint64_t {2} << 20u;
+	// protection change of a neighbouring view in the same page-table page went on during the system calls.
+	// The bug check was still reported with those waits. Windows protection changes now wait for any busy range:
+	// all guest views share a section's prototype PTEs. KYTY_PROTECT_SERIAL=0 restores page-table-local protection
+	// waits. Incoming map/unmap/trim operations and ownership queries retain their local boundary checks.
+	[[nodiscard]] bool BusyUnlocked(uint64_t vaddr, uint64_t size,
+	                                BusyRangeOperation operation = BusyRangeOperation::Lookup) const {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		static const bool serial = ProtectSerializationEnabled(std::getenv("KYTY_PROTECT_SERIAL"));
+#endif
 		for (const auto& [begin, end]: m_busy) {
-			const auto page_begin = begin & ~(PageTablePage - 1u);
-			const auto page_end   = (end + PageTablePage) & ~(PageTablePage - 1u);
-			if (vaddr < page_end && page_begin < vaddr + size) return true;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (BusyRangeConflicts(begin, end, vaddr, size, operation, serial)) return true;
+#else
+			if (vaddr < end && begin < vaddr + size) return true;
+#endif
 		}
 		return false;
 	}
@@ -2167,7 +2197,7 @@ public:
 			const uint64_t next = std::min(end, (at & ~(Chunk - 1u)) + Chunk);
 			{
 				ExclusiveLock lock(m_mutex);
-				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(at, next - at); });
+				m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(at, next - at, BusyRangeOperation::Mutation); });
 				m_busy.emplace_back(at, next);
 			}
 			VirtualUnlock(reinterpret_cast<void*>(at), next - at);
@@ -2183,11 +2213,14 @@ public:
 private:
 #endif
 
-	// (With m_mutex held shared.) Returns once no map or unmap is changing [vaddr, vaddr + size).
-	void WaitNotBusy(std::shared_lock<std::shared_mutex>& lock, uint64_t vaddr, uint64_t size) {
-		if (!BusyUnlocked(vaddr, size)) return;
+	// With m_mutex held shared or exclusively. The wait releases it so the busy operation can finish.
+	// Protection queries may wait for unrelated busy ranges as described above.
+	template <typename Lock>
+	void WaitNotBusy(Lock& lock, uint64_t vaddr, uint64_t size,
+	                 BusyRangeOperation operation = BusyRangeOperation::Lookup) {
+		if (!BusyUnlocked(vaddr, size, operation)) return;
 		LiveCounters::Add(LiveCounters::AddressSpaceBusyWaits);
-		m_busy_done.wait(lock, [&] { return !BusyUnlocked(vaddr, size); });
+		m_busy_done.wait(lock, [&] { return !BusyUnlocked(vaddr, size, operation); });
 	}
 
 	void EraseBusyUnlocked(uint64_t begin, uint64_t end) {
@@ -2321,7 +2354,7 @@ private:
 		g_protective_remap = kyty_local_protective_remap.load(std::memory_order_relaxed) != 0;
 		{
 			ExclusiveLock lock(m_mutex);
-			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(begin, end - begin); });
+			m_busy_done.wait(lock.Lock(), [&] { return !BusyUnlocked(begin, end - begin, BusyRangeOperation::Mutation); });
 			m_busy.emplace_back(begin, end);
 		}
 		std::vector<std::pair<uint64_t, uint64_t>> freed, spans;
@@ -2760,7 +2793,8 @@ private:
 	// it for every VirtualProtect. Mapping changes take it exclusively.
 	std::shared_mutex                          m_mutex;
 	// Ranges a backing map or unmap is changing outside m_mutex (MapBacking, UnmapBacking: their system calls), under
-	// it; what overlaps one waits for it (WaitNotBusy). Guest maps and unmaps run one at a time (the kernel's memory
+	// it; protection changes wait for all of them on Windows by default (WaitNotBusy). Other queries retain their
+	// range-local exclusions. Guest maps and unmaps run one at a time (the kernel's memory
 	// operation mutex).
 	std::vector<std::pair<uint64_t, uint64_t>> m_busy;
 	std::condition_variable_any                m_busy_done;
@@ -2773,10 +2807,9 @@ private:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 static void TrimParkedRange(uint64_t vaddr, uint64_t size) {
-	if (auto* space = g_trim_space.load(std::memory_order_acquire); space != nullptr) {
+	std::shared_lock trim_lock(TrimTarget().mutex);
+	if (auto* space = TrimTarget().space; space != nullptr) {
 		space->TrimParked(vaddr, size);
-	} else {
-		VirtualUnlock(reinterpret_cast<void*>(vaddr), size);
 	}
 }
 #endif

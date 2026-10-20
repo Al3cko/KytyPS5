@@ -168,6 +168,9 @@ struct GraphicContext {
 	void                   DeleteImage(VulkanImage& image);
 	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
 	void                   TrimImagePool();
+	// Periodic pressure check: trim retired images and stop caching new retirements
+	// until budget headroom recovers. Does not touch images still owned by callers.
+	void                   UpdateImagePoolBudget();
 	void                   ReportMemoryFallback(const char* what, uint64_t bytes) const;
 	// KYTY_SIMULATE_VRAM_MB: the video memory taken at start-up (left out of the budget and usage above).
 	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video

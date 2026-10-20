@@ -99,6 +99,15 @@ MemoryUse ProcessMemory();
 uint64_t  PhysicalMemory();
 // The physical memory the system can still give without paging (free and standby; Linux: MemAvailable). 0: unknown.
 uint64_t AvailablePhysicalMemory();
+// Diagnostic snapshot. Commit is the system-wide committed allocation/limit on
+// Windows, not the process working set or the pagefile's current usage.
+// Availability flags distinguish a failed query from a real zero reading.
+struct SystemMemoryUse {
+	uint64_t physical_total = 0, physical_available = 0;
+	uint64_t commit_total = 0, commit_limit = 0;
+	bool physical_known = false, commit_known = false;
+};
+SystemMemoryUse SystemMemory();
 // Diagnostics: the process's address space in [begin, end) to stdout, labelled: each allocation of 16 MiB and more (its
 // base, size, state and type), the smaller ones counted, and the free gaps of 1 GiB and more. Windows only.
 void LogAddressSpace(const char* label, uint64_t begin, uint64_t end);

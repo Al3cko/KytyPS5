@@ -40,6 +40,8 @@ extern "C" {
 // Negative controls for the offline replay only: bit 0 zeroes the vertex
 // stage's flattened SRT in the upload, bit 1 skips the draw call.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_debug {0};
+// 1: draw argument scratch holds only the groups written by this draw; 0: zero-fill control for measurements.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_draw_argument_scratch {1};
 // 1: objects are drawn in last frame's order, so the record that followed this
 // one last frame is prefetched while this draw runs.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_predict_mode {0};
@@ -332,6 +334,8 @@ struct RenderExecutor::NativeXprRecord {
 	vk::DescriptorSet     set    = nullptr;
 	vk::DescriptorPool    pool   = nullptr;
 	vk::Buffer            upload = nullptr; // ring the dynamic bindings point into
+	// BufferCache::BdaTableGeneration when the sets got the BDA page table: the record goes once the table grew.
+	uint64_t              bda_generation = 0;
 	std::array<Stage, 2>  stages;
 	uint32_t              stage_count = 1;
 	vk::ShaderStageFlags  push_stages;
@@ -1301,6 +1305,7 @@ const char* RenderExecutor::NativeXprBindResources(NativeXprRecord& record,
 		EXIT_IF(value == nullptr);
 		return {value->Handle(), 0, value->Size()};
 	};
+	record.bda_generation = BufferCache::BdaTableGeneration(); // (read before the table: BufferCache::GrowBdaTable)
 	const auto upload = buffers.GetShaderUploadBuffer().Handle();
 	std::array<NativeXprRecord::Stage, 2> data;
 	std::array<std::vector<std::vector<std::pair<uint32_t, uint32_t>>>, 2> positions;
@@ -2812,6 +2817,7 @@ bool RenderExecutor::NativeXprReevaluate(NativeXprRecord& record) {
 
 // Once per frame: is the record's content still what a fresh translation gives?
 bool RenderExecutor::NativeXprValidate(NativeXprRecord& record, uint64_t frame) {
+	if (record.bda_generation != BufferCache::BdaTableGeneration()) return false; // (the page table grew since)
 	auto& cache     = *m_native_xpr;
 	auto& resources = m_context.GetGpuResources();
 	// A guest mapping change forces the buffer and image proofs below; the words
@@ -3222,8 +3228,11 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	// One lookup per group of consecutive arguments: the same range the draws
 	// read, synchronized as the per-draw lookups would.
 	constexpr uint64_t stride = sizeof(vk::DrawIndexedIndirectCommand);
-	// Only the first `groups` entries are written and read: no zero fill (1.25 KB per draw).
-	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
+	// std::pair's default constructor zeroed 1 KiB even for a direct draw with no groups.
+	// This aggregate has no initializers; every group read below is assigned in full first.
+	struct Argument { Buffer* owner; uint64_t offset; };
+	std::array<Argument, 64> arguments;
+	if (kyty_local_draw_argument_scratch.load(std::memory_order_relaxed) == 0) arguments.fill({nullptr, 0});
 	std::array<uint32_t, 64>                     group_sizes;
 	uint32_t                                     groups = 0;
 	EXIT_IF(commands.size() > arguments.size() || (direct != nullptr && !commands.empty()));
@@ -3301,7 +3310,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 		}
 		// Each group of consecutive arguments goes out as one multi-draw.
 		for (uint32_t group = 0; group < groups; ++group)
-			vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second,
+			vk_buffer.drawIndexedIndirect(arguments[group].owner->Handle(), arguments[group].offset,
 			                              group_sizes[group], static_cast<uint32_t>(stride));
 	}
 	emit.command     = vk_buffer;
@@ -3339,6 +3348,7 @@ bool RenderExecutor::NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArg
 		return false;
 	}
 	auto&      record    = *found->second;
+	if (record.bda_generation != BufferCache::BdaTableGeneration()) return false; // (NativeXprTry makes it again)
 	const auto state_key = NativeXprStateKey(buffer);
 	const auto state_it  = cache.states.find(state_key);
 	const auto pipeline_it =

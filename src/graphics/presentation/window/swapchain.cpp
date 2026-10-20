@@ -1318,6 +1318,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			m_impl->RecoverSwapchain(status);
 			continue;
 		}
+		const bool generate = FrameGen::Enabled();
+		if (generate) FrameGen::BeginPresentFrame();
 		{
 			// The present thread records and submits on its own scheduler (present_scheduler: its own pool, timeline
 			// and command buffers; the queue has its own lock), from the presenter's frame image into the swapchain's:
@@ -1342,6 +1344,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.x - region.offset.x) + static_cast<float>(hud->drawn.extent.width) + margin) / w,
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
+			if (generate) FrameGen::BeginPresentCommands();
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene);
 			if (FrameGen::HudlessOn() && !frame.reusing_last) {
 				// DLSS-G's HUD-less image, where the frame image went.
@@ -1350,6 +1353,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			}
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+        if (generate) LocalVulkanRecording::WaitDeferredSubmits();
+#endif
+        if (generate) FrameGen::EndPresentCommands();
 #if defined(_WIN32)
 		// The Windows driver waits in vkQueuePresentKHR, inside the kernel, for the semaphore's
 		// GPU work while it holds a device-wide lock: every queue submission waits behind it,
@@ -1359,7 +1366,6 @@ void Presenter::Present(Frame& frame, bool reuse) {
 #endif
 		// KYTY_FRAMEGEN: Streamline takes the present (vkQueuePresentKHR is its hook) and adds
 		// the generated frames; an idle refresh of the last frame carries no new inputs.
-		const bool generate = FrameGen::Enabled();
 		if (generate) {
 			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
 			                        swapchain.Extent(), swapchain.PresentRegion(), swapchain.Format(),
@@ -1367,7 +1373,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		}
 		status = swapchain.Present();
 		if (generate) {
-			FrameGen::AfterPresent();
+			FrameGen::AfterPresent(status == Swapchain::Status::Success);
 		}
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);

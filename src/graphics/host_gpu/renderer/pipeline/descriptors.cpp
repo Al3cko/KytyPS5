@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "slow-log.h"
+#include "speculation-state.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -138,7 +139,7 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 }
 
 static vk::DescriptorBufferInfo
-NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
+NativeStorageBuffer(RenderContext& context, PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
                     uint32_t slot, uint32_t& buffer_offset) {
 	buffer_offset = 0;
@@ -154,6 +155,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                              resource.formatted, id);
+	// Deferred discovery may have acquired an owner here. Retain it for native draw
+	// recording; a streamed range without an owner keeps its invalid ID.
+	if (!source.id) {
+		source.id = context.GetBufferCache().RegisteredBuffer(address, size);
+	}
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -1213,12 +1219,15 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 	}
 }
 
-void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+void RenderExecutor::FindBuffers(PreparedBindings& prepared, bool register_buffers) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
+	// BDA preparation needs registered ranges, and speculative discovery must still
+	// record its dependencies or refuse a range with no existing owner.
+	register_buffers |= program.info.uses_dma || Spec::Current() != nullptr;
 
 	prepared.buffer_sources.clear();
 	prepared.buffer_sources.reserve(program.info.buffers.size());
@@ -1233,12 +1242,19 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		// A finite descriptor inside a GPU-mapped PRT aperture may cross CPU-unmapped
+		// pages. Keep its resident tail; sentinel/oversized or unregistered ranges
+		// still need the conservative guest-mapping clamp.
+		const bool finite_gpu_range = requested_size < (uint64_t {1} << 30u) &&
+		                              records != UINT32_MAX && cache.IsGpuMapped(address, requested_size);
+		const auto size = finite_gpu_range ? requested_size
+		                                  : Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		if (size == 0) { // unmapped: bound as a null buffer
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		prepared.buffer_sources.push_back(
+		    {address, size, register_buffers ? cache.FindBuffer(address, size) : BufferId {}});
 	}
 }
 
@@ -1290,8 +1306,19 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 // What FindTexture requires of a bound image.
 bool RenderExecutor::AcquirableImage(const TextureBinding& binding) {
 	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
-	return image != nullptr && !image->binding.needs_rebind &&
-	       (image->info.data.Empty() || (image->registered && !image->depth_id));
+	if (image == nullptr || image->binding.needs_rebind) return false;
+	if (image->info.data.Empty()) return true; // null storage images stand in for every requested mip
+	if (!image->registered || image->depth_id) return false;
+	// A surviving slot is insufficient after alias resolution changes its shape.
+	// Rediscover stale mip/layer ranges before FindTexture creates a native view.
+	const auto& view = binding.desc.view_info;
+	const auto& backing = image->backing;
+	if (view.level_count == 0 || view.base_level >= backing.mip_levels ||
+	    view.level_count > backing.mip_levels - view.base_level) return false;
+	const bool slice = backing.image_type == vk::ImageType::e3D &&
+	                   (view.type == vk::ImageViewType::e2D || view.type == vk::ImageViewType::e2DArray);
+	const auto layers = slice ? std::max(backing.extent.depth >> view.base_level, 1u) : backing.layers;
+	return view.layer_count != 0 && view.base_layer < layers && view.layer_count <= layers - view.base_layer;
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
@@ -1389,6 +1416,9 @@ bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+			// (A null image - bind_null: no image could be made, issue #53 - has one level, which stands for each level
+			// the shader picks.)
+			const bool null_image = binding.desc.info.data.Empty();
 			EXIT_IF(resource.mip_count == 0u ||
 			        resource.mip_count != DynamicStorageLevels(binding, resource.mip_count));
 			binding.mip_views.reserve(resource.mip_count);
@@ -1441,9 +1471,13 @@ void RenderExecutor::PrepareGraphicsBindingsInto(const ShaderStageRuntime& verte
 	} else {
 		bindings.pixel.reset();
 	}
-	FindBuffers(bindings.vertex);
+	// Let ObtainBuffer stream small CPU-dirty reads without registering a cache
+	// allocation. Either active stage's BDA access requires both stages eagerly.
+	const bool register_buffers = vertex.program->info.uses_dma ||
+	                              (pixel_active && pixel.program->info.uses_dma);
+	FindBuffers(bindings.vertex, register_buffers);
 	if (bindings.pixel) {
-		FindBuffers(*bindings.pixel);
+		FindBuffers(*bindings.pixel, register_buffers);
 	}
 	PrepareBdaBindings(bindings.vertex, bindings.pixel ? &*bindings.pixel : nullptr);
 	auto&    cache = m_context.GetBufferCache();

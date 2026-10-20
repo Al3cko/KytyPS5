@@ -658,6 +658,7 @@ private:
 				if (SaveExec(inst.opcode)) {
 					WriteScalar(inst.dst, 2, true, state); // (the old EXEC)
 					SetPair(state.lanes, ScalarIndex(inst.dst), NameHas64(inst.opcode));
+					state.scc_mask = true; // SCC tests the updated EXEC of the whole wave, not either half alone.
 					break;
 				}
 				if (inst.family != Family::SOPC && inst.dst.kind != OperandKind::Unknown) {

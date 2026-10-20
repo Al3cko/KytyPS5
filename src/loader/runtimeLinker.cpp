@@ -2358,6 +2358,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 void RuntimeLinker::DeleteProgram(Program* p) {
 	auto program = std::unique_ptr<Program>(p);
+	DemonsSoulsCopy::Clear(p);
 	if (g_tls_main_program == program.get()) {
 		g_tls_main_program = nullptr;
 	}

@@ -455,8 +455,23 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::BitwiseAnd32:
-			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
+			if (FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; }) ||
+			    ReplaceBinaryIdentity(inst, Type::U32, UINT32_MAX)) return;
+			for (uint32_t arm = 0; arm < 2u; ++arm) {
+				const auto mask = Arg(inst, arm);
+				if (!IsImmediate(mask, Type::U32)) continue;
+				if (mask.U32() == 0u) {
+					Replace(inst, Value(0u));
+					return;
+				}
+				const auto* shifted = Arg(inst, arm ^ 1u).TryInstruction();
+				if (shifted == nullptr || shifted->GetOpcode() != ValueOpcode::ShiftLeftLogical32) continue;
+				const auto shift = Arg(*shifted, 1);
+				// Shift counts wrap at 32; eliminate only the masked result, preserving shared shifts.
+				if (IsImmediate(shift, Type::U32) && (mask.U32() >> (shift.U32() & 31u)) == 0u) {
+					Replace(inst, Value(0u));
+					return;
+				}
 			}
 			return;
 		case ValueOpcode::BitwiseAnd64:

@@ -25,6 +25,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/imagePool.h"
 #include "live-counters.h"
 #include "local-platform.h"
 
@@ -42,6 +43,7 @@ static VmaAllocator          g_report_allocator = nullptr;
 static const GraphicContext* g_report_context   = nullptr;
 // Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 16th of the GPU's memory budget.
 static uint64_t g_image_pool_limit = 1024ull << 20;
+static ImagePool::BudgetGate g_image_pool_budget;
 static void WriteVmaReport(const char* path) {
 	if (g_report_allocator == nullptr) return;
 	if (g_report_context != nullptr) g_report_context->LogVideoMemory("live");
@@ -140,6 +142,7 @@ bool GraphicContext::CreateAllocator() {
 	g_report_context            = this;
 	LiveCounters::g_vma_report = WriteVmaReport;
 	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 16);
+	g_image_pool_budget = ImagePool::BudgetGate {};
 	return true;
 }
 
@@ -197,13 +200,15 @@ void GraphicContext::LogVideoMemory(const char* label) const {
 	// flags (NVIDIA places it in video memory while there is room), host-visible.
 	VmaTotalStatistics statistics {};
 	vmaCalculateStatistics(allocator, &statistics);
-	uint64_t local = 0, plain = 0, host = 0;
+	uint64_t local = 0, plain = 0, host = 0, local_allocated = 0;
 	const auto& properties = GetPhysicalDeviceMemoryProperties();
 	for (uint32_t type = 0; type < properties.memoryTypeCount; type++) {
 		const auto flags = properties.memoryTypes[type].propertyFlags;
 		const auto bytes = statistics.memoryType[type].statistics.blockBytes;
-		if (flags & vk::MemoryPropertyFlagBits::eDeviceLocal) local += bytes;
-		else if (flags & vk::MemoryPropertyFlagBits::eHostVisible) host += bytes;
+		if (flags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+			local += bytes;
+			local_allocated += statistics.memoryType[type].statistics.allocationBytes;
+		} else if (flags & vk::MemoryPropertyFlagBits::eHostVisible) host += bytes;
 		else plain += bytes;
 	}
 	// What of the plain type the GPU's system memory does not hold is in video memory; the rest of the video memory in
@@ -216,6 +221,9 @@ void GraphicContext::LogVideoMemory(const char* label) const {
 	            " MiB, host-visible %" PRIu64 " MiB)\n",
 	            label, video >> 20u, budget >> 20u, local >> 20u, plain_in_video >> 20u, driver >> 20u, shared >> 20u,
 	            plain_in_system >> 20u, host >> 20u);
+	std::printf("VMA_MEMORY local_blocks_mib=%" PRIu64 " local_allocations_mib=%" PRIu64
+	            " local_unused_block_mib=%" PRIu64 "; unused block bytes need not be independently releasable\n",
+	            local >> 20u, local_allocated >> 20u, (local - std::min(local, local_allocated)) >> 20u);
 	std::fflush(stdout);
 }
 
@@ -349,6 +357,29 @@ void GraphicContext::TrimImagePool() {
 	if (allocator != nullptr) DestroyImagePool(allocator);
 }
 
+void GraphicContext::UpdateImagePoolBudget() {
+	if (allocator == nullptr || !CanReportMemoryUsage()) return;
+	const auto usage = GetDeviceMemoryUsage();
+	const auto budget = GetTotalMemoryBudget(); // already reserves driver headroom
+	std::scoped_lock lock(g_image_pool_mutex);
+	const bool previously_allowed = g_image_pool_budget.AllowsRetention();
+	const bool allowed = g_image_pool_budget.Update(usage, budget, g_image_pool_limit);
+	const auto before = g_image_pool_bytes;
+	if (!allowed) {
+		ImagePool::Trim(g_image_pool, g_image_pool_bytes, 0, [&](const PooledImage& image) {
+			vmaDestroyImage(allocator, image.image, image.allocation);
+		});
+	}
+	if (previously_allowed != allowed || before != g_image_pool_bytes) {
+		std::printf("Image reuse pool: retention %s, released %llu MiB, cached %llu MiB; usage %llu / budget %llu MiB\n",
+		            allowed ? "resumes" : "paused",
+		            static_cast<unsigned long long>((before - g_image_pool_bytes) >> 20u),
+		            static_cast<unsigned long long>(g_image_pool_bytes >> 20u),
+		            static_cast<unsigned long long>(usage >> 20u),
+		            static_cast<unsigned long long>(budget >> 20u));
+	}
+}
+
 // Out of video memory: the first few times say so in the log, with the heaps' budgets.
 void GraphicContext::ReportMemoryFallback(const char* what, uint64_t bytes) const {
 	static std::atomic<uint32_t> reported {0};
@@ -460,17 +491,16 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		VmaAllocationInfo allocation_info {};
 		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
 		std::scoped_lock lock(g_image_pool_mutex);
-		g_image_pool.push_back({ImagePoolKey(image), image.image, image.allocation, allocation_info.size});
-		g_image_pool_bytes += allocation_info.size;
-		while (g_image_pool_bytes > g_image_pool_limit && !g_image_pool.empty()) {
-			auto& oldest = g_image_pool.front();
-			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
-			g_image_pool_bytes -= oldest.bytes;
-			g_image_pool.erase(g_image_pool.begin());
+		if (g_image_pool_budget.AllowsRetention() &&
+		    ImagePool::Retain(g_image_pool, g_image_pool_bytes, g_image_pool_limit,
+		                      PooledImage {ImagePoolKey(image), image.image, image.allocation, allocation_info.size},
+		                      [&](const PooledImage& oldest) {
+		                          vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+		                      })) {
+			image.image      = nullptr;
+			image.allocation = nullptr;
+			return;
 		}
-		image.image      = nullptr;
-		image.allocation = nullptr;
-		return;
 	}
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;

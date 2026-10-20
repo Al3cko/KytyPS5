@@ -1,4 +1,4 @@
-﻿# Windows launcher: runs the Windows build with the switches of a launch config.
+# Windows launcher: runs the Windows build with the switches of a launch config.
 #   .\run-windows.ps1                        the release package's switches (run-windows.json), 2560x1440
 #   .\run-windows.ps1 -Precompile            compile every recorded shader and pipeline, then exit
 #                                            (every shader of the game: precompile-windows.ps1)
@@ -368,7 +368,13 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 # what runs per frame or on a cache miss only, so nothing measurable).
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
-if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+if ($FrameGen -gt 0) {
+    $environment['KYTY_FRAMEGEN'] = "$FrameGen"
+    # RTX 5080 / driver 617.42: the default 128 GiB driver window failed vkCreateDevice.
+    # A 512 GiB window starts Streamline successfully; this only applies to frame generation.
+    # An explicit -Set KYTY_RESERVE_CEILING=... below still overrides this setting.
+    if (!$environment.Contains('KYTY_RESERVE_CEILING')) { $environment['KYTY_RESERVE_CEILING'] = '8000000000' }
+}
 # -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
 if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }
 # Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
@@ -441,6 +447,8 @@ if ('KYTY_RECORDING_CPUS', 'KYTY_RENDER_CPUS' | Where-Object { $environment[$_] 
 $quoted = @('--game', "`"$Game`"") + ($options | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
 $logDir = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+. (Join-Path $PSScriptRoot 'Run-Settings.ps1')
+$stamp += '-' + (Get-RunSettingsLabel ($options.Contains('--hdr')) $environment)
 Write-Host "game:     $(if ($titleName) { "$titleName, " })$version$(if (!$tested) { " (untested: the emulator is tested with $($testedVersions -join ' and '))" })"
 Write-Host "config:   $Config$(if ($Baseline) { ' (baseline: no switches)' })$(if ($Precompile) { ' (precompile)' })"
 Write-Host ("affinity: 0x{0:X} ({1} CPUs){2}" -f $mask, $cpus, $(if ($environment['KYTY_RENDER_CPUS']) { "; render threads on CPUs $($environment['KYTY_RENDER_CPUS'])" }))
@@ -584,8 +592,19 @@ New-Item -ItemType Directory -Force $logDir | Out-Null
 $out = "$logDir\$stamp.out.log"
 # (Named to the emulator too: F9's debug snapshot, src/local/debug-snapshot.h, notes the run's log.)
 $env:KYTY_RUN_LOG = $out
-$process = Start-Process -FilePath $Exe -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -PassThru `
-	-RedirectStandardOutput $out -RedirectStandardError "$logDir\$stamp.err.log"
+$runRecord = Write-RunSettings -Prefix "$logDir\$stamp" -Exe $Exe -Game $Game -GameVersion $version -Arguments $quoted -Environment $environment -HdrRequested ($options.Contains('--hdr')) -Config $Config -PackageRoot $PSScriptRoot
+try {
+	$process = Start-Process -FilePath $Exe -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
+		-RedirectStandardOutput $out -RedirectStandardError "$logDir\$stamp.err.log"
+} catch {
+	$runRecord.status = 'launch_failed'
+	$runRecord['error'] = $_.Exception.Message
+	$runRecord | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$logDir\$stamp.settings.json" -Encoding UTF8
+	throw
+}
+$runRecord.processId = $process.Id
+$runRecord.status = 'started'
+$runRecord | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$logDir\$stamp.settings.json" -Encoding UTF8
 if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }
 $null = $process.Handle # keeps the exit code readable after the process ends
 Write-Host "pid $($process.Id); logs: $($logDir.Substring($PSScriptRoot.Length + 1))\$stamp.*.log"

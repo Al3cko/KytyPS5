@@ -38,6 +38,7 @@ extern volatile std::atomic_uint32_t kyty_local_vulkan_recording_mode;
 extern volatile std::atomic_uint32_t kyty_local_deferred_submit_mode;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_packets_mode;
+extern volatile std::atomic_uint32_t kyty_local_draw_argument_scratch;
 extern volatile std::atomic_uint32_t kyty_local_native_xpr_predict_mode;
 extern volatile std::atomic_uint32_t kyty_local_native_image_proof_mode;
 extern volatile std::atomic_uint32_t kyty_local_async_xpr_pipelines_mode;
@@ -125,6 +126,7 @@ inline void InitializePerformanceSwitches() {
 	    // 1: native XPR draws; 2: verification (the normal path draws and is compared).
 	    Switch {"KYTY_NATIVE_XPR", &kyty_local_native_xpr_mode, 0, 2},
 	    Switch {"KYTY_DRAW_PACKETS", &kyty_local_draw_packets_mode},
+	    Switch {"KYTY_DRAW_ARGUMENT_SCRATCH", &kyty_local_draw_argument_scratch},
 	    Switch {"KYTY_NATIVE_XPR_PREDICT", &kyty_local_native_xpr_predict_mode},
 	    Switch {"KYTY_NATIVE_IMAGE_PROOF", &kyty_local_native_image_proof_mode},
 	    Switch {"KYTY_ASYNC_XPR_PIPELINES", &kyty_local_async_xpr_pipelines_mode},

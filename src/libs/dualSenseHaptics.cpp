@@ -27,6 +27,7 @@ constexpr PROPERTYKEY PKEY_INTERFACE_FRIENDLY_NAME = {
 
 // The pad's USB interface path, as both the audio driver and the registry report it.
 constexpr const char* PAD_DEVICE_PATH = "VID_054C&PID_0CE6";
+constexpr const char* EDGE_DEVICE_PATH = "VID_054C&PID_0DF2";
 
 // The endpoint's four channels: 0-1 play on the pad's speaker, 2-3 drive its haptic actuators.
 constexpr uint32_t SPEAKER_FIRST_CHANNEL = 0;
@@ -307,7 +308,8 @@ IMMDevice* FindEndpoint() {
 			if (SUCCEEDED(store->GetValue(PKEY_INTERFACE_FRIENDLY_NAME, &value)) &&
 			    value.vt == VT_LPWSTR && value.pwszVal != nullptr) {
 				const auto path = Narrow(value.pwszVal);
-				is_pad          = path.find(PAD_DEVICE_PATH) != std::string::npos;
+				is_pad          = path.find(PAD_DEVICE_PATH) != std::string::npos ||
+				                  path.find(EDGE_DEVICE_PATH) != std::string::npos;
 				if (g_log) {
 					std::printf("DualSense: endpoint %u: %s%s\n", i, path.c_str(),
 					            is_pad ? "  <- the pad" : "");

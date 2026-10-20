@@ -117,8 +117,8 @@ public:
 		TouchImage(image);
 		return image;
 	}
-	// The image, or null when `id` names no live image (an erased one a record kept): not touched.
-	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
+	// Renderer-owner lookup: validate slot generation without changing LRU state.
+	[[nodiscard]] Image* TryGetImage(ImageId id) { return m_slot_images.try_get(id); }
 	void MarkGpuWritten(ImageId id);
 	// A speculative translation's use of the image, when it is committed (`serial`: the image it used).
 	void TouchSpeculated(Image& image, uint64_t serial);
@@ -210,6 +210,19 @@ private:
 	using ImageEpochTable = MultiLevelPageTable<uint64_t, 20, 40, 10>;
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, bool may_fail = false);
+	// An overlap lookup or copy still needs these owners while InsertImage may reclaim other old images. Caller holds
+	// m_lock. Scoped pins leave their LRU ages unchanged and nest when a lookup expands one of its candidates.
+	class ReclaimPins {
+	public:
+		explicit ReclaimPins(TextureCache& cache, ImageId id = {});
+		~ReclaimPins();
+		KYTY_CLASS_NO_COPY(ReclaimPins);
+		void Add(ImageId id);
+	private:
+		TextureCache& m_cache;
+		size_t        m_begin;
+	};
+	std::vector<ImageId>      m_reclaim_pins;
 	// Room for an image that must exist, which the GPU could not make (InsertImage): the images freed. Caller holds m_lock.
 	size_t                    ReclaimImageMemory(uint64_t bytes, bool all);
 	// Images the GPU could not make (InsertImage's `may_fail`): their memory is not asked for again for FailedRetryTicks
@@ -398,7 +411,8 @@ private:
 		const auto bit = MetaFilterBit(address);
 		return ((m_meta_filter[bit >> 6u].load(std::memory_order_acquire) >> (bit & 63u)) & 1u) != 0;
 	}
-	uint64_t                                          m_total_used_memory  = 0;
+	// Registration bookkeeping only; driver usage is sampled separately by the collector.
+	uint64_t                                          m_registered_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_logged_video_memory = 0; // RunGarbageCollector's log line
 	uint64_t                                          m_logged_shared_memory = 0;

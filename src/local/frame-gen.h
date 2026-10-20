@@ -90,9 +90,12 @@ void BypassCommandHooks(vk::Device device);
 // Present thread, around vkQueuePresentKHR of the image showing `inputs` (null: a frame
 // without inputs, e.g. a menu). `backbuffer` is the swapchain extent, `region` the part the
 // game image covers.
+void BeginPresentFrame();
+void BeginPresentCommands();
+void EndPresentCommands();
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count);
-void AfterPresent();
+void AfterPresent(bool presented);
 // Present thread: the swapchain is made again (DLSS-G off until frames with inputs turn it on again).
 void SwapchainChanging();
 // Any thread: a frame with inputs was left unshown (the presenter kept a newer one): the next one resets DLSS-G's history.

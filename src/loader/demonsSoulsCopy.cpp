@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <xxhash.h>
 
@@ -23,8 +24,7 @@ extern "C" {
 
 namespace Loader::DemonsSoulsCopy {
 namespace {
-uint64_t                site = 0;
-std::array<uint8_t, 13> original {}, patch {};
+CopyHook hook;
 
 // A large move into memory the GPU caches, page by page: a page the GPU wrote (its bytes here are stale, and reading them
 // would fault) or whose bytes differ is written (runs prepared as overwritten, Memory::TryPrepareHostOverwrite); a page
@@ -82,16 +82,26 @@ struct Body {
 	const char* build;
 	uint64_t    offset, size, hash;
 };
-constexpr std::array<Body, 2> Bodies {{
+constexpr std::array<Body, 3> Bodies {{
     {"01.007.000", 0x3c36, 2048, 0xe654325b8be848a9ull},
     {"01.005.000", 0x3d06, 1705, 0xc4be692ee02e9f77ull}, // an older body (another small-size table), the same entries
+    // PPSA01342 01.005.000's alternate libc: the same 1705-byte body as above, except its
+    // RIP-relative displacement to the relocated small-size table. All three checked entries
+    // share this body with one saved RBP; neither direct branches nor that table enter the
+    // 13-byte replacement span after its first byte. Keep the complete-body fingerprint.
+    {"01.005.000 (alternate libc)", 0x3986, 1705, 0x62b00b487e6f61ddull},
 }};
 } // namespace
 
 void Install(Program* program) {
 #if defined(__x86_64__) || defined(_M_X64)
-	if (site || !program || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "libc.prx")
+	if (hook.Active() || !program || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "libc.prx")
 		return;
+	// Experimental: direct launches must be just as conservative as the play launcher.
+	if (!Enabled(std::getenv("KYTY_GUEST_MOVE"))) {
+		std::printf("Demon's Souls copy: native move disabled (requires KYTY_GUEST_MOVE=1); retaining its memmove\n");
+		return;
+	}
 	const auto body = std::find_if(Bodies.begin(), Bodies.end(), [&](const Body& b) {
 		const auto address = program->base_vaddr + b.offset;
 		return program->mapped_size >= b.offset + b.size && program->base_vaddr <= UINT64_MAX - b.offset - b.size &&
@@ -103,25 +113,15 @@ void Install(Program* program) {
 		return;
 	}
 	const auto address = program->base_vaddr + body->offset;
-	std::memcpy(original.data(), reinterpret_cast<const void*>(address), original.size());
-	patch = Tailcall(reinterpret_cast<uint64_t>(&CoherentMove));
-	std::memcpy(reinterpret_cast<void*>(address), patch.data(), patch.size());
-	if (!Common::VirtualMemory::FlushInstructionCache(address, patch.size())) {
-		std::memcpy(reinterpret_cast<void*>(address), original.data(), original.size());
-		Common::VirtualMemory::FlushInstructionCache(address, original.size());
+	if (!hook.Install(program, address, Tailcall(reinterpret_cast<uint64_t>(&CoherentMove)),
+	                  &Common::VirtualMemory::FlushInstructionCache)) {
 		return;
 	}
-	site = address;
 	std::printf("Demon's Souls copy: installed verified coherent memmove (libc.prx of %s)\n", body->build);
 #endif
 }
 
-void Clear() {
-	if (!site) return;
-	if (std::memcmp(reinterpret_cast<const void*>(site), patch.data(), patch.size()) == 0) {
-		std::memcpy(reinterpret_cast<void*>(site), original.data(), original.size());
-		Common::VirtualMemory::FlushInstructionCache(site, original.size());
-	}
-	site = 0;
+void Clear(const Program* program) {
+	hook.Clear(&Common::VirtualMemory::FlushInstructionCache, program);
 }
 } // namespace Loader::DemonsSoulsCopy

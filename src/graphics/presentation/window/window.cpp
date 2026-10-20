@@ -41,6 +41,7 @@
 #include "graphics/presentation/window/startupProgress.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "frame-gen.h"
+#include "perf-overlay.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -533,6 +534,10 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
+	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) && event->key.keysym.sym == SDLK_HOME) {
+		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) PerfOverlay::ToggleVisibility();
+		return;
+	}
 	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) &&
 	    event->key.keysym.sym == SDLK_F7) {
 		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {

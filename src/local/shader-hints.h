@@ -21,7 +21,8 @@ std::string GameId(const std::filesystem::path& game);
 
 // --make-hints: the hint file of the game version game_id from recordings (warmup files or recorded seed files):
 // their records whose code the seed file has (what --make-seeds lists on every PC; a recording can hold another
-// version's play too) and the pipeline recipes of those. 0, or 1 (nothing is written).
+// version's play too) and the pipeline recipes of those. 0: complete; 1: failed;
+// 2: usable partial output, with unreadable recordings omitted (do not prune their cached pipelines).
 int Make(const std::filesystem::path& out, const std::filesystem::path& seeds,
          const std::vector<std::filesystem::path>& recordings, const std::string& game_id);
 

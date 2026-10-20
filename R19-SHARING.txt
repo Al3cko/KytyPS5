@@ -1,0 +1,46 @@
+Al3cko r19 source snapshot
+=========================
+
+Base: chenxiao07/KytyPS5 v20261019
+https://github.com/chenxiao07/KytyPS5/releases/tag/v20261019
+
+This source snapshot carries the local renderer, memory, input and Windows
+launcher changes used for r19. Existing upstream copyright notices, license
+files and source history are retained. Private development notes and local
+runtime data are excluded from this sharing commit.
+
+The three memory changes selected for r19 were adapted from Chen's commits:
+3c6157abc0150bb25334bd1054c53011b544a377 - avoid stale light-table GPU waits
+a1bdda37ff7c2afa14c56febb414bb96eaa0d945 - fresh-memory zero uploads
+3c1b968cac7d003848aec76283733dde5d550cd2 - mapped buffer expansion and gap reclamation
+
+A local regression exposed an alias edge case in fresh-memory tracking. The
+fix conservatively marks backing written before removing watches when another
+alias remains mapped. Tests cover first writes, aliases, partial/full unmaps,
+zero uploads, mapped buffer boundaries, smaller buffer gaps and light tables.
+
+Retained local work includes Reflex timing, DualSense Edge USB haptics,
+compatibility for Demon's Souls 01.005 PSML parameters, memory-pressure gates,
+world-aware pipeline preparation/retirement, per-run settings logs, and the
+backed-up World Tendency editor. Source changes were developed with AI assistance.
+
+Validation of the packaged r19 build:
+- Emulator and shader precompiler built successfully on Windows.
+- 20 focused tests passed, including real Vulkan memory/cache fixtures.
+- The fresh-memory-disabled upload fixture passed five repeated runs.
+- Launcher dry runs and UI creation passed with SDR, 1440 render height and 2x FG.
+- Gameplay performance and visual comparison of r19 are still pending.
+
+The src/, tests/, CMakeLists.txt and runtime launcher script contents in this
+snapshot match the tested integration source. Documentation and ignore rules
+were adjusted for sharing. This source checkout has not been rebuilt separately.
+
+Building requires the submodules and toolchain described in the upstream README.
+Local launcher files are in tools/local/windows and are intended to be staged
+beside the built executables and root run-windows.ps1/Run-Settings.ps1 scripts.
+Set game-path.txt to your own game dump and choose your installed Streamline
+runtime. The local convenience Play-DemonsSouls scripts currently default to
+C:\Mods\Streamline\_sdk\v2.14.16; adapt this location for another installation.
+
+Saves, caches, game dumps, runtime settings and logs are not included. Do not
+upload a personal play-build directory as a source commit or release archive.

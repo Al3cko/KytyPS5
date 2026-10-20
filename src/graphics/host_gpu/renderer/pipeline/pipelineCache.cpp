@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheBlobs.h"
+#include "graphics/host_gpu/renderer/pipeline/prefetchMemoryGate.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -28,6 +29,7 @@
 #include "native-preparation-scratch.h"
 #include "native-resource-state.h"
 #include "shader-warmup-cache.h"
+#include "scene-tags.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "device-fault.h"
@@ -481,10 +483,13 @@ struct PipelineCache::ProgramCache {
 		bool                                                        plan_listed = false;
 		bool                                                        plan_preloaded = false; // back by a worker, not used since
 	};
-	// Plans: sweeps so far (one a flip, SweepPlans), out of memory now, brought back (by the render thread; by workers).
+	// Plans: sweeps so far, out of memory now, restored on demand (including ready
+	// worker results), and restored speculatively before demand.
 	uint32_t plan_clock = 0;
 	size_t   plans_out = 0;
 	uint64_t plan_reloads = 0, plan_preloads = 0, plan_preload_uses = 0;
+	uint64_t plan_sync_loads = 0, plan_worker_takeovers = 0;
+	double   plan_sync_load_ms = 0, plan_sync_load_max_ms = 0;
 
 	// A place's plans come back together: a frame at 1-1 back from other worlds rebuilt ~70 (29 ms of IR, operator new
 	// the most of it) on the render thread. The first one it brings back sends the others of its time (last used within
@@ -494,14 +499,16 @@ struct PipelineCache::ProgramCache {
 	std::multimap<uint32_t, SourceEntry*> plans_out_by_use;
 	struct LoadedPlan {
 		ShaderRecompiler::IR::ResourcePlan plan;
+		bool                               valid = false;
 		bool                               linear = false;
 		uint64_t                           erased = 0;
 	};
 	struct PlanLoads {
 		std::mutex                                   mutex;
-		std::unordered_map<SourceEntry*, LoadedPlan> plans;
+		std::vector<std::pair<SourceEntry*, LoadedPlan>> plans;
 	};
 	std::shared_ptr<PlanLoads> plan_loads = std::make_shared<PlanLoads>();
+	Kyty::PrefetchMemory::PlanPreloadBudget plan_preload_budget {256};
 	uint64_t                   programs_erased = 0;
 	void UnlistPlan(SourceEntry& source) {
 		if (!source.plan_listed) return;
@@ -511,7 +518,19 @@ struct PipelineCache::ProgramCache {
 	// An entry about to be erased: no queue keeps it (rare: a warm program whose code changed).
 	void ForgetPlanLoads(SourceEntry& entry) {
 		UnlistPlan(entry);
+		if (entry.plan_preloaded) plan_preload_budget.UsedOrEvicted();
 		programs_erased++;
+		// Old worker results are invalidated by this epoch. Surviving entries must
+		// be eligible again; otherwise their plan_loading flag can stay set forever.
+		for (auto& [key, source]: programs) {
+			(void)key;
+			if (&source == &entry || !source.plan_loading) continue;
+			source.plan_loading = false;
+			if (source.plan_out && !source.plan_listed) {
+				source.plan_node = plans_out_by_use.emplace(source.plan_use, &source);
+				source.plan_listed = true;
+			}
+		}
 	}
 
 	// The plan back in the entry (its linear SRT plan kept meanwhile).
@@ -531,34 +550,40 @@ struct PipelineCache::ProgramCache {
 		LoadedPlan loaded;
 		{
 			std::lock_guard lock(plan_loads->mutex);
-			const auto      found = plan_loads->plans.find(&source);
+			const auto found = std::ranges::find_if(plan_loads->plans, [&](const auto& result) {
+				return result.first == &source && result.second.erased == programs_erased;
+			});
 			if (found == plan_loads->plans.end()) return false;
 			loaded = std::move(found->second);
 			plan_loads->plans.erase(found);
+			plan_preload_budget.Complete(false); // demanded now, no speculative residency
 		}
 		source.plan_loading = false;
-		if (loaded.erased != programs_erased || loaded.linear != (source.plan_linear != nullptr)) return false;
+		if (!loaded.valid || loaded.erased != programs_erased || loaded.linear != (source.plan_linear != nullptr)) return false;
 		plan = std::move(loaded.plan);
 		return true;
 	}
 
 	// The plans out of memory last used within PreloadWindow flips of `around` to the compile workers.
-	void PreloadPlans(uint32_t around) {
+	void PreloadPlans(uint32_t around, SourceEntry* needed) {
 		// (16 GB simulated, 5 worlds x2: 600 flips brought back 14,072 plans beside the render thread, 3,861 of them used
 		// before leaving again, and left it 207 of its own; 150 flips missed some: spins at 1-1 and Latria fell to 30-38 fps.)
 		static constexpr uint32_t PreloadWindow = 600;
-		static constexpr size_t   MaxPlans = 256, PlansPerJob = 4;
-		if (!push_job || plans_out_by_use.empty()) return;
+		static constexpr size_t PlansPerJob = 4;
+		if (!push_job || plans_out_by_use.empty() || !BackgroundShaderMemoryReady()) return;
 		std::vector<std::pair<SourceEntry*, SpilledPlan>> batch;
+		const size_t room = plan_preload_budget.Room();
 		for (auto it = plans_out_by_use.lower_bound(around > PreloadWindow ? around - PreloadWindow : 0);
-		     it != plans_out_by_use.end() && it->first <= around + PreloadWindow && batch.size() < MaxPlans;) {
+		     it != plans_out_by_use.end() && it->first <= around + PreloadWindow && batch.size() < room;) {
 			auto* entry        = it->second;
+			if (entry == needed) { ++it; continue; } // loaded synchronously by EnsurePlan
 			it                 = plans_out_by_use.erase(it); // (listed again when out again)
 			entry->plan_listed = false;
 			if (!entry->plan_out || entry->plan_loading) continue;
 			entry->plan_loading = true;
 			batch.emplace_back(entry, entry->plan_spilled);
 		}
+		(void)plan_preload_budget.Reserve(batch.size());
 		for (size_t first = 0; first < batch.size(); first += PlansPerJob) {
 			std::vector<std::pair<SourceEntry*, SpilledPlan>> part(
 			    batch.begin() + static_cast<std::ptrdiff_t>(first),
@@ -567,9 +592,11 @@ struct PipelineCache::ProgramCache {
 				for (const auto& [entry, spilled]: part) {
 					LoadedPlan loaded;
 					loaded.erased = erased;
-					if (!LoadPlanBytes(spilled, loaded.plan, loaded.linear)) continue; // (the render thread reads it)
+					// A queued job can outlive its memory headroom. Publish cancellation as
+					// well as success so the render thread can clear plan_loading and retry.
+					loaded.valid = BackgroundShaderMemoryReady() && LoadPlanBytes(spilled, loaded.plan, loaded.linear);
 					std::lock_guard lock(loads->mutex);
-					loads->plans[entry] = std::move(loaded);
+					loads->plans.emplace_back(entry, std::move(loaded));
 				}
 			});
 		}
@@ -577,17 +604,30 @@ struct PipelineCache::ProgramCache {
 
 	// The workers' results in their entries (each flip): those of entries still out, a use noted (their place is back).
 	void DrainLoadedPlans() {
-		std::unordered_map<SourceEntry*, LoadedPlan> plans;
+		std::vector<std::pair<SourceEntry*, LoadedPlan>> plans;
 		{
 			std::lock_guard lock(plan_loads->mutex);
 			if (plan_loads->plans.empty()) return;
 			plans.swap(plan_loads->plans);
 		}
+		const bool keep = BackgroundShaderMemoryReady();
 		for (auto& [entry, loaded]: plans) {
-			if (loaded.erased != programs_erased) continue; // (the entry may be gone)
+			if (loaded.erased != programs_erased) {
+				plan_preload_budget.Complete(false);
+				continue; // the entry may be gone; never dereference it
+			}
 			entry->plan_loading = false;
-			if (!entry->plan_out || loaded.linear != (entry->plan_linear != nullptr)) continue;
+			if (!entry->plan_out) { plan_preload_budget.Complete(false); continue; }
+			if (!keep || !loaded.valid || loaded.linear != (entry->plan_linear != nullptr)) {
+				plan_preload_budget.Complete(false);
+				if (!entry->plan_listed) {
+					entry->plan_node = plans_out_by_use.emplace(entry->plan_use, entry);
+					entry->plan_listed = true;
+				}
+				continue;
+			}
 			RestorePlan(*entry, std::move(loaded.plan));
+			plan_preload_budget.Complete(true);
 			entry->plan_use       = plan_clock;
 			entry->plan_preloaded = true;
 			plan_preloads++;
@@ -599,16 +639,24 @@ struct PipelineCache::ProgramCache {
 		const auto last_use = source.plan_use;
 		source.plan_use     = plan_clock;
 		if (source.plan_preloaded) {
+			plan_preload_budget.UsedOrEvicted();
 			source.plan_preloaded = false;
 			plan_preload_uses++;
 		}
 		if (!source.plan_out) return;
 		ShaderRecompiler::IR::ResourcePlan plan;
 		if (!TakeLoadedPlan(source, plan)) {
-			PreloadPlans(last_use);
+			PreloadPlans(last_use, &source);
 			bool linear = false;
+			const auto load_start = std::chrono::steady_clock::now();
 			if (!LoadPlanBytes(source.plan_spilled, plan, linear) || linear != (source.plan_linear != nullptr))
 				EXIT("a shader's resource plan could not be read back from the scratch file\n");
+			const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count();
+			plan_sync_loads++;
+			plan_sync_load_ms += load_ms;
+			plan_sync_load_max_ms = std::max(plan_sync_load_max_ms, load_ms);
+		} else {
+			plan_worker_takeovers++;
 		}
 		RestorePlan(source, std::move(plan));
 		plan_reloads++;
@@ -661,6 +709,7 @@ struct PipelineCache::ProgramCache {
 			freed->push_back(std::move(source.resource_plan));
 			source.resource_plan = {};
 			source.plan_out       = true;
+			if (source.plan_preloaded) plan_preload_budget.UsedOrEvicted();
 			source.plan_preloaded = false;
 			plans_out++;
 			source.plan_node   = plans_out_by_use.emplace(source.plan_use, &source);
@@ -1029,13 +1078,14 @@ struct PipelineCache::ProgramCache {
 		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 		auto& p = *prefetch;
 		while (!p.stop.load(std::memory_order_relaxed)) {
+			if (!WaitForMemory(p)) break;
 			// The recorded programs after those the game met first.
 			if (auto* group = p.Followed()) {
 				if (RunGroup(p, *group)) p.followed.fetch_add(1, std::memory_order_relaxed);
 				continue;
 			}
 			if (worker >= p.gentle_threads && p.next.load(std::memory_order_relaxed) >= p.recorded_groups) break;
-			if (WaitForMemory(p)) continue; // (a program play just met first)
+			if (p.stop.load(std::memory_order_relaxed)) break;
 			const size_t n = p.next.fetch_add(1, std::memory_order_relaxed);
 			if (n >= p.groups.size()) break;
 			(void)RunGroup(p, *p.groups[n]);
@@ -1058,28 +1108,37 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
-	// While the PC has less physical memory left than KYTY_PREFETCH_MIN_AVAIL_MB (default 1024 MiB), the prefetch makes
-	// none of the programs play has not met (they are for later): its translations, SPIR-V and plan file add to the paging
-	// the PC is doing then, the game loading beside it on 16 GB (issue #50: a bug check 0x1A in a protection change of the
-	// game's memory, while a level loaded with the prefetch translating 20,000 programs). True when one play met came up.
-	static bool WaitForMemory(Prefetch& p) {
+	// All predictive shader work shares this gate, including neighboring recorded
+	// programs and spilled-plan reloads. Actual render-thread demand never waits here.
+	static bool BackgroundShaderMemoryReady() {
 		static const uint64_t minimum = [] {
 			const char* value = std::getenv("KYTY_PREFETCH_MIN_AVAIL_MB");
-			return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) << 20u;
+			const uint64_t mib = value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {2048};
+			return std::min(mib, UINT64_MAX >> 20u) << 20u;
 		}();
-		static std::atomic<uint32_t> reports {0};
-		bool                         waited = false;
-		while (!p.stop.load(std::memory_order_relaxed)) {
-			const uint64_t available = LocalPlatform::AvailablePhysicalMemory();
-			if (available == 0 || available >= minimum) break;
-			if (!waited && reports.fetch_add(1, std::memory_order_relaxed) < 8)
-				PipelineCacheLog("Shader prefetch: waits, {} MiB of physical memory left (below {} MiB)", available >> 20u,
-				                 minimum >> 20u);
-			waited = true;
-			if (p.Followed() != nullptr) return true;
-			std::this_thread::sleep_for(std::chrono::milliseconds(250));
-		}
-		return false;
+		static Kyty::PrefetchMemory::SystemPressureGate gate(minimum, uint64_t {512} << 20u);
+		static std::mutex mutex;
+		static uint32_t reports = 0;
+		static bool was_ready = true;
+		std::lock_guard lock(mutex);
+		const auto memory = LocalPlatform::SystemMemory();
+		const bool ready = gate.Allow(memory.physical_available, memory.physical_known,
+		                              memory.commit_total, memory.commit_limit, memory.commit_known);
+		if (ready != was_ready && reports++ < 16)
+			PipelineCacheLog("Shader background work: {} at RAM {} MiB (known {}), commit room {} MiB (known {}) "
+			                 "(pause below {} MiB; recovery margin 512 MiB)",
+			                 ready ? "resumes" : "pauses", memory.physical_available >> 20u, memory.physical_known,
+			                 (memory.commit_limit - std::min(memory.commit_limit, memory.commit_total)) >> 20u,
+			                 memory.commit_known, minimum >> 20u);
+		was_ready = ready;
+		return ready;
+	}
+
+	static bool WaitForMemory(Prefetch& p) {
+		return Kyty::PrefetchMemory::WaitForRoom(
+		    [&] { return p.stop.load(std::memory_order_relaxed); },
+		    [] { return BackgroundShaderMemoryReady(); },
+		    [] { std::this_thread::sleep_for(std::chrono::milliseconds(250)); });
 	}
 
 	// The group translated here unless another thread took it.
@@ -1101,6 +1160,7 @@ struct PipelineCache::ProgramCache {
 		LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
 		auto& p = *prefetch;
 		while (!p.stop.load(std::memory_order_relaxed) && p.finished.load(std::memory_order_relaxed) < p.groups.size()) {
+			if (!WaitForMemory(p)) break;
 			uint64_t seen = 0;
 			if (auto* group = p.Followed(&seen)) {
 				if (RunGroup(p, *group)) p.followed.fetch_add(1, std::memory_order_relaxed);
@@ -1939,6 +1999,21 @@ struct PipelineCache::ProgramCache {
 	// `mutex` (the pipeline cache's) by this thread alone - a worker below normal priority holding it while the game's
 	// threads kept every CPU would hold up the render thread. The game's Get may have made the program meanwhile, or
 	// the permutation: a record then adds what the program lacks, of the same code only.
+	// The permutation TranslateWarmup made (or found) for a recorded input, while the cache still has it; null: the
+	// program left (its code changed) or never had it. Under the pipeline cache's mutex, `warming` set while it is used.
+	Permutation* FindRecorded(const LocalShaderWarmup::Record& record) {
+		const ProgramKey key {record.stage, record.hash, record.user_data_count, static_cast<uint32_t>(record.code.size()),
+		                      record.static_key};
+		const auto entry = programs.find(key);
+		if (entry == programs.end() || entry->second.source_digest != SourceDigest(record.code, record.back_code)) return nullptr;
+		const auto found = std::ranges::find_if(entry->second.permutations, [&](const auto& p) {
+			return !p.table_mode && p.specialization == record.specialization &&
+			       p.program.bindings.push_data_start_dword ==
+			           ShaderRecompiler::IR::PushData::StartFor(record.push_cursor, p.program.bindings.ShaderDataDwords());
+		});
+		return found != entry->second.permutations.end() ? &*found : nullptr;
+	}
+
 	void TranslateWarmup(Common::Mutex& mutex, bool background, const std::atomic<bool>& stop) {
 		const auto begin = std::chrono::steady_clock::now();
 		// 0 means all recorded inputs. A caller can explicitly bound startup time.
@@ -2234,7 +2309,7 @@ namespace {
 // The flips (EvictIdlePipelines) and what eviction did (ReportSession).
 std::atomic<uint32_t> g_pipeline_flip {1};
 struct {
-	std::atomic<uint64_t> kept {0}, evicted {0}, remade {0}, remake_us {0}, remake_max_us {0};
+	std::atomic<uint64_t> kept {0}, evicted {0}, remade {0}, remake_us {0}, remake_max_us {0}, scene {0};
 } g_pipeline_evictions;
 
 // KYTY_PIPELINE_EVICT: 0 keeps every pipeline, 2 (a test) evicts whatever the video memory in use; set, it evicts on any
@@ -2266,7 +2341,9 @@ const EvictSettings& PipelineEvictSettings() {
 bool KeepsRemake(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, bool from_store) {
 	const auto& settings = PipelineEvictSettings();
 	pipeline.last_flip   = g_pipeline_flip.load(std::memory_order_relaxed);
-	if (!settings.on || (!settings.set && !graphics.small_video_memory) || !from_store) return false;
+	// (Where the game reports its worlds, on any GPU: the worlds it leaves take their pipelines along.)
+	const bool scenes = SceneTags::Generation() != 0;
+	if (!settings.on || (!settings.set && !graphics.small_video_memory && !scenes) || !from_store) return false;
 	g_pipeline_evictions.kept.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
@@ -2300,6 +2377,12 @@ PipelineCache::GraphicsRemake(GraphicsMakeInputs inputs) {
 
 vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline) {
 	pipeline.last_flip = g_pipeline_flip.load(std::memory_order_relaxed);
+	if (pipeline.recipe != 0) {
+		if (const auto generation = SceneTags::Generation(); pipeline.scene_noted != generation) {
+			pipeline.scene_noted = generation;
+			SceneTags::NoteUse(pipeline.recipe);
+		}
+	}
 	if (pipeline.pipeline != nullptr || pipeline.remake == nullptr) return pipeline.pipeline;
 	// Made again as it was made (its layouts are the shared ones for its bindings: the same), from the static store.
 	const auto              start = std::chrono::steady_clock::now();
@@ -2334,33 +2417,73 @@ void PipelineCache::EvictIdlePipelines() {
 	const uint32_t     flip         = g_pipeline_flip.fetch_add(1, std::memory_order_relaxed) + 1;
 	const auto         now          = std::chrono::steady_clock::now();
 	m_flip_times[flip % m_flip_times.size()] = now.time_since_epoch().count();
-	if (!settings.on || flip % CheckFlips != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
-	uint64_t video = 0, budget = 0;
-	m_evict_pressure = m_graphics.QueryLocalVideoMemory(&video, &budget) && (settings.always || video + EvictMargin >= budget);
-	if (!m_evict_pressure) return;
-	// The newest flip that began by the horizon among those the ring holds; none when even the oldest began after it.
-	const auto horizon = (now - settings.idle).time_since_epoch().count();
-	uint32_t   first   = flip - std::min<uint32_t>(flip - 1, static_cast<uint32_t>(m_flip_times.size() - 1)), last = flip;
-	if (m_flip_times[first % m_flip_times.size()] > horizon) return;
-	while (first < last) {
-		const uint32_t middle = first + (last - first + 1) / 2;
-		if (m_flip_times[middle % m_flip_times.size()] <= horizon) first = middle;
-		else last = middle - 1;
+	// A world the game left (SceneTags::Enter): once the one it went to was played for SceneSettle, the pipelines no
+	// binding used since the change - and none of the new world's recorded ones, which the warmup made for its places not
+	// reached yet - leave whatever the video memory, a pass a check until one finds none. Each held ~220 KB of the NVIDIA
+	// driver's RAM and video memory for its code, until the session ended. 16 GB policy, 1-1 -> five worlds -> 1-1, 60 s
+	// in each: the driver's pools 0.87 -> 2.01 GB kept, 0.84 -> 0.98 GB with those pipelines evicted (private 4.2 -> 2.8
+	// GB more); a pipeline evicted and bound again is made from the static store (~0.4 ms there). Where the warmup made
+	// every recorded pipeline (a world it did not know yet), those of the other worlds go too.
+	constexpr auto SceneSettle = std::chrono::seconds(60);
+	if (const auto generation = SceneTags::Generation(); generation != m_scene_generation) {
+		m_scene_generation = generation;
+		m_scene_flip       = flip;
+		m_scene_since      = now;
+		m_scene_swept      = false;
 	}
-	const uint32_t below   = last; // bound in an earlier flip: idle since then
-	size_t         evicted = 0;
-	const auto     evict   = [&](Pipeline& pipeline) {
+	if (!settings.on || flip % CheckFlips != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
+	const bool scene_left = !m_scene_swept && now - m_scene_since >= SceneSettle;
+	uint64_t video = 0, budget = 0;
+	const bool known = m_graphics.QueryLocalVideoMemory(&video, &budget);
+	m_evict_pressure = known && (settings.always || video + EvictMargin >= budget);
+	if (!m_evict_pressure && !scene_left) return;
+	// The newest flip that began by the horizon among those the ring holds; none when even the oldest began after it.
+	uint32_t below = 0; // bound in an earlier flip: idle since then
+	if (m_evict_pressure) {
+		const auto horizon = (now - settings.idle).time_since_epoch().count();
+		uint32_t   first   = flip - std::min<uint32_t>(flip - 1, static_cast<uint32_t>(m_flip_times.size() - 1)), last = flip;
+		if (m_flip_times[first % m_flip_times.size()] <= horizon) {
+			while (first < last) {
+				const uint32_t middle = first + (last - first + 1) / 2;
+				if (m_flip_times[middle % m_flip_times.size()] <= horizon) first = middle;
+				else last = middle - 1;
+			}
+			below = last;
+		}
+	}
+	std::unordered_set<uint64_t> scene_recipes;
+	if (scene_left) scene_recipes = SceneTags::Recipes(SceneTags::Current());
+	size_t     evicted = 0, left = 0;
+	const auto evict   = [&](Pipeline& pipeline) {
 		if (evicted == MaxEvictions || pipeline.pipeline == nullptr || pipeline.remake == nullptr || pipeline.unoptimized ||
-		    pipeline.optimized != nullptr || pipeline.last_flip >= below)
+		    pipeline.optimized != nullptr)
 			return;
+		const bool idle  = pipeline.last_flip < below;
+		const bool other = scene_left && pipeline.last_flip < m_scene_flip && !scene_recipes.contains(pipeline.recipe);
+		if (!idle && !other) return;
 		DeviceFault::ForgetPipeline(static_cast<VkPipeline>(pipeline.pipeline));
 		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 		pipeline.pipeline = nullptr;
 		evicted++;
+		left += idle ? 0 : 1;
 	};
 	for (auto& [key, pipeline]: m_graphics_pipelines) evict(*pipeline);
 	for (auto& [id, pipeline]: m_compute_pipelines) evict(*pipeline);
-	if (evicted == 0) return;
+	if (scene_left && evicted < MaxEvictions) m_scene_swept = true;
+	g_pipeline_evictions.scene.fetch_add(left, std::memory_order_relaxed);
+	if (scene_left && m_scene_swept) {
+		std::printf("Pipelines of the worlds left (%s for %lld s): %llu evicted in all, %llu made again (%.0f ms)\n",
+		            SceneTags::Name(SceneTags::Current()).c_str(),
+		            static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(now - m_scene_since).count()),
+		            static_cast<unsigned long long>(g_pipeline_evictions.scene.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(g_pipeline_evictions.remade.load(std::memory_order_relaxed)),
+		            static_cast<double>(g_pipeline_evictions.remake_us.load(std::memory_order_relaxed)) / 1000.0);
+		std::fflush(stdout);
+	}
+	if (evicted == left) {
+		(void)g_pipeline_evictions.evicted.fetch_add(evicted, std::memory_order_relaxed);
+		return;
+	}
 	const auto total = g_pipeline_evictions.evicted.fetch_add(evicted, std::memory_order_relaxed) + evicted;
 	// (A line at most every 30 s: the totals so far.)
 	static auto logged = std::chrono::steady_clock::time_point {};
@@ -2424,10 +2547,14 @@ void PipelineCache::ReportSession() {
 	}
 	PipelineCacheLog("Pipelines compiled unoptimized first: {}, replaced by their optimized build: {}",
 	                 m_unoptimized_builds, m_replaced_pipelines.size());
-	PipelineCacheLog("Shader plans: {} out of memory at the end, {} brought back by the render thread, {} beside it ({} of "
+	PipelineCacheLog("Shader plans: {} out of memory at the end, {} brought back on demand, {} beside the render thread ({} of "
 	                 "those used)",
 	                 m_program_cache->plans_out, m_program_cache->plan_reloads, m_program_cache->plan_preloads,
 	                 m_program_cache->plan_preload_uses);
+	PipelineCacheLog("Shader plan demand: {} synchronous scratch-file loads in {:.2f} ms (at most {:.2f} ms), "
+	                 "{} ready worker results taken directly",
+	                 m_program_cache->plan_sync_loads, m_program_cache->plan_sync_load_ms,
+	                 m_program_cache->plan_sync_load_max_ms, m_program_cache->plan_worker_takeovers);
 	PipelineCacheLog("Made where first needed: {} programs translated ({:.0f} ms), {} pipelines ({:.0f} ms)",
 	                 m_program_cache->render_translations, m_program_cache->render_translate_ms, m_render_pipelines,
 	                 m_render_pipeline_ms);
@@ -2480,7 +2607,8 @@ void PipelineCache::ReportObjects(uint64_t id) const {
 	            "replaced_unoptimized=%zu optimizing=%zu programs=%zu jit_bytes=%zu stored_modules=%llu stored_spirv_mib=%llu "
 	            "store_file_mib=%llu store_loads=%llu store_load_misses=%llu plans_out=%zu plan_reloads=%llu plan_preloads=%llu plan_preload_uses=%llu prefetch_adopted=%zu "
 	            "prefetch_claimed=%zu prefetch_taken=%zu prefetch_take_early=%zu prefetch_finished=%zu prefetch_followed=%zu render_translations=%llu "
-	            "render_translate_ms=%.0f render_pipelines=%llu render_pipeline_ms=%.0f warmup_phase=%u\n",
+	            "render_translate_ms=%.0f render_pipelines=%llu render_pipeline_ms=%.0f warmup_phase=%u "
+	            "plan_sync_loads=%llu plan_sync_load_ms=%.2f plan_sync_load_max_ms=%.2f plan_worker_takeovers=%llu\n",
 	            static_cast<unsigned long long>(id), m_graphics_pipelines.size(), m_compute_pipelines.size(), m_pending_graphics_pipelines.size(),
 	            m_pending_compute_pipelines.size(), m_replaced_pipelines.size(), m_optimizing.size(),
 	            m_program_cache->programs.size(), JitArena::Used(), static_cast<unsigned long long>(store.modules),
@@ -2494,7 +2622,9 @@ void PipelineCache::ReportObjects(uint64_t id) const {
 	            prefetch ? prefetch->finished.load() : size_t {0}, prefetch ? prefetch->followed.load() : size_t {0},
 	            static_cast<unsigned long long>(m_program_cache->render_translations), m_program_cache->render_translate_ms,
 	            static_cast<unsigned long long>(m_render_pipelines), m_render_pipeline_ms,
-	            m_program_cache->warm_phase.load(std::memory_order_relaxed));
+	            m_program_cache->warm_phase.load(std::memory_order_relaxed),
+	            static_cast<unsigned long long>(m_program_cache->plan_sync_loads), m_program_cache->plan_sync_load_ms,
+	            m_program_cache->plan_sync_load_max_ms, static_cast<unsigned long long>(m_program_cache->plan_worker_takeovers));
 }
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -2562,6 +2692,17 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		if (low_ram && std::string_view(warmup) == "1")
 			PipelineCacheLog("Shader warmup: recording only (RAM {} MiB)", ram >> 20u);
 		m_program_cache->LoadWarmup(path, title + device, adopt_from);
+		// The warmup by scene (local/scene-tags.h): Demon's Souls reports the map it loads (libAmpr); KYTY_SCENE_WARMUP=0
+		// makes every recorded pipeline at start-up, as before.
+		const char* by_scene = std::getenv("KYTY_SCENE_WARMUP");
+		m_warmup_path        = path;
+		m_scene_warmup       = (by_scene == nullptr || std::string_view(by_scene) != "0") && title.starts_with("PPSA0134");
+		if (m_scene_warmup) {
+			auto scenes = path;
+			scenes += ".scenes";
+			if (!SceneTags::Load(scenes, title + device))
+				PipelineCacheLog("Scene warmup: ignoring invalid {}", Common::PathToString(scenes));
+		}
 		// KYTY_PIPELINE_WARMUP: 1 makes them all whatever the memory, 0 none; KYTY_PIPELINE_WARMUP_VIDEO_MIB: the compute
 		// pipelines' video memory cap instead of 1/16 of a small one's.
 		const char*            forced = std::getenv("KYTY_PIPELINE_WARMUP");
@@ -2614,15 +2755,47 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 	m_graphics.RefreshMemoryBudget();
 	const auto video_before = m_graphics.GetDeviceMemoryUsage();
 	if (settings.compile_shaders) programs.TranslateWarmup(m_mutex, settings.background, m_warmup_stop);
+	// Our launcher translates shaders before starting the guest. A scene cannot arrive until the guest runs:
+	// hand only the remaining pipeline work to the scene worker, retaining that bounded foreground translation.
+	// Offline precompile still builds everything synchronously and exits through the existing path below.
+	const char* only = std::getenv("KYTY_SHADER_WARMUP_ONLY");
+	if (!settings.background && settings.warm_pipelines && m_scene_warmup &&
+	    (only == nullptr || std::string_view(only) != "1") && !m_warmup_stop.load(std::memory_order_relaxed)) {
+		programs.warmup.StartWriter();
+		programs.warming = true;
+		// The foreground deadline must not expire while the player is in the menus. As with upstream background
+		// warmup, memory-pressure gates and shutdown cancellation govern the scene worker instead.
+		programs.warm_deadline = std::chrono::steady_clock::time_point::max();
+		settings.compile_shaders = false;
+		settings.background = true;
+		PipelineCacheLog("Scene warmup: foreground shader preparation finished; pipelines wait for the game's world");
+		m_warmup_thread = std::thread([this, settings] { RunWarmup(settings); });
+		return;
+	}
 	// (The recording's records the warmup did not translate: the shader prefetch's first.)
 	std::vector<std::vector<uint32_t>> recorded_inputs;
 	for (size_t i = 0; i < programs.warm_records.size(); ++i)
 		if (i >= programs.warm_permutations.size() || programs.warm_permutations[i] == nullptr)
 			recorded_inputs.emplace_back(programs.warm_records[i].begin(), programs.warm_records[i].end());
 	const auto memory_shaders = LocalPlatform::ProcessMemory();
+	// By scene (local/scene-tags.h): the shader prefetch at once, the pipelines once the game loads its first scene (after
+	// the title and menus, whose own it makes where needed), those of later scenes as it loads them (SceneLoop).
+	const bool by_scene = settings.background && settings.warm_pipelines && m_scene_warmup;
+	if (by_scene && !m_warmup_stop.load(std::memory_order_relaxed)) StartShaderPrefetch(std::move(recorded_inputs));
 	if (settings.warm_pipelines && !m_warmup_stop.load(std::memory_order_relaxed)) {
 		const auto pipelines_begin = std::chrono::steady_clock::now();
-		WarmPipelines(settings.compute_video, settings.background);
+		if (by_scene) {
+			// (No scene in SceneWaitSeconds: every recorded pipeline, as without scenes.)
+			constexpr int64_t SceneWaitSeconds = 300;
+			programs.warm_phase.store(0, std::memory_order_release);
+			while (SceneTags::Current() == SceneTags::None && !m_warmup_stop.load(std::memory_order_relaxed) &&
+			       std::chrono::steady_clock::now() - pipelines_begin < std::chrono::seconds(SceneWaitSeconds))
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			if (!m_warmup_stop.load(std::memory_order_relaxed))
+				WarmScene(SceneTags::Current(), settings.compute_video, true);
+		} else {
+			WarmPipelines(settings.compute_video, settings.background);
+		}
 		// What the driver had to compile is kept at once: the cache is otherwise written only
 		// at a normal exit, so after a crash the next launch compiled it all again (2+ minutes). (Beside the game: by
 		// the cache saver, once compiles settle: MainPipelineDone.)
@@ -2667,7 +2840,101 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 			std::_Exit(0);
 		}
 	}
+	if (by_scene) {
+		SceneLoop(settings.compute_video);
+		return;
+	}
 	if (!m_warmup_stop.load(std::memory_order_relaxed)) StartShaderPrefetch(std::move(recorded_inputs));
+}
+
+void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory) {
+	auto& programs = *m_program_cache;
+	m_scenes_warmed.insert(scene);
+	bool known = scene != SceneTags::None && SceneTags::Knows(scene);
+	std::unordered_set<uint64_t> only;
+	if (known) only = SceneTags::Recipes(scene);
+	// (Later scenes: the recording read again, records and recipes only appended to it, so the indices hold; each
+	// input's permutation looked up: none, the program left or the game made its own, its pipelines made where needed.
+	// warm_records views `records` until the pipelines are made.)
+	std::vector<std::vector<uint32_t>> records;
+	if (!in_memory) {
+		std::vector<std::vector<uint32_t>> recipes;
+		if (!LocalShaderWarmup::Cache::ReadInputs(m_warmup_path, records, recipes)) {
+			PipelineCacheLog("Scene warmup: {}: the recording could not be read", SceneTags::Name(scene));
+			return;
+		}
+		if (known) std::erase_if(recipes, [&](const auto& words) { return !only.contains(LocalShaderWarmup::RecipeKey(words)); });
+		std::vector<uint8_t> needed(records.size(), 0);
+		for (const auto& words: recipes) {
+			LocalShaderWarmup::PipelineRecord recipe;
+			LocalShaderWarmup::Reader         reader {words};
+			if (!LocalShaderWarmup::VisitPipeline(reader, recipe)) continue;
+			for (const auto index: {recipe.vertex, recipe.pixel, recipe.compute})
+				if (index < needed.size()) needed[index] = 1;
+		}
+		std::vector<std::pair<uint32_t, LocalShaderWarmup::Record>> decoded;
+		for (uint32_t i = 0; i < records.size(); ++i) {
+			if (needed[i] == 0) continue;
+			LocalShaderWarmup::Record record;
+			LocalShaderWarmup::Reader reader {records[i]};
+			if (LocalShaderWarmup::Visit(reader, record)) decoded.emplace_back(i, std::move(record));
+		}
+		Common::LockGuard lock(m_mutex);
+		programs.warming = true;
+		programs.warm_permutations.assign(records.size(), nullptr);
+		for (const auto& [index, record]: decoded) programs.warm_permutations[index] = programs.FindRecorded(record);
+		programs.warm_records.assign(records.begin(), records.end());
+		programs.warm_recipes = std::move(recipes);
+	}
+	// Tags of which fewer than half are among the recording's recipes are another recording's (it started over).
+	size_t present = 0;
+	if (known) {
+		for (const auto& words: programs.warm_recipes) present += only.contains(LocalShaderWarmup::RecipeKey(words)) ? 1 : 0;
+		if (present * 2 < only.size()) {
+			PipelineCacheLog("Scene warmup: {}: {} of its {} pipelines recorded, the recording's taken", SceneTags::Name(scene),
+			                 present, only.size());
+			known = false;
+		}
+	}
+	if (known) {
+		PipelineCacheLog("Scene warmup: {}: its {} recorded pipelines", SceneTags::Name(scene), present);
+	} else {
+		PipelineCacheLog("Scene warmup: {}: not known yet, every recorded pipeline",
+		                 scene != SceneTags::None ? SceneTags::Name(scene) : std::string("no scene"));
+		m_scene_warmed_all = true;
+		if (!in_memory)
+			for (const auto& words: programs.warm_recipes) only.insert(LocalShaderWarmup::RecipeKey(words));
+	}
+	WarmPipelines(compute_video, true, known || !in_memory ? &only : nullptr);
+	if (!in_memory) {
+		Common::LockGuard lock(m_mutex);
+		programs.warming = false;
+		programs.ReleaseRetired();
+		programs.warm_phase.store(0, std::memory_order_release);
+		programs.warm_permutations = {};
+		programs.warm_records      = {};
+		programs.warm_recipes      = {};
+	}
+}
+
+// The warmup thread after its start-up work: each scene the game loads gets its recorded pipelines (WarmScene; none
+// once every recorded one was made), and the scene tags are saved every SaveSeconds, until m_warmup_stop.
+void PipelineCache::SceneLoop(uint64_t compute_video) {
+	constexpr int64_t SaveSeconds = 15;
+	uint64_t          seen        = SceneTags::Generation();
+	auto              saved       = std::chrono::steady_clock::now();
+	while (!m_warmup_stop.load(std::memory_order_relaxed)) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		if (const auto now = std::chrono::steady_clock::now(); now - saved >= std::chrono::seconds(SaveSeconds)) {
+			(void)SceneTags::Save();
+			saved = now;
+		}
+		if (const auto generation = SceneTags::Generation(); generation != seen) {
+			seen             = generation;
+			const auto scene = SceneTags::Current();
+			if (!m_scene_warmed_all && !m_scenes_warmed.contains(scene)) WarmScene(scene, compute_video, false);
+		}
+	}
 }
 
 // KYTY_SHADER_PREFETCH (default on; 0 off): ProgramCache::StartPrefetch, the warmup's programs left out.
@@ -2710,7 +2977,7 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
 }
 
-void PipelineCache::WarmPipelines(uint64_t compute_video, bool background) {
+void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only) {
 	auto& programs = *m_program_cache;
 	const auto begin = std::chrono::steady_clock::now();
 	const auto get = [&](uint32_t index) -> ProgramCache::Permutation* {
@@ -2729,6 +2996,7 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background) {
 		const ProgramCache::Permutation*  pixel = nullptr;
 		const ProgramCache::Permutation*  compute = nullptr;
 		GraphicsPipelineKey               key;
+		uint64_t                          recipe_key = 0;
 	};
 	std::vector<Job> jobs;
 	jobs.reserve(programs.warm_recipes.size());
@@ -2739,6 +3007,8 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background) {
 	// for compute pipelines leaves out are the oldest.
 	for (auto recorded = programs.warm_recipes.rbegin(); recorded != programs.warm_recipes.rend(); ++recorded) {
 		Job job;
+		job.recipe_key = LocalShaderWarmup::RecipeKey(*recorded);
+		if (only != nullptr && !only->contains(job.recipe_key)) continue;
 		LocalShaderWarmup::Reader reader {*recorded};
 		if (!LocalShaderWarmup::VisitPipeline(reader, job.recipe)) { ++skipped; continue; }
 		if (job.recipe.compute != LocalShaderWarmup::NoShader) {
@@ -2754,6 +3024,13 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background) {
 			if (!graphics_keys.insert(job.key).second) continue;
 		}
 		jobs.push_back(std::move(job));
+	}
+	if (only != nullptr) {
+		// (A later scene's: what an earlier one made, or the game, stays.)
+		Common::LockGuard lock(m_mutex);
+		std::erase_if(jobs, [&](const Job& job) {
+			return job.compute != nullptr ? m_compute_pipelines.contains(job.compute->handle.id) : m_graphics_pipelines.contains(job.key);
+		});
 	}
 	if (background) {
 		programs.warm_total.store(jobs.size(), std::memory_order_relaxed);
@@ -2775,6 +3052,12 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background) {
 		for (size_t n; (n = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
 			if (m_warmup_stop.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= programs.warm_deadline)
 				return;
+			// Scene preload runs beside the guest even when shader translation ran before boot. Apply the same RAM
+			// and commit-headroom gate as speculative shader work; demand compilation remains unrestricted.
+			if (background && !Kyty::PrefetchMemory::WaitForRoom(
+			        [&] { return m_warmup_stop.load(std::memory_order_relaxed); },
+			        [] { return ProgramCache::BackgroundShaderMemoryReady(); },
+			        [] { std::this_thread::sleep_for(std::chrono::milliseconds(250)); })) return;
 			auto& job      = jobs[n];
 			auto  pipeline = std::make_unique<Pipeline>();
 			if (job.compute) {
@@ -2837,6 +3120,7 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background) {
 				Common::LockGuard lock(m_mutex);
 				for (auto& [n, pipeline]: batch) {
 					const auto& job   = jobs[n];
+					pipeline->recipe  = job.recipe_key;
 					const bool  added = job.compute != nullptr
 					                        ? m_compute_pipelines.try_emplace(job.compute->handle.id, std::move(pipeline)).second
 					                        : m_graphics_pipelines.try_emplace(job.key, std::move(pipeline)).second;
@@ -2926,8 +3210,8 @@ static uint32_t ReadStaticFeatures() {
 	return ReadStaticStamp().first;
 }
 
-// `made`: the store holds this precompile's pipelines alone. (The precompile tool's merge: the emulator has no use.)
-[[maybe_unused]] static void WriteStaticFeatures(bool made) {
+// `made`: the store holds this precompile's pipelines alone.
+static bool WriteStaticFeatures(bool made) {
 	namespace Translate = ShaderRecompiler::Frontend;
 	const auto      used      = Translate::TranslatorFeatureSet();
 	const auto      features  = made ? used : ReadStaticFeatures();
@@ -2938,10 +3222,21 @@ static uint32_t ReadStaticFeatures() {
 	{
 		std::ofstream file(temporary, std::ios::trunc);
 		file << features << ' ' << used << '\n';
-		if (!file) return;
+		file.close();
+		if (!file) {
+			PipelineCacheLog("Static pipeline store: cannot write translation feature stamp {}", temporary.string());
+			std::filesystem::remove(temporary, error);
+			return false;
+		}
 	}
 	std::filesystem::rename(temporary, path, error);
+	if (error) {
+		PipelineCacheLog("Static pipeline store: cannot replace translation feature stamp {}: {}", path.string(), error.message());
+		std::filesystem::remove(temporary, error);
+		return false;
+	}
 	PipelineCacheLog("Static pipeline store: made with translation features {:#x} (this precompile's: {:#x})", features, used);
+	return true;
 }
 
 // Its pipelines as the driver's binaries (VK_KHR_pipeline_binary), read when needed: the driver keeps a
@@ -3333,6 +3628,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 
 bool PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+	if (m_scene_warmup && !SceneTags::Save()) PipelineCacheLog("Scene warmup: saving the scene tags failed");
 	const bool inputs_saved = m_program_cache->warmup.Save();
 	if (!inputs_saved) PipelineCacheLog("Shader warmup: cache save failed");
 	else if (m_program_cache->warmup.Enabled()) PipelineCacheLog("Shader warmup: saved {} inputs and {} pipelines",
@@ -3841,6 +4137,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	if (recipe.vertex != LocalShaderWarmup::NoShader &&
 	    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
 		m_program_cache->warmup.AddPipeline(recipe);
+		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
 	}
 
 	return iter->second.get();
@@ -3896,6 +4193,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	recipe.compute = m_program_cache->RecordedIndex(compute_program);
 	if (recipe.compute != LocalShaderWarmup::NoShader) {
 		m_program_cache->warmup.AddPipeline(recipe);
+		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
 	}
 
 	return *iter->second;
@@ -3957,3 +4255,4 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderCom
 #endif
 
 } // namespace Libs::Graphics
+

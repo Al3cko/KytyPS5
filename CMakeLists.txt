@@ -520,6 +520,9 @@ if (WIN32)
 	target_link_libraries(kyty_shader_precompile opengl32 setupapi ws2_32)
 endif()
 
+add_executable(prefetch_memory_gate_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PrefetchMemoryGateTests.cpp")
+target_include_directories(prefetch_memory_gate_tests PRIVATE ${inc_headers})
+
 add_executable(lane_local_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LaneLocalTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp"
@@ -654,6 +657,13 @@ add_executable(save_data_backup_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataBackupTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/saveDataBackup.cpp")
 target_include_directories(save_data_backup_tests PRIVATE ${inc_headers})
+add_executable(psml_context_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PsmlContextTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_include_directories(psml_context_tests PRIVATE ${inc_headers})
+target_link_libraries(psml_context_tests common fmt::fmt)
 add_kyty_full_emulator_test(fiber_migration_tests
 	"${KYTY_TESTS_DIR}/FiberMigrationTests.cpp")
 
@@ -707,6 +717,40 @@ endif()
 
 if(BUILD_TESTING)
 	find_package(Threads REQUIRED)
+	add_executable(fresh_memory_tests EXCLUDE_FROM_ALL tests/FreshMemoryTests.cpp)
+	target_include_directories(fresh_memory_tests PRIVATE ${inc_headers})
+	add_test(NAME fresh_memory COMMAND $<TARGET_FILE:fresh_memory_tests>)
+	set_tests_properties(fresh_memory PROPERTIES ENVIRONMENT "KYTY_FRESH_MEMORY=1")
+	add_test(NAME fresh_memory_disabled COMMAND $<TARGET_FILE:fresh_memory_tests>)
+	set_tests_properties(fresh_memory_disabled PROPERTIES ENVIRONMENT "KYTY_FRESH_MEMORY=0")
+	add_test(NAME fresh_memory_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fresh-memory-only)
+	set_tests_properties(fresh_memory_gpu PROPERTIES ENVIRONMENT "KYTY_FRESH_MEMORY=1")
+	add_test(NAME fresh_memory_gpu_disabled COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fresh-memory-only)
+	set_tests_properties(fresh_memory_gpu_disabled PROPERTIES ENVIRONMENT "KYTY_FRESH_MEMORY=0")
+	add_test(NAME buffer_stream_gaps COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-stream-gaps-only)
+	add_executable(memory_busy_range_tests EXCLUDE_FROM_ALL tests/MemoryBusyRangeTests.cpp)
+	add_executable(frame_gen_lifecycle_tests EXCLUDE_FROM_ALL tests/FrameGenLifecycleTests.cpp)
+	target_include_directories(frame_gen_lifecycle_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME frame_gen_lifecycle COMMAND $<TARGET_FILE:frame_gen_lifecycle_tests>)
+	add_executable(dlss_scene_tests EXCLUDE_FROM_ALL tests/DlssSceneTests.cpp)
+	target_include_directories(dlss_scene_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME dlss_scene COMMAND $<TARGET_FILE:dlss_scene_tests>)
+	add_test(NAME psml_context COMMAND $<TARGET_FILE:psml_context_tests>)
+	target_include_directories(memory_busy_range_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME memory_busy_range COMMAND $<TARGET_FILE:memory_busy_range_tests>)
+	add_executable(cache_gc_policy_tests EXCLUDE_FROM_ALL tests/CacheGcPolicyTests.cpp)
+	add_executable(scene_tags_tests EXCLUDE_FROM_ALL tests/SceneTagsTests.cpp)
+	target_include_directories(scene_tags_tests PRIVATE "${KYTY_SOURCE_DIR}" "${KYTY_THIRD_PARTY_DIR}/xxhash")
+	target_link_libraries(scene_tags_tests PRIVATE xxhash)
+	add_test(NAME scene_tags COMMAND $<TARGET_FILE:scene_tags_tests>)
+	target_include_directories(cache_gc_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME cache_gc_policy COMMAND $<TARGET_FILE:cache_gc_policy_tests>)
+	add_executable(image_pool_tests EXCLUDE_FROM_ALL tests/ImagePoolTests.cpp)
+	target_include_directories(image_pool_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME image_pool COMMAND $<TARGET_FILE:image_pool_tests>)
+	add_executable(writeback_verify_tests EXCLUDE_FROM_ALL tests/WritebackVerifyTests.cpp)
+	target_include_directories(writeback_verify_tests PRIVATE "${KYTY_SOURCE_DIR}/local")
+	add_test(NAME writeback_verify COMMAND $<TARGET_FILE:writeback_verify_tests>)
 	add_executable(atrac9_initialization_tests EXCLUDE_FROM_ALL tests/Atrac9InitializationTests.cpp)
 	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
 	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
@@ -722,6 +766,9 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_translator_features COMMAND $<TARGET_FILE:shader_cfg_tests> --filter TestTranslatorFeatures)
+	add_test(NAME lane_local COMMAND $<TARGET_FILE:lane_local_tests>)
+	add_test(NAME prefetch_memory_gate COMMAND $<TARGET_FILE:prefetch_memory_gate_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -736,12 +783,17 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME kernel_apr_identity COMMAND $<TARGET_FILE:kernel_file_system_tests> --apr-only)
 	add_test(NAME save_data_capacity COMMAND $<TARGET_FILE:save_data_capacity_tests>)
 	add_test(NAME save_data_backup COMMAND $<TARGET_FILE:save_data_backup_tests>)
 	add_test(NAME fiber_migration COMMAND $<TARGET_FILE:fiber_migration_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_wave64 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave64-only)
+	add_test(NAME shader_wave_branches COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-branch-only)
+	set_tests_properties(shader_wave64 shader_wave_branches PROPERTIES
+		ENVIRONMENT "KYTY_LANE_LOCAL_COOP=1;KYTY_TABLE_SLOTS_AT_USE=1")
 	add_test(NAME native_dispatch_indirect
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --native-dispatch-indirect-only)
 	add_test(NAME cpu_write_window COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cpu-write-window-only)
@@ -774,6 +826,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-resolve-cache-only)
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
+	add_test(NAME texture_layer_ranges
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-layer-ranges-only)
+	add_test(NAME texture_reclaim_source
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-reclaim-source-only)
+	set_tests_properties(texture_reclaim_source PROPERTIES ENVIRONMENT "KYTY_TEST_RECLAIM=1")
 	add_test(NAME host_image_allocation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
 	add_test(NAME texture_cache_image_views
@@ -782,6 +839,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
 	add_test(NAME texture_cache_depth_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
+	add_test(NAME texture_cache_oversized_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --oversized-image-readback-only)
+	add_test(NAME dynamic_rendering_resume
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rendering-resume-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
@@ -789,6 +850,10 @@ if(BUILD_TESTING)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
+		add_test(NAME finite_sparse_buffer_descriptor
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --finite-sparse-buffer-only)
+		add_test(NAME storage_texture_descriptors
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-descriptors-only)
 		add_test(NAME texture_cache_image_overlap
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
 		add_test(NAME texture_cache_htile_clear
@@ -798,6 +863,16 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		fresh_memory_tests
+		lane_local_tests
+		prefetch_memory_gate_tests
+		cache_gc_policy_tests
+		scene_tags_tests
+		image_pool_tests
+		writeback_verify_tests
+		memory_busy_range_tests
+		frame_gen_lifecycle_tests
+		dlss_scene_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -934,8 +1009,8 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 			"${recording_generated}"
 		DEPENDS "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
 		VERBATIM)
-	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests xpr_replay_tests
-			virtual_memory_allocation_tests)
+	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests xpr_replay_tests
+			virtual_memory_allocation_tests kernel_file_system_tests)
 		target_sources(${recording_target} PRIVATE
 			"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
 		target_include_directories(${recording_target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -948,7 +1023,7 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
 
 	foreach(native_resource_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests
-			resource_tracking_tests resource_materialization_tests virtual_memory_allocation_tests)
+			resource_tracking_tests resource_materialization_tests virtual_memory_allocation_tests kernel_file_system_tests)
 		target_sources(${native_resource_target} PRIVATE "${lod_stats_pack_header}")
 		target_compile_definitions(${native_resource_target} PRIVATE KYTY_LOCAL_NATIVE_RESOURCES=1)
 		target_link_libraries(${native_resource_target} ${CMAKE_DL_LIBS})

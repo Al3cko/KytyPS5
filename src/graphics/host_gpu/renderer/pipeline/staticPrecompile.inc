@@ -1173,8 +1173,7 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune, bool keep_shar
 // translation features they were made with; a precompile's last merge (`stamp`) with those it tried (WriteStaticFeatures).
 bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards, bool stamp) {
 	const auto stamped = [&](bool merged) {
-		if (merged && (prune || stamp)) WriteStaticFeatures(prune);
-		return merged;
+		return merged && (!(prune || stamp) || WriteStaticFeatures(prune));
 	};
 	if (graphics.pipeline_binaries_enabled) return stamped(MergeBinaryShards(graphics, prune, keep_shards));
 	if (StaticBlobsMode(graphics)) return stamped(MergeBlobShards(graphics, prune, keep_shards));

@@ -13,6 +13,8 @@ namespace PerfOverlay {
 // 0 off, 1 the frame rate with the frame-time graph, 2 detailed (GPU, processor, memory): KYTY_FPS_HUD at start-up
 // (the launcher's Overlay), then F8 in the game (CycleLevel).
 [[nodiscard]] int Level();
+// Home: hide/show the configured panel (detailed if it started disabled).
+void ToggleVisibility();
 // The next level (off, frame rate, detailed, off...); returns it.
 int CycleLevel();
 

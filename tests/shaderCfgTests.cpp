@@ -49,6 +49,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -1715,6 +1716,157 @@ void TestNewShaderRecompilerSoppMarkers() {
           result.spirv.end(),
       "SPIR-V barrier does not use workgroup acquire-release memory semantics");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+struct RestoreTranslatorFeatures {
+  uint32_t saved = ShaderRecompiler::Frontend::TranslatorFeatureSet();
+  ~RestoreTranslatorFeatures() {
+    ShaderRecompiler::Frontend::SetTranslatorFeatures(saved);
+  }
+};
+
+void TestTranslatorFeaturesCooperativeHalves() {
+  using namespace ShaderRecompiler;
+  RestoreTranslatorFeatures restore;
+  // AMD RDNA2 ISA guide 70648: VOPC V_CMPX_NE_U32 (213), SOPP
+  // S_CBRANCH_EXECZ (8), VOP1 V_READFIRSTLANE_B32 (2). A half may have
+  // no active lanes, but both halves must reach the read's workgroup barrier.
+  const uint32_t shader[] = {
+      EncodeVopc(0xd5, 128, 0),     // v_cmpx_ne_u32 exec, 0, v0
+      EncodeSopp(0x08, 4),          // s_cbranch_execz end
+      EncodeVop1(0x02, 5, 256),     // v_readfirstlane_b32 s5, v0
+      EncodeVop1(0x01, 1, 5),       // v_mov_b32 v1, s5
+      EncodeMubuf0(0x1c), EncodeMubuf1(1, 2, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.host_subgroup_size = 32;
+  compute.thread_ids_num = 1;
+  auto data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = data;
+
+  Frontend::SetTranslatorFeatures(0);
+  Check((Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureCooperativeHalves) == 0,
+        "cooperative test requires KYTY_LANE_LOCAL_COOP to be unset");
+  auto ordinary = RecompileForTest(shader, options);
+  Check(!ordinary.program.lane_local && !ordinary.program.lane_cooperative &&
+            SpirvInstructionOpcodeCount(ordinary.spirv, 224u) == 0u,
+        "disabled cooperative feature did not retain the two-lanes-per-invocation path");
+  CheckSpirvBinaryValidates(ordinary.spirv);
+
+  Frontend::SetTranslatorFeatures(Frontend::TranslatorFeatureCooperativeHalves);
+  Check((Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureCooperativeHalves) != 0,
+        "cooperative test requires KYTY_LANE_LOCAL_COOP to be unset");
+  auto result = RecompileForTest(shader, options);
+  Check(result.program.lane_local && result.program.lane_cooperative &&
+            result.program.cooperative_reads == std::vector<uint32_t>{8u} &&
+            result.program.cooperative_branches == std::vector<uint32_t>{4u},
+        "cooperative proof did not promote the read and its enclosing EXEC branch");
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto& binary = result.spirv;
+  std::unordered_map<uint32_t, size_t> definitions;
+  std::unordered_map<uint32_t, uint32_t> constants;
+  std::vector<size_t> barriers, branches;
+  for (size_t i = 5; i < binary.size(); i += binary[i] >> 16u) {
+    const auto op = binary[i] & 0xffffu;
+    if (op == 43u && (binary[i] >> 16u) == 4u) constants[binary[i + 2]] = binary[i + 3];
+    if (op == 61u || op == 65u || op == 128u || op == 168u || op == 171u || op == 197u)
+      definitions[binary[i + 2]] = i;
+    if (op == 224u) {
+      barriers.push_back(i);
+      Check(constants.at(binary[i + 1]) == 2u && constants.at(binary[i + 2]) == 2u &&
+                constants.at(binary[i + 3]) == 264u,
+            "cooperative exchange lost workgroup acquire-release synchronization");
+    }
+    if (op == 250u) branches.push_back(i);
+  }
+  Check(barriers.size() == 2u, "cooperative branch/read did not emit exactly two exchanges");
+  std::vector<size_t> enclosing;
+  for (auto branch : branches)
+    if (branch < barriers[1]) enclosing.push_back(branch);
+  Check(enclosing.size() == 1u && barriers[0] < enclosing[0],
+        "cooperative read barrier is behind a per-invocation EXEC guard");
+  // EXECZ must test the OR of the two halves' shared results, rather than a
+  // subgroup-local ballot. This is the only conditional enclosing the read.
+  auto condition = definitions.at(binary[enclosing[0] + 1]);
+  Check((binary[condition] & 0xffffu) == 168u, "EXECZ lost its logical inversion");
+  condition = definitions.at(binary[condition + 3]);
+  Check((binary[condition] & 0xffffu) == 171u, "wave branch lost its zero comparison");
+  const auto bits = definitions.at(binary[condition + 3]);
+  Check((binary[bits] & 0xffffu) == 197u, "wave branch does not combine both halves");
+  for (uint32_t half = 0; half < 2; ++half) {
+    const auto load = definitions.at(binary[bits + 3 + half]);
+    Check((binary[load] & 0xffffu) == 61u, "wave branch does not read shared half results");
+    const auto pointer = definitions.at(binary[load + 3]);
+    Check((binary[pointer] & 0xffffu) == 65u, "wave branch half result is not an exchange slot");
+    const auto offset = definitions.at(binary[pointer + 4]);
+    Check((binary[offset] & 0xffffu) == 128u &&
+              constants.at(binary[offset + 4]) == half * 32u,
+          "wave branch did not read slots from both 32-lane halves");
+  }
+  Check(Common::ContainsStr(DisassembleSpirvBinary(binary), "LocalSize 64 1 1"),
+        "cooperative shader did not retain all 64 workgroup invocations");
+  for (const auto [threads, subgroup] : {std::pair{32u, 32u}, std::pair{128u, 32u}, std::pair{64u, 64u}}) {
+    compute.threads_num[0] = threads;
+    compute.host_subgroup_size = subgroup;
+    auto gated = RecompileForTest(shader, options);
+    Check(!gated.program.lane_cooperative && SpirvInstructionOpcodeCount(gated.spirv, 224u) == 0u,
+          "cooperative exchanges escaped the single-wave/two-subgroup workgroup gate");
+    CheckSpirvBinaryValidates(gated.spirv);
+  }
+}
+
+void TestTranslatorFeaturesTableSlotsAtUse() {
+  using namespace ShaderRecompiler;
+  RestoreTranslatorFeatures restore;
+  // AMD 70648 SOPC/SOPP/SMEM formats. The scalar load is conditional and live
+  // through the store, so a table load at function entry is observably misplaced.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 12, 128), EncodeSopp(0x05, 5),
+      EncodeSmem0(0x00, 4, 0), 125u << 25u,
+      EncodeVop1(0x01, 1, 4),
+      EncodeMubuf0(0x1c), EncodeMubuf1(1, 2, 0),
+      EncodeSopp(0x01),
+  };
+  auto data = ImageTestUserData();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = data;
+  options.table_mode = true;
+  const auto compile = [&](bool enabled) {
+    Frontend::SetTranslatorFeatures(enabled ? Frontend::TranslatorFeatureTableSlotsAtUse : 0u);
+    Check(((Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureTableSlotsAtUse) != 0) == enabled,
+          "table-slot test requires KYTY_TABLE_SLOTS_AT_USE to be unset");
+    auto result = RecompileForTest(shader, options, ReadZeroTestMemory);
+    Check(result.program.table_mode && result.program.table_slots_at_use == enabled &&
+              result.program.table_plan.slots.size() == 1u && result.program.table_plan.gpu[0] != 0u,
+          "table-slot fixture did not compile a live table-mode slot");
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto& binary = result.spirv;
+    std::unordered_set<uint32_t> physical_types, physical_pointers;
+    uint32_t main_id = 0, function = 0, before = 0, after = 0;
+    bool branched = false;
+    for (size_t i = 5; i < binary.size(); i += binary[i] >> 16u) {
+      const auto op = binary[i] & 0xffffu;
+      if (op == 15u) main_id = binary[i + 2];
+      if (op == 32u && binary[i + 2] == 5349u) physical_types.insert(binary[i + 1]);
+      if (op == 120u && physical_types.contains(binary[i + 1])) physical_pointers.insert(binary[i + 2]);
+      if (op == 54u) function = binary[i + 2];
+      if (op == 56u) function = 0;
+      if (function != main_id) continue;
+      if (op == 250u) branched = true;
+      if (op == 61u && physical_pointers.contains(binary[i + 3])) (branched ? after : before)++;
+    }
+    Check(branched, "table-slot fixture lost its conditional branch");
+    return std::pair{before, after};
+  };
+  const auto entry = compile(false);
+  const auto at_use = compile(true);
+  Check(entry.second == 0u && at_use.second == 1u && entry.first == at_use.first + 1u,
+        "table slot was not moved from the prologue to its conditional use exactly once");
 }
 
 void TestNewShaderRecompilerSopkWaitcntMarkers() {
@@ -8932,6 +9084,7 @@ void TestComputeDispatchWaveSize() {
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
+      EncodeVopc(0xd4, 144, 0), // v_cmpx_gt_u32 16, v0: only lanes 0..15 load.
       EncodeMubuf0(0x0c),
       EncodeMubuf1(0, 0, 1), // buffer_load_dword
                              // v0
@@ -8940,11 +9093,13 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
       EncodeSopp(0x01),
   };
 
-  // A partial wave64 on a 32-wide host starts with a lane-dependent EXEC, so the guard is a
-  // branch (a guard on a constant EXEC is emitted as straight-line code).
+  // Explicitly narrow EXEC with the invocation's x id. A partial workgroup alone
+  // does not require an EXEC branch in a lane-local shader: Vulkan already
+  // suppresses invocations outside LocalSize, so that fixture optimized to true.
   auto compute = RegressionComputeInputInfo();
   compute.threads_num[0]     = 48;
   compute.host_subgroup_size = 32;
+  compute.thread_ids_num = 1;
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.input_info.compute = &compute;
   options.dump_ir = true;
@@ -8955,6 +9110,10 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
+  if (std::getenv("KYTY_TEST_DUMP_BUFFER_EXEC") != nullptr) {
+    std::puts(source.c_str());
+    std::fflush(stdout);
+  }
   const auto exec_branch =
       Common::FindIndex(source, std::string("OpBranchConditional"), 0);
   const auto array_length =
@@ -10190,13 +10349,12 @@ void TestTypedEntryStateIsMinimal() {
   using namespace ShaderRecompiler;
 
   const auto check = [](uint32_t wave_size) {
+    // Lane-local analysis builds its own CFG from decoded instructions. An
+    // empty decoded program with a hand-made return block is not a shader.
+    const uint32_t shader[] = {EncodeSopp(0x01)}; // s_endpgm
     Decoder::Program decoded;
-    CFG::Graph graph;
-    CFG::BasicBlock source_block;
-    source_block.id = 0;
-    source_block.terminator.kind = CFG::TerminatorKind::Return;
-    graph.blocks.push_back(std::move(source_block));
-    graph.entry_block = 0;
+    Decoder::DecodeProgram(std::span{shader}, decoded);
+    const auto graph = CFG::BuildGraph(decoded);
     IR::Program values;
     ShaderComputeInputInfo compute{};
     Frontend::TranslateOptions translate_options{};
@@ -10591,6 +10749,51 @@ void TestValuePhiValidation() {
                    "validation");
   }
 #endif
+}
+
+void TestMaskedShiftConstantPropagation() {
+  using namespace ShaderRecompiler::IR;
+  for (const uint32_t count : {0u, 1u, 8u, 31u, 32u, 33u, 40u, 63u, 64u, UINT32_MAX}) {
+    for (const uint32_t mask : {0u, 1u, 0xffu, 0x7fffffffu, 0x80000000u, UINT32_MAX}) {
+      for (const bool swapped : {false, true}) {
+        for (const bool shared : {false, true}) {
+          Block block;
+          IREmitter ir(&block);
+          const auto input = ir.GetUserData(static_cast<ScalarReg>(0));
+          const auto shifted = ir.Emit(ValueOpcode::ShiftLeftLogical32, {input, Value(count)});
+          const auto result = ir.Emit(ValueOpcode::BitwiseAnd32,
+              swapped ? std::initializer_list<Value>{Value(mask), shifted}
+                      : std::initializer_list<Value>{shifted, Value(mask)});
+          const auto other = shared ? ir.Emit(ValueOpcode::IAdd32, {shifted, Value(1u)}) : Value{};
+          ConstantPropagationPass({&block});
+          const bool zero = ((UINT32_MAX << (count & 31u)) & mask) == 0u;
+          Check(zero ? result.Resolve() == Value(0u) : !result.Resolve().IsImmediate(),
+                "masked shift retained impossible bits or discarded possible bits");
+          if (shared) {
+            Check(other.Resolve().Instruction()->Arg(0).Resolve() == shifted.Resolve(),
+                  "folding a masked shift changed its other consumer");
+          }
+          constexpr uint32_t source = 0xa5f03c69u;
+          input.Instruction()->ReplaceUsesWith(Value(source));
+          ConstantPropagationPass({&block});
+          const uint32_t expected = source << (count & 31u);
+          Check(result.Resolve() == Value(expected & mask) &&
+                    (!shared || other.Resolve() == Value(expected + 1u)),
+                "masked shift folding changed a runtime result");
+        }
+      }
+    }
+  }
+
+  Block block;
+  IREmitter ir(&block);
+  const auto input = ir.GetUserData(static_cast<ScalarReg>(0));
+  const auto count = ir.GetUserData(static_cast<ScalarReg>(1));
+  const auto shifted = ir.Emit(ValueOpcode::ShiftLeftLogical32, {input, count});
+  const auto result = ir.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(0xffu)});
+  ConstantPropagationPass({&block});
+  Check(result.Resolve().Instruction()->GetOpcode() == ValueOpcode::BitwiseAnd32,
+        "a variable shift count was treated as a constant");
 }
 
 void TestU64ShiftConstantPropagation() {
@@ -13033,144 +13236,178 @@ void TestShaderWarmupCacheFiles() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char** argv) {
   using namespace Libs::Graphics;
 
-  EnsureConfigInitialized();
+  const char* filter = nullptr;
+  bool list_only = false;
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-exec-only") == 0) {
+    filter = "TestNewShaderRecompilerBufferLoadsGuardedByExec";
+  } else if (argc == 2 && std::strcmp(argv[1], "--masked-shift-only") == 0) {
+    filter = "TestMaskedShiftConstantPropagation";
+  } else if (argc == 2 && std::strcmp(argv[1], "--list") == 0) {
+    list_only = true;
+  } else if (argc == 3 && std::strcmp(argv[1], "--filter") == 0 && argv[2][0]) {
+    filter = argv[2];
+  } else if (argc != 1) {
+    std::fprintf(stderr, "Usage: shader_cfg_tests [--list|--filter substring|--masked-shift-only|--buffer-exec-only]\n");
+    return 2;
+  }
+  if (!list_only) { EnsureConfigInitialized(); }
+  unsigned selected = 0;
+  const auto run = [&](const char* name, void (*test)()) {
+    if (filter && !std::strstr(name, filter)) { return; }
+    ++selected;
+    if (list_only) { std::puts(name); return; }
+    // Preserve the fixture name on fatal exits, including redirected logs.
+    std::printf("[ RUN      ] %s\n", name);
+    std::fflush(stdout);
+    test();
+    std::printf("[       OK ] %s\n", name);
+    std::fflush(stdout);
+  };
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
-  TestShaderWarmupCacheFiles();
+  run("TestShaderWarmupCacheFiles", TestShaderWarmupCacheFiles);
 #endif
-  TestResourceDescriptorClassification();
-  TestNativeShaderResourceDependencies();
-  TestNormalizedImageContracts();
-  TestSpirvRequirementsAnalysis();
-  TestNewShaderRecompilerSpirvSizeBaselines();
-  TestDemandDrivenSpirvDeclarations();
-  TestNewShaderRecompilerSMovB32();
-  TestNewShaderRecompilerClipDisabledPosition();
-  TestNewShaderRecompilerAuxPositionExports();
-  TestNewShaderRecompilerNativeWideScalarMemoryIr();
-  TestNewShaderRecompilerNativeWideBufferIr();
-  TestNewShaderRecompilerScalarB64LaneTranslation();
-  TestNewShaderRecompilerMubufFormatTranslation();
-  TestNewShaderRecompilerTypedBufferTranslation();
-  TestNewShaderRecompilerDsReadWrite2Translation();
-  TestNewShaderRecompilerDsWideAndAtomicTranslation();
-  TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
-  TestNewShaderRecompilerScalarMemoryBindingDomains();
+  run("TestResourceDescriptorClassification", TestResourceDescriptorClassification);
+  run("TestNativeShaderResourceDependencies", TestNativeShaderResourceDependencies);
+  run("TestNormalizedImageContracts", TestNormalizedImageContracts);
+  run("TestSpirvRequirementsAnalysis", TestSpirvRequirementsAnalysis);
+  run("TestNewShaderRecompilerSpirvSizeBaselines", TestNewShaderRecompilerSpirvSizeBaselines);
+  run("TestDemandDrivenSpirvDeclarations", TestDemandDrivenSpirvDeclarations);
+  run("TestTranslatorFeaturesCooperativeHalves", TestTranslatorFeaturesCooperativeHalves);
+  run("TestTranslatorFeaturesTableSlotsAtUse", TestTranslatorFeaturesTableSlotsAtUse);
+  run("TestNewShaderRecompilerSMovB32", TestNewShaderRecompilerSMovB32);
+  run("TestNewShaderRecompilerClipDisabledPosition", TestNewShaderRecompilerClipDisabledPosition);
+  run("TestNewShaderRecompilerAuxPositionExports", TestNewShaderRecompilerAuxPositionExports);
+  run("TestNewShaderRecompilerNativeWideScalarMemoryIr", TestNewShaderRecompilerNativeWideScalarMemoryIr);
+  run("TestNewShaderRecompilerNativeWideBufferIr", TestNewShaderRecompilerNativeWideBufferIr);
+  run("TestNewShaderRecompilerScalarB64LaneTranslation", TestNewShaderRecompilerScalarB64LaneTranslation);
+  run("TestNewShaderRecompilerMubufFormatTranslation", TestNewShaderRecompilerMubufFormatTranslation);
+  run("TestNewShaderRecompilerTypedBufferTranslation", TestNewShaderRecompilerTypedBufferTranslation);
+  run("TestNewShaderRecompilerDsReadWrite2Translation", TestNewShaderRecompilerDsReadWrite2Translation);
+  run("TestNewShaderRecompilerDsWideAndAtomicTranslation", TestNewShaderRecompilerDsWideAndAtomicTranslation);
+  run("TestNewShaderRecompilerCapturedVop1SdwaByteConvert", TestNewShaderRecompilerCapturedVop1SdwaByteConvert);
+  run("TestNewShaderRecompilerScalarMemoryBindingDomains", TestNewShaderRecompilerScalarMemoryBindingDomains);
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
-  TestNewShaderDecoderArchitecture();
-  TestImageAddressOperands();
-  TestSopkCompareImmediateExtension();
-  TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
-  TestNewShaderRecompilerIrLookupMissFailsExplicitly();
-  TestNewShaderRecompilerRejectsDppOn64BitCompares();
-  TestPsInputCountRegisterDecode();
-  TestPixelAncillaryLayerInput();
-  TestNewShaderRecompilerUnbasedFlatUsesBda();
-  TestNewShaderRecompilerFlatUserPointerUsesDma();
-  TestNewShaderRecompilerFlatAddressDomainsUseDma();
-  TestNewShaderRecompilerCfgStraightLine();
-  TestNewShaderRecompilerCfgIfElse();
-  TestNewShaderRecompilerCfgConsecutiveNativePhis();
-  TestNewShaderRecompilerStructuredU64Phi();
-  TestNewShaderRecompilerCfgTerminalExitMergePS();
-  TestNewShaderRecompilerCfgPostEndTargetMergePS();
-  TestNewShaderRecompilerCfgLoopBreakContinue();
+  run("TestNewShaderDecoderArchitecture", TestNewShaderDecoderArchitecture);
+  run("TestImageAddressOperands", TestImageAddressOperands);
+  run("TestSopkCompareImmediateExtension", TestSopkCompareImmediateExtension);
+  run("TestNewShaderRecompilerCapturedVopcSdwaCmpxClass", TestNewShaderRecompilerCapturedVopcSdwaCmpxClass);
+  run("TestNewShaderRecompilerIrLookupMissFailsExplicitly", TestNewShaderRecompilerIrLookupMissFailsExplicitly);
+  run("TestNewShaderRecompilerRejectsDppOn64BitCompares", TestNewShaderRecompilerRejectsDppOn64BitCompares);
+  run("TestPsInputCountRegisterDecode", TestPsInputCountRegisterDecode);
+  run("TestPixelAncillaryLayerInput", TestPixelAncillaryLayerInput);
+  run("TestNewShaderRecompilerUnbasedFlatUsesBda", TestNewShaderRecompilerUnbasedFlatUsesBda);
+  run("TestNewShaderRecompilerFlatUserPointerUsesDma", TestNewShaderRecompilerFlatUserPointerUsesDma);
+  run("TestNewShaderRecompilerFlatAddressDomainsUseDma", TestNewShaderRecompilerFlatAddressDomainsUseDma);
+  run("TestNewShaderRecompilerCfgStraightLine", TestNewShaderRecompilerCfgStraightLine);
+  run("TestNewShaderRecompilerCfgIfElse", TestNewShaderRecompilerCfgIfElse);
+  run("TestNewShaderRecompilerCfgConsecutiveNativePhis", TestNewShaderRecompilerCfgConsecutiveNativePhis);
+  run("TestNewShaderRecompilerStructuredU64Phi", TestNewShaderRecompilerStructuredU64Phi);
+  run("TestNewShaderRecompilerCfgTerminalExitMergePS", TestNewShaderRecompilerCfgTerminalExitMergePS);
+  run("TestNewShaderRecompilerCfgPostEndTargetMergePS", TestNewShaderRecompilerCfgPostEndTargetMergePS);
+  run("TestNewShaderRecompilerCfgLoopBreakContinue", TestNewShaderRecompilerCfgLoopBreakContinue);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
-  TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
+  run("TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured", TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured);
+  run("TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher", TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher);
 #endif
-  TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
-  TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
-  TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
-  TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
-  TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
-  TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
-  TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();
-  TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit();
-  TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher();
-  TestNewShaderRecompilerCfgConditionalLatchNoSelection();
-  TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();
-  TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection();
-  TestNewShaderRecompilerCfgLoopGatewaySelection();
-  TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
-  TestNewShaderRecompilerCfgMultipleLoopLatches();
-  TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
-  TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
-  TestNewShaderRecompilerCfgExecSccSharedArm();
-  TestSharedReturnPreservesDescriptorDominance();
-  TestNewShaderRecompilerCfgNestedTailEarlyExit();
-  TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
-  TestNewShaderRecompilerCfgAlternatingSharedReturns();
-  TestNewShaderRecompilerCfgLoopSharedRegion();
-  TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
-  TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
-  TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
-  TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
-  TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
-  TestNewShaderRecompilerCfgIrreducibleDispatcher();
-  TestNewShaderRecompilerDispatcherSpillsU32x3();
-  TestNewShaderRecompilerU64PairTranslation();
-  TestComputeDispatchWaveSize();
-  TestNewShaderRecompilerBufferLoadsGuardedByExec();
-  TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
-  TestCapturedBufferAtomicsX2();
-  TestNewShaderRecompilerPixelImageSampleLodSelection();
-  TestNewShaderRecompilerBranchConditionForms();
-  TestNewShaderRecompilerSetpcBranch();
-  TestFusedShaderHandoffPreservesRegisters();
-  TestMeshExportStorage();
-  TestMergedShaderUserDataSnapshot();
-  TestMeshInputAssembly();
+  run("TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured", TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured);
+  run("TestNewShaderRecompilerCfgLoopHeaderDsReadStructured", TestNewShaderRecompilerCfgLoopHeaderDsReadStructured);
+  run("TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured", TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured);
+  run("TestNewShaderRecompilerCfgSharedOuterAndLoopMerge", TestNewShaderRecompilerCfgSharedOuterAndLoopMerge);
+  run("TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection", TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection);
+  run("TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher", TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher);
+  run("TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection", TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection);
+  run("TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit", TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit);
+  run("TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher", TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher);
+  run("TestNewShaderRecompilerCfgConditionalLatchNoSelection", TestNewShaderRecompilerCfgConditionalLatchNoSelection);
+  run("TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection", TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection);
+  run("TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection", TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection);
+  run("TestNewShaderRecompilerCfgLoopGatewaySelection", TestNewShaderRecompilerCfgLoopGatewaySelection);
+  run("TestNewShaderRecompilerCfgConditionalLoopHeaderSelection", TestNewShaderRecompilerCfgConditionalLoopHeaderSelection);
+  run("TestNewShaderRecompilerCfgMultipleLoopLatches", TestNewShaderRecompilerCfgMultipleLoopLatches);
+  run("TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit", TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit);
+  run("TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders", TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders);
+  run("TestNewShaderRecompilerCfgExecSccSharedArm", TestNewShaderRecompilerCfgExecSccSharedArm);
+  run("TestSharedReturnPreservesDescriptorDominance", TestSharedReturnPreservesDescriptorDominance);
+  run("TestNewShaderRecompilerCfgNestedTailEarlyExit", TestNewShaderRecompilerCfgNestedTailEarlyExit);
+  run("TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections", TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections);
+  run("TestNewShaderRecompilerCfgAlternatingSharedReturns", TestNewShaderRecompilerCfgAlternatingSharedReturns);
+  run("TestNewShaderRecompilerCfgLoopSharedRegion", TestNewShaderRecompilerCfgLoopSharedRegion);
+  run("TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop", TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop);
+  run("TestNewShaderRecompilerCfgOverlappingEarlyExitLadder", TestNewShaderRecompilerCfgOverlappingEarlyExitLadder);
+  run("TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal", TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal);
+  run("TestNewShaderRecompilerCfgSharedTerminalEarlyExit", TestNewShaderRecompilerCfgSharedTerminalEarlyExit);
+  run("TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry", TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry);
+  run("TestNewShaderRecompilerCfgIrreducibleDispatcher", TestNewShaderRecompilerCfgIrreducibleDispatcher);
+  run("TestNewShaderRecompilerDispatcherSpillsU32x3", TestNewShaderRecompilerDispatcherSpillsU32x3);
+  run("TestNewShaderRecompilerU64PairTranslation", TestNewShaderRecompilerU64PairTranslation);
+  run("TestComputeDispatchWaveSize", TestComputeDispatchWaveSize);
+  run("TestNewShaderRecompilerBufferLoadsGuardedByExec", TestNewShaderRecompilerBufferLoadsGuardedByExec);
+  run("TestNewShaderRecompilerBufferAtomicsGuardedByBounds", TestNewShaderRecompilerBufferAtomicsGuardedByBounds);
+  run("TestCapturedBufferAtomicsX2", TestCapturedBufferAtomicsX2);
+  run("TestNewShaderRecompilerPixelImageSampleLodSelection", TestNewShaderRecompilerPixelImageSampleLodSelection);
+  run("TestNewShaderRecompilerBranchConditionForms", TestNewShaderRecompilerBranchConditionForms);
+  run("TestNewShaderRecompilerSetpcBranch", TestNewShaderRecompilerSetpcBranch);
+  run("TestFusedShaderHandoffPreservesRegisters", TestFusedShaderHandoffPreservesRegisters);
+  run("TestMeshExportStorage", TestMeshExportStorage);
+  run("TestMergedShaderUserDataSnapshot", TestMergedShaderUserDataSnapshot);
+  run("TestMeshInputAssembly", TestMeshInputAssembly);
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
-  TestPreparationVertexInputReuse();
+  run("TestPreparationVertexInputReuse", TestPreparationVertexInputReuse);
 #endif
-  TestEmbeddedVertexFormatSwizzle();
-  TestNewShaderRecompilerSetpcJumpTable();
-  TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
-  TestNewShaderRecompilerSetpcDwordJumpTable();
-  TestTypedEntryStateIsMinimal();
+  run("TestEmbeddedVertexFormatSwizzle", TestEmbeddedVertexFormatSwizzle);
+  run("TestNewShaderRecompilerSetpcJumpTable", TestNewShaderRecompilerSetpcJumpTable);
+  run("TestNewShaderRecompilerPrunesUnreachableSetpcMetadata", TestNewShaderRecompilerPrunesUnreachableSetpcMetadata);
+  run("TestNewShaderRecompilerSetpcDwordJumpTable", TestNewShaderRecompilerSetpcDwordJumpTable);
+  run("TestTypedEntryStateIsMinimal", TestTypedEntryStateIsMinimal);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestFinalSsaRejectsRegisterStatePseudos();
+  run("TestFinalSsaRejectsRegisterStatePseudos", TestFinalSsaRejectsRegisterStatePseudos);
 #endif
-  TestValuePhiValidation();
-  TestU64ShiftConstantPropagation();
+  run("TestValuePhiValidation", TestValuePhiValidation);
+  run("TestMaskedShiftConstantPropagation", TestMaskedShiftConstantPropagation);
+  run("TestU64ShiftConstantPropagation", TestU64ShiftConstantPropagation);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestNativeWideValueValidation();
+  run("TestNativeWideValueValidation", TestNativeWideValueValidation);
 #endif
-  TestNewShaderRecompilerZeroInitialRegisterState();
-  TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
-  TestNewShaderRecompilerVertexStartInstanceSgpr();
-  TestNewShaderRecompilerVertexExportUsesInvocationExecMask();
-  TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
-  TestNewShaderRecompilerPerInvocationU64Complement();
-  TestNewShaderRecompilerExpPixelOutputs();
-  TestRenderTargetReverseExportMapping();
-  TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
-  TestTypedDescriptorRealWideMoveTranslation();
-  TestComputeImageFill();
-  TestTypedDescriptorRealCarryAndScalarLoads();
-  TestSrtWalkerRealSmemTranslation();
-  TestSrtWalkerVccBaseTranslation();
-  TestSrtWalkerRealSBufferTranslation();
-  TestScalarMemorySourcesCapturedBeforeWrites();
-  TestScalarMemoryLoadCrossesIntoVcc();
-  TestScalarMemoryUnusedTailDce();
-  TestResourceTrackingRealDensePatching();
-  TestDirectTranslationResetsAnalysisState();
-  TestNewShaderRecompilerNativeBindingPlan();
-  TestNewShaderRecompilerStageInputInfo();
-  TestCustomVintrpMovTranslation();
-  TestNewShaderRecompilerSharedParameterPerVertexInput();
-  TestGraphicsCreateInterpolantMapping();
-  TestNewShaderRecompilerPixelPipelineEntry();
-  TestComputeLdsAllocationIdentity();
-  TestPixelProgramCacheBindingIdentity();
-  TestGraphicsPushConstantPlacement();
-  TestNewShaderRecompilerUnsupportedMemoryDecode();
+  run("TestNewShaderRecompilerZeroInitialRegisterState", TestNewShaderRecompilerZeroInitialRegisterState);
+  run("TestNewShaderRecompilerVertexSystemInputsWithoutMirrors", TestNewShaderRecompilerVertexSystemInputsWithoutMirrors);
+  run("TestNewShaderRecompilerVertexStartInstanceSgpr", TestNewShaderRecompilerVertexStartInstanceSgpr);
+  run("TestNewShaderRecompilerVertexExportUsesInvocationExecMask", TestNewShaderRecompilerVertexExportUsesInvocationExecMask);
+  run("TestNewShaderRecompilerPerInvocationMasksWithoutMirrors", TestNewShaderRecompilerPerInvocationMasksWithoutMirrors);
+  run("TestNewShaderRecompilerPerInvocationU64Complement", TestNewShaderRecompilerPerInvocationU64Complement);
+  run("TestNewShaderRecompilerExpPixelOutputs", TestNewShaderRecompilerExpPixelOutputs);
+  run("TestRenderTargetReverseExportMapping", TestRenderTargetReverseExportMapping);
+  run("TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled", TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled);
+  run("TestTypedDescriptorRealWideMoveTranslation", TestTypedDescriptorRealWideMoveTranslation);
+  run("TestComputeImageFill", TestComputeImageFill);
+  run("TestTypedDescriptorRealCarryAndScalarLoads", TestTypedDescriptorRealCarryAndScalarLoads);
+  run("TestSrtWalkerRealSmemTranslation", TestSrtWalkerRealSmemTranslation);
+  run("TestSrtWalkerVccBaseTranslation", TestSrtWalkerVccBaseTranslation);
+  run("TestSrtWalkerRealSBufferTranslation", TestSrtWalkerRealSBufferTranslation);
+  run("TestScalarMemorySourcesCapturedBeforeWrites", TestScalarMemorySourcesCapturedBeforeWrites);
+  run("TestScalarMemoryLoadCrossesIntoVcc", TestScalarMemoryLoadCrossesIntoVcc);
+  run("TestScalarMemoryUnusedTailDce", TestScalarMemoryUnusedTailDce);
+  run("TestResourceTrackingRealDensePatching", TestResourceTrackingRealDensePatching);
+  run("TestDirectTranslationResetsAnalysisState", TestDirectTranslationResetsAnalysisState);
+  run("TestNewShaderRecompilerNativeBindingPlan", TestNewShaderRecompilerNativeBindingPlan);
+  run("TestNewShaderRecompilerStageInputInfo", TestNewShaderRecompilerStageInputInfo);
+  run("TestCustomVintrpMovTranslation", TestCustomVintrpMovTranslation);
+  run("TestNewShaderRecompilerSharedParameterPerVertexInput", TestNewShaderRecompilerSharedParameterPerVertexInput);
+  run("TestGraphicsCreateInterpolantMapping", TestGraphicsCreateInterpolantMapping);
+  run("TestNewShaderRecompilerPixelPipelineEntry", TestNewShaderRecompilerPixelPipelineEntry);
+  run("TestComputeLdsAllocationIdentity", TestComputeLdsAllocationIdentity);
+  run("TestPixelProgramCacheBindingIdentity", TestPixelProgramCacheBindingIdentity);
+  run("TestGraphicsPushConstantPlacement", TestGraphicsPushConstantPlacement);
+  run("TestNewShaderRecompilerUnsupportedMemoryDecode", TestNewShaderRecompilerUnsupportedMemoryDecode);
 
+  if (selected == 0) {
+    std::fprintf(stderr, "ShaderCfgTests: no tests matched filter\n");
+    return 2;
+  }
+  if (!list_only) { std::printf("ShaderCfgTests: %u tests passed\n", selected); }
   return 0;
 }

@@ -235,7 +235,7 @@ public:
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void                           FindBuffers(PreparedBindings& bindings);
+	void                           FindBuffers(PreparedBindings& bindings, bool register_buffers = true);
 	void PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second = nullptr);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);

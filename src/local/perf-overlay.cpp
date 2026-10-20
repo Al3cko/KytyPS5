@@ -47,6 +47,7 @@ constexpr size_t      Ring = 4096;
 std::atomic<int64_t>  g_flip_ns[Ring] {};
 std::atomic<int64_t>  g_flip_idle_ns[Ring] {};
 std::atomic<uint64_t> g_flips {0};
+std::atomic<uint32_t> g_visibility_toggle {0};
 
 std::mutex     g_machine_mutex;
 Machine        g_machine; // (g_machine_mutex)
@@ -312,7 +313,7 @@ void Run(std::array<uint8_t, 16> uuid, std::string gpu_name) {
 		const uint64_t tsc = __rdtsc();
 		const double   seconds = static_cast<double>(ns - last_ns) / 1e9;
 		const uint32_t parts = kyty_local_overlay_sampling.load(std::memory_order_relaxed);
-		if (parts == 0) {
+		if (parts == 0 || Level() < 2) {
 			first = true;
 			continue;
 		}
@@ -405,8 +406,14 @@ std::atomic<int>& LevelState() {
 	return level;
 }
 
+void ToggleVisibility() {
+	g_visibility_toggle.fetch_xor(1u, std::memory_order_relaxed);
+}
+
 int Level() {
-	return LevelState().load(std::memory_order_relaxed);
+    const auto level = LevelState().load(std::memory_order_relaxed);
+    const bool toggled = g_visibility_toggle.load(std::memory_order_relaxed) != 0;
+    return level == 0 ? (toggled ? 2 : 0) : (toggled ? 0 : level);
 }
 
 int CycleLevel() {

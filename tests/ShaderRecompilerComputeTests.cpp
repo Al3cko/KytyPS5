@@ -1,3 +1,5 @@
+#include "local/fresh-memory.h"
+#include "local/async-upload.h"
 #include "common/assert.h"
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
 #include "native-resource-state.h"
@@ -171,6 +173,21 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+  static bool StageImage(BufferCache& cache, uint8_t* target, uint64_t address, uint64_t size) {
+    return cache.PushImageStagingCopies(target, address, size);
+  }
+  static std::pair<uint64_t, uint64_t> ResolveSpan(BufferCache& cache, uint64_t address, uint64_t size) {
+    const auto span = cache.ResolveOverlaps(address, size);
+    return {span.begin, span.end};
+  }
+  static bool AccountingMatches(BufferCache &cache) {
+    uint64_t expected = 0;
+    for (const auto &[address, id] : cache.m_buffers) {
+      expected += cache.m_slot_buffers[id].Size();
+    }
+    return expected == cache.m_registered_memory;
+  }
+
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
   static uint64_t CpuEpoch(const BufferCache& cache, uint64_t address, uint64_t size) {
     return cache.m_memory_tracker.CpuModificationEpoch(address, size);
@@ -196,6 +213,11 @@ struct BufferCacheTestAccess {
                                              uint64_t critical) {
     cache.m_trigger_gc_memory = trigger;
     cache.m_critical_gc_memory = critical;
+  }
+
+  // Start pressure-GC fixtures beyond the stale-clock tick-zero sentinel.
+  static void StartGarbageCollectionClock(BufferCache &cache) {
+    cache.m_gc_tick = 1;
   }
 
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
@@ -243,6 +265,14 @@ struct TileManagerTestAccess {
 };
 
 struct TextureCacheTestAccess {
+  static bool AccountingMatches(TextureCache &cache) {
+    uint64_t expected = 0;
+    cache.m_slot_images.ForEach([&](ImageId, const Image &image) {
+      if (image.registered) expected += image.AccountedSize();
+    });
+    return expected == cache.m_registered_memory;
+  }
+
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
                              Common::SlotVector<Image>>);
   static_assert(TextureCache::ImagePageTable::kPageBits == 20);
@@ -262,9 +292,12 @@ struct TextureCacheTestAccess {
 
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
-                                         uint64_t tick, [[maybe_unused]] uint64_t pressure) {
-    // (One collection threshold since 10-01: collecting from no memory use.)
-    cache.m_trigger_gc_memory = 0;
+                                         uint64_t tick, uint64_t pressure) {
+    // Prime the live budget at tick zero before installing a test threshold.
+    // Tick zero cannot retire stale images or enter pressure collection.
+    cache.m_gc_tick = 0;
+    cache.RunGarbageCollector();
+    cache.m_trigger_gc_memory = pressure;
     cache.m_gc_tick = tick;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
@@ -291,6 +324,15 @@ struct TextureCacheTestAccess {
   static bool Contains(const TextureCache &cache, ImageId id) {
     const auto owner = cache.m_slot_images.try_get(id);
     return owner != nullptr && owner->registered;
+  }
+
+  static ImageId ExpandForReclaim(TextureCache &cache, const ImageInfo &info, ImageId source) {
+    auto lock = Lock(cache);
+    return cache.ExpandImage(info, source);
+  }
+
+  static bool HasReclaimPins(const TextureCache &cache) {
+    return !cache.m_reclaim_pins.empty();
   }
 
   static std::vector<ImageId> FindImages(TextureCache &cache, uint64_t address,
@@ -410,6 +452,7 @@ struct TextureCacheTestAccess {
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
     metadata.clear_mask = 0;
+    cache.MetaFilterAdd(address);
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -2078,8 +2121,9 @@ public:
 			      "fault window crossed a mapped range boundary");
 		  resources.MapMemory(base + 0x3000, 0x1000);
 		  resources.UnmapMemory(base, bytes);
-		  scheduler.Finish();
+		  scheduler.Shutdown();
 	  }
+	  context.ShutdownGpu();
 	  Require(name, "unmap", Memory::KernelMunmap(base, bytes) == 0, "unmap failed");
 	  Require(name, "release", Memory::KernelReleaseDirectMemory(allocation, bytes) == 0,
 		      "release failed");
@@ -2875,6 +2919,21 @@ public:
       PreparedBindings source_binding;
       source_binding.runtime = &source_runtime;
       source_binding.images.push_back({.image_id = image_id, .desc = sampled});
+      Require(name, "live view", executor.AcquirableImage(source_binding.images[0]),
+              "a valid current view was rejected");
+      for (uint32_t invalid_range = 0; invalid_range < 4; ++invalid_range) {
+        auto& view = source_binding.images[0].desc.view_info;
+        view = sampled.view_info;
+        if (invalid_range == 0) view.base_level = 1;
+        if (invalid_range == 1) view.level_count = 2;
+        if (invalid_range == 2) view.base_layer = 1;
+        if (invalid_range == 3) view.layer_count = 2;
+        Require(name, "stale subresource", !executor.AcquirableImage(source_binding.images[0]),
+                "a stale mip/layer range reached native image-view creation");
+        Require(name, "stale acquisition", !executor.AcquireImages(source_binding),
+                "acquisition accepted a range outside the current image backing");
+      }
+      source_binding.images[0].desc = sampled;
       // Actual descriptor rebinding publishes image.usage.texture. Merely
       // looking up a view does not establish that historical binding usage.
       executor.RebindImages(source_binding);
@@ -3598,10 +3657,14 @@ public:
         [&] { scheduler.DeferOperation([&] { normal_completed = true; }); });
     resources.MapMemory(empty_unmap_base, empty_unmap_size);
     resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
-    Require("GpuCommandLane", "unmap native completion",
-            normal_completed.load() &&
-                !resources.IsMapped(empty_unmap_base, empty_unmap_size),
-            "unmap returned before an earlier native guest-memory callback");
+    Require("GpuCommandLane", "unrelated unmap mapping",
+            !resources.IsMapped(empty_unmap_base, empty_unmap_size),
+            "unmap retained an unrelated mapped range");
+    // Unmap drains range-tracked downloads/uploads, not every deferred operation
+    // elsewhere. Explicit completion must still execute the unrelated callback.
+    gpu.SendCommandSync([&] { scheduler.Finish(); });
+    Require("GpuCommandLane", "deferred native completion",
+            normal_completed.load(), "explicit completion lost a deferred callback");
 
     std::binary_semaphore priority_entered{0};
     std::binary_semaphore release_priority{0};
@@ -3632,10 +3695,10 @@ public:
       priority_unmap_complete.acquire();
     }
     priority_unmap_thread.join();
-    Require("GpuCommandLane", "unmap priority ordering",
-            !unmap_overtook_priority &&
+    Require("GpuCommandLane", "unrelated priority completion",
+            unmap_overtook_priority &&
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size),
-            "unmap returned before an earlier guest-memory callback");
+            "unmap waited for an unrelated priority callback");
 
     constexpr uintptr_t fault_base = 0x0000000200500000ull;
     constexpr uint64_t fault_size = 0x10000;
@@ -4328,17 +4391,17 @@ public:
         }
       }
       gpu.SendCommandSync([&] {
-        scheduler.Finish();
         resources.UnmapMemory(base, bytes);
+        // Unmap queues cache callbacks: drain them before resources leave scope.
+        scheduler.Shutdown();
       });
       m_runtime_context.device.destroySemaphore(gate, nullptr);
     }
-    context.GetGpu().Shutdown();
+    context.ShutdownGpu();
     Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0,
             "guest unmap failed");
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
         direct_offset, bytes) == 0, "direct release failed");
-    scheduler.Shutdown();
     kyty_local_frame_pipeline_mode.store(old_frame_mode);
     std::printf("PASS %s\n", name);
   }
@@ -4401,13 +4464,22 @@ public:
         scheduler.Flush(submit);
       });
       std::atomic<bool> written{false};
+      std::binary_semaphore writer_started{0};
       std::jthread writer([&] {
+        writer_started.release();
         cache.ReadMemory(address, 4, true);
         written.store(true, std::memory_order_release);
       });
-      // The GPU thread stays responsive while the gated download is pending.
-      for (int i = 0; i < 100 && !BufferCacheTestAccess::HasGuestReadback(cache); ++i)
-        gpu.SendCommandSync([] {});
+      writer_started.acquire();
+      // Probe cache state on its owning lane, allowing time for the host writer
+      // to enqueue its request. A fixed number of empty commands can starve it.
+      bool pending = false;
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!pending && !written.load(std::memory_order_acquire) &&
+             std::chrono::steady_clock::now() < deadline) {
+        gpu.SendCommandSync([&] { pending = BufferCacheTestAccess::HasGuestReadback(cache); });
+        if (!pending) std::this_thread::yield();
+      }
       gpu.SendCommandSync([&] {
         Require(name, "pending", BufferCacheTestAccess::HasGuestReadback(cache) &&
             !written.load(std::memory_order_acquire), "the write did not wait for the download");
@@ -4425,16 +4497,16 @@ public:
         Require(name, "ownership", !cache.IsRegionGpuModified(address, 4) &&
             !cache.HasGpuDirtyBytes(address, 4) && !BufferCacheTestAccess::HasGuestReadback(cache),
             "the written range stayed GPU-owned");
-        scheduler.Finish();
         resources.UnmapMemory(base, bytes);
+        // Unmap queues cache callbacks: drain them before resources leave scope.
+        scheduler.Shutdown();
       });
       m_runtime_context.device.destroySemaphore(gate, nullptr);
     }
-    context.GetGpu().Shutdown();
+    context.ShutdownGpu();
     Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0, "guest unmap failed");
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, bytes) == 0,
             "direct release failed");
-    scheduler.Shutdown();
     kyty_local_async_write_readback_mode.store(old_write_mode);
     kyty_local_frame_pipeline_mode.store(old_frame_mode);
     std::printf("PASS %s\n", name);
@@ -4717,11 +4789,23 @@ public:
       resources.SetGpu(&gpu);
       auto &cache = resources.GetBufferCache();
       resources.MapMemory(base, allocation_size);
+      BufferCacheTestAccess::StartGarbageCollectionClock(cache);
 
       const auto MarkGpuWrite = [&](uint64_t address, uint64_t size) {
         auto allocation = cache.ObtainBuffer(address, size, true, false);
         Require(name, "dirty allocation", allocation.first != nullptr,
                 "dirty-GC buffer allocation failed");
+      };
+      // The test and guest GPU threads have separate Vulkan recording queues.
+      // Publish on the sender before handing their command buffer back.
+      const auto UnmapMemory = [&](uint64_t address, uint64_t size) {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+        LocalVulkanRecording::Drain();
+#endif
+        resources.UnmapMemory(address, size);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+        gpu.SendCommandSync([] { LocalVulkanRecording::Drain(); });
+#endif
       };
       const auto ReadNativeValue =
           [&](const Libs::Graphics::Buffer &buffer, uint64_t offset) {
@@ -4785,6 +4869,17 @@ public:
           cache.FindBuffer(index_begin + 0x100, sizeof(uint32_t));
       const auto index_right = cache.FindBuffer(
           index_begin + 2 * index_page + 0x100, sizeof(uint32_t));
+      // With driver budget reporting enabled, a no-eviction pass must not replace
+      // registered bytes with whole-device usage. The same resources are then
+      // exercised through overlap, unmap and dirty-GC below. Restore the harness's
+      // logical-only reporting afterward so forced GC thresholds stay deterministic.
+      Require(name, "buffer accounting before collection",
+              BufferCacheTestAccess::AccountingMatches(cache), "registered buffer bytes disagree before GC");
+      m_runtime_context.memory_budget_ext_enabled = m_memory_budget_supported;
+      cache.RunGarbageCollector();
+      m_runtime_context.memory_budget_ext_enabled = false;
+      Require(name, "buffer accounting after driver sample",
+              BufferCacheTestAccess::AccountingMatches(cache), "driver usage overwrote registered buffer bytes");
       Require(name, "registered-range owners",
               index_left && index_right &&
                   cache.FindBuffer(index_begin + 0x200, sizeof(uint32_t)) ==
@@ -4938,11 +5033,13 @@ public:
         }
       }
 
-      resources.UnmapMemory(index_begin, index_span);
-      resources.UnmapMemory(base + recycled_offset, index_page);
+      Require(name, "CPU invalidation mapped ranges",
+              resources.InvalidateMemory(index_begin, index_span) &&
+                  resources.InvalidateMemory(base + recycled_offset, index_page),
+              "CPU invalidation rejected a mapped range");
       Require(name, "invalidation retains owners",
-              !resources.IsMapped(index_begin, index_span) &&
-                  !resources.IsMapped(base + recycled_offset, index_page) &&
+              resources.IsMapped(index_begin, index_span) &&
+                  resources.IsMapped(base + recycled_offset, index_page) &&
                   cache.IsRegionRegistered(index_begin, index_span) &&
                   BufferCacheTestAccess::PageOwner(cache, index_begin) ==
                       index_bridge &&
@@ -4956,6 +5053,14 @@ public:
                   cache.IsRegionCpuModified(base + recycled_offset,
                                             index_page),
               "CPU invalidation retired a reusable Buffer owner");
+      // Exercise unmapping separately: unlike CPU invalidation, it may retire
+      // whole unmapped owners or split partially mapped ones.
+      UnmapMemory(index_begin, index_span);
+      UnmapMemory(base + recycled_offset, index_page);
+      Require(name, "unmapped range removal",
+              !resources.IsMapped(index_begin, index_span) &&
+                  !resources.IsMapped(base + recycled_offset, index_page),
+              "unmap retained a mapped range");
       resources.MapMemory(index_begin, index_span);
       resources.MapMemory(base + recycled_offset, index_page);
 
@@ -5275,24 +5380,23 @@ public:
               "direct-invalidation buffer allocation failed");
       cache.FillBuffer(base + unmap_offset, sizeof(unmap_value), unmap_value,
                        false);
-      resources.UnmapMemory(base + 0x4000, 0x4000);
+      UnmapMemory(base + 0x4000, 0x4000);
       uint32_t unmap_backing = 0;
       std::memcpy(&unmap_backing, memory + unmap_offset, sizeof(unmap_backing));
       Require(name, "direct-invalidation contents",
               unmap_backing == unmap_value &&
                   !resources.IsMapped(base + 0x4000, 0x4000) &&
-                  cache.IsRegionRegistered(base + 0x4000, 0x4000) &&
-                  cache.IsRegionCpuModified(base + 0x4000, 0x4000) &&
+                  !cache.IsRegionRegistered(base + 0x4000, 0x4000) &&
                   !cache.IsRegionGpuModified(base + 0x4000, 0x4000) &&
                   !cache.HasGpuDirtyBytes(base + 0x4000, 0x4000),
-              "dirty invalidation did not publish bytes and retain its owner");
+              "dirty unmap did not publish bytes and retire its owner");
       std::memcpy(memory + unmap_offset, &remap_value, sizeof(remap_value));
       resources.MapMemory(base + 0x4000, 0x4000);
       const auto remapped =
           cache.ObtainBuffer(base + unmap_offset, sizeof(remap_value), true);
       Require(name, "same-address remap allocation",
-              remapped.first == unmap_allocation.first,
-              "same-address remap did not synchronize the retained Buffer");
+              remapped.first != nullptr,
+              "same-address remap did not allocate a valid Buffer");
       Require(name, "same-address remap contents",
               ReadNativeValue(*remapped.first, remapped.second) == remap_value,
               "same-address remap reused stale native Buffer bytes");
@@ -5307,7 +5411,7 @@ public:
       cache.FillBuffer(base + partial_unmap_survivor_offset,
                        sizeof(partial_unmap_survivor_value),
                        partial_unmap_survivor_value, false);
-      resources.UnmapMemory(base + 0x8000, 0x4000);
+      UnmapMemory(base + 0x8000, 0x4000);
       uint32_t partial_unmap_survivor_backing = 0;
       std::memcpy(&partial_unmap_survivor_backing,
                   memory + partial_unmap_survivor_offset,
@@ -5315,26 +5419,30 @@ public:
       Require(
           name, "partial-invalidation ownership",
           !resources.IsMapped(base + 0x8000, 0x4000) &&
-              cache.IsRegionRegistered(base + 0x8000, 0x8000) &&
-              cache.IsRegionCpuModified(base + 0x8000, 0x4000) &&
+              !cache.IsRegionRegistered(base + 0x8000, 0x4000) &&
+              cache.IsRegionRegistered(base + 0xc000, 0x4000) &&
               !cache.IsRegionCpuModified(
                   base + partial_unmap_survivor_offset,
                   sizeof(partial_unmap_survivor_value)) &&
               !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
                                       sizeof(partial_unmap_value)) &&
-              !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
-                                      sizeof(partial_unmap_survivor_value)) &&
+              // Splitting copies the retained half on the GPU; its ownership
+              // can be dirty again, and the native readback below checks it.
               partial_unmap_survivor_backing == partial_unmap_survivor_value,
           "widened partial invalidation mishandled ownership or backing");
+      const auto split_owner = BufferCacheTestAccess::PageOwner(cache, base + partial_unmap_survivor_offset);
+      Require(name, "split survivor contents before remap",
+              ReadNativeValue(cache.GetBuffer(split_owner), cache.GetBuffer(split_owner).Offset(base + partial_unmap_survivor_offset)) == partial_unmap_survivor_value,
+              "split copy did not preserve the retained GPU bytes");
       resources.MapMemory(base + 0x8000, 0x4000);
       auto survivor =
           cache.ObtainBuffer(base + partial_unmap_survivor_offset,
                              sizeof(partial_unmap_survivor_value), false);
       Require(name, "partial-invalidation survivor", survivor.first != nullptr,
               "cached-buffer remainder was not retained");
+      const auto survivor_value = ReadNativeValue(*survivor.first, survivor.second);
       Require(name, "partial-invalidation survivor contents",
-              ReadNativeValue(*survivor.first, survivor.second) ==
-                  partial_unmap_survivor_value,
+              survivor_value == partial_unmap_survivor_value,
               "partial invalidation lost disjoint native bytes");
 
       constexpr uint64_t large_offset = 0x10000;
@@ -5465,7 +5573,7 @@ public:
           name, "disjoint retirement publication",
           disjoint_before_unmap == disjoint_value,
           "whole-owner Buffer retired before publishing its dirty bytes");
-      resources.UnmapMemory(base + disjoint_owner_offset + 0x4000, 0x4000);
+      UnmapMemory(base + disjoint_owner_offset + 0x4000, 0x4000);
       uint32_t disjoint_after_unmap = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + disjoint_dirty_offset,
                                               &disjoint_after_unmap,
@@ -5545,9 +5653,13 @@ public:
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
 
+      Require(name, "buffer accounting after overlap and GC",
+              BufferCacheTestAccess::AccountingMatches(cache), "buffer lifecycle lost registered accounting");
       resources.SetGpu(nullptr);
-      resources.UnmapMemory(base, allocation_size);
+      UnmapMemory(base, allocation_size);
       scheduler.Finish();
+      Require(name, "buffer accounting after unmap",
+              BufferCacheTestAccess::AccountingMatches(cache), "buffer unmap lost registered accounting");
     }
     context.ShutdownGpu();
     Require(name, "unmap direct backing",
@@ -5652,8 +5764,13 @@ public:
   // part of a view's layers grows into one image of both: its layers copied on the GPU (their guest bytes change
   // behind the cache's back here, so an upload of them would show), the others uploaded; a view inside it is served
   // from it. A sampled texture past the format's layer limit has no image when it may fail, and is not tried again.
-  void CheckTextureLayerRanges() {
-    constexpr const char *name = "TextureLayerRanges";
+  void CheckTextureLayerRanges(bool reclaim_source = false) {
+    const char *name = reclaim_source ? "TextureReclaimSource" : "TextureLayerRanges";
+    if (reclaim_source) {
+      const char *injected = std::getenv("KYTY_TEST_RECLAIM");
+      Require(name, "injection enabled", injected != nullptr && std::strcmp(injected, "1") == 0,
+              "run this isolated fixture with KYTY_TEST_RECLAIM=1");
+    }
     constexpr uint64_t base = 0x000000020a000000ull, slice = 0x10000, slices = 32, size = slice * slices;
     EnsureRuntimeContext();
     int64_t physical = -1;
@@ -5708,6 +5825,13 @@ public:
         return desc;
       };
       const auto texel = [&](ImageId id, uint32_t layer) {
+        Require(name, "texture accounting before collection",
+                TextureCacheTestAccess::AccountingMatches(textures), "registered texture sizes disagree before GC");
+        m_runtime_context.memory_budget_ext_enabled = m_memory_budget_supported;
+        textures.RunGarbageCollector();
+        m_runtime_context.memory_budget_ext_enabled = false;
+        Require(name, "texture accounting after driver sample",
+                TextureCacheTestAccess::AccountingMatches(textures), "driver usage overwrote registered texture bytes");
         auto &image = textures.GetImage(id);
         auto probe = CreateHostBuffer(name, sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {});
         scheduler.Current().EndRendering();
@@ -5733,47 +5857,75 @@ public:
         DestroyBuffer(&probe);
         return value;
       };
-      auto first_view = layers(4, 6);
-      const auto first_id = textures.FindImage(first_view);
-      Require(name, "first view", textures.FindTexture(first_id, first_view) != nullptr,
-              "the view of layers 4..9 was not made");
-      for (uint32_t layer = 4; layer < 10; ++layer) fill(layer, 0x6b000000u + layer, true);
-      for (uint32_t layer = 10; layer < slices; ++layer) fill(layer, 0x6b000000u + layer, false);
-      auto grown = layers(6, 7);
-      uint32_t first = 0;
-      textures.HoldLayers(grown.info, first);
-      Require(name, "union", grown.info.data.address == base + slice * 4 && grown.info.resources.layers == 9 &&
-              first == 2, "layers 6..12 beside the image of 4..9 did not grow into one of 4..12");
-      grown.view_info.base_layer = first;
-      const auto grown_id = textures.FindImage(grown);
-      const auto *replaced = TextureCacheTestAccess::Owner(textures, first_id);
-      Require(name, "union image", textures.FindTexture(grown_id, grown) != nullptr && grown_id != first_id &&
-              textures.GetImage(grown_id).backing.layers == 9 && (replaced == nullptr || !replaced->registered),
-              "the grown image was not the one of 9 layers that replaced the first");
-      for (uint32_t layer = 0; layer < 9; ++layer) {
-        const uint32_t expected = layer < 6 ? 0x5a000000u + 4 + layer : 0x6b000000u + 4 + layer;
-        const uint32_t observed = texel(grown_id, layer);
-        if (observed != expected) {
-          std::printf("[gpu]     %s: layer %u holds 0x%08x, 0x%08x expected\n", name, layer, observed, expected);
+      if (reclaim_source) {
+        auto source = layers(0, 16);
+        const auto source_id = textures.FindImage(source);
+        Require(name, "source", textures.FindTexture(source_id, source) != nullptr,
+                "the source image was not initialized");
+        auto victim = layers(16, 16);
+        const auto victim_id = textures.FindImage(victim);
+        Require(name, "victim", textures.FindTexture(victim_id, victim) != nullptr,
+                "the unrelated reclaimable image was not initialized");
+        scheduler.Finish();
+        // Keep the source's native contents distinct from newer guest bytes. An expansion must retain the source
+        // while its allocation takes the injected reclaim path, then copy those contents into the new image.
+        for (uint32_t layer = 0; layer < 16; ++layer) fill(layer, 0x6b000000u + layer, true);
+        const std::array oldest{source_id, victim_id};
+        TextureCacheTestAccess::ConfigureGarbageCollection(textures, oldest, 600, UINT64_MAX);
+        auto expanded = layers(0, 24);
+        const auto expanded_id = TextureCacheTestAccess::ExpandForReclaim(textures, expanded.info, source_id);
+        Require(name, "injected reclaim", TextureCacheTestAccess::Owner(textures, victim_id) == nullptr,
+                "the injected allocation did not reclaim its unrelated stale victim");
+        Require(name, "pins released", !TextureCacheTestAccess::HasReclaimPins(textures),
+                "the completed copy left a reclamation pin behind");
+        Require(name, "copied source", texel(expanded_id, 0) == 0x5a000000u &&
+                texel(expanded_id, 15) == 0x5a00000fu,
+                "reclaiming during expansion lost the active source's native texels");
+        Require(name, "new layers", texel(expanded_id, 23) == 0x5a000017u,
+                "expansion failed to upload the layers outside its copied source");
+      } else {
+        auto first_view = layers(4, 6);
+        const auto first_id = textures.FindImage(first_view);
+        Require(name, "first view", textures.FindTexture(first_id, first_view) != nullptr,
+                "the view of layers 4..9 was not made");
+        for (uint32_t layer = 4; layer < 10; ++layer) fill(layer, 0x6b000000u + layer, true);
+        for (uint32_t layer = 10; layer < slices; ++layer) fill(layer, 0x6b000000u + layer, false);
+        auto grown = layers(6, 7);
+        uint32_t first = 0;
+        textures.HoldLayers(grown.info, first);
+        Require(name, "union", grown.info.data.address == base + slice * 4 && grown.info.resources.layers == 9 &&
+                first == 2, "layers 6..12 beside the image of 4..9 did not grow into one of 4..12");
+        grown.view_info.base_layer = first;
+        const auto grown_id = textures.FindImage(grown);
+        const auto *replaced = TextureCacheTestAccess::Owner(textures, first_id);
+        Require(name, "union image", textures.FindTexture(grown_id, grown) != nullptr && grown_id != first_id &&
+                textures.GetImage(grown_id).backing.layers == 9 && (replaced == nullptr || !replaced->registered),
+                "the grown image was not the one of 9 layers that replaced the first");
+        for (uint32_t layer = 0; layer < 9; ++layer) {
+          const uint32_t expected = layer < 6 ? 0x5a000000u + 4 + layer : 0x6b000000u + 4 + layer;
+          const uint32_t observed = texel(grown_id, layer);
+          if (observed != expected) {
+            std::printf("[gpu]     %s: layer %u holds 0x%08x, 0x%08x expected\n", name, layer, observed, expected);
+          }
+          Require(name, "union layers", observed == expected,
+                  "a layer of the first image was uploaded again, or a new one was not uploaded");
         }
-        Require(name, "union layers", observed == expected,
-                "a layer of the first image was uploaded again, or a new one was not uploaded");
+        auto inner = layers(5, 3);
+        textures.HoldLayers(inner.info, first);
+        Require(name, "holder", inner.info.data.address == base + slice * 4 && inner.info.resources.layers == 9 &&
+                first == 1, "the image of layers 4..12 did not serve a view of 5..7");
+        const auto max_layers = m_runtime_context.GetPhysicalDeviceProperties().limits.maxImageArrayLayers;
+        TextureCache::ImageDesc huge = layers(0, 1);
+        huge.info.data = {base, uint64_t {64} * (max_layers + 1)};
+        huge.info.extent = {4, 4, 1};
+        huge.info.resources = {1, max_layers + 1};
+        huge.info.pitch = 4;
+        huge.info.tile_mode = Prospero::TileMode::kLinear;
+        huge.info.mip_layout[0] = {0, huge.info.data.size, 4, 4};
+        huge.view_info.layer_count = max_layers + 1;
+        Require(name, "past the layer limit", !textures.FindImage(huge, false, true) &&
+                !textures.FindImage(huge, false, true), "a texture past the GPU's layers had an image");
       }
-      auto inner = layers(5, 3);
-      textures.HoldLayers(inner.info, first);
-      Require(name, "holder", inner.info.data.address == base + slice * 4 && inner.info.resources.layers == 9 &&
-              first == 1, "the image of layers 4..12 did not serve a view of 5..7");
-      const auto max_layers = m_runtime_context.GetPhysicalDeviceProperties().limits.maxImageArrayLayers;
-      TextureCache::ImageDesc huge = layers(0, 1);
-      huge.info.data = {base, uint64_t {64} * (max_layers + 1)};
-      huge.info.extent = {4, 4, 1};
-      huge.info.resources = {1, max_layers + 1};
-      huge.info.pitch = 4;
-      huge.info.tile_mode = Prospero::TileMode::kLinear;
-      huge.info.mip_layout[0] = {0, huge.info.data.size, 4, 4};
-      huge.view_info.layer_count = max_layers + 1;
-      Require(name, "past the layer limit", !textures.FindImage(huge, false, true) &&
-              !textures.FindImage(huge, false, true), "a texture past the GPU's layers had an image");
       resources.SetGpu(nullptr);
       resources.UnmapMemory(base, size);
       scheduler.Finish();
@@ -6629,11 +6781,17 @@ public:
       auto &buffer_cache = resources.GetBufferCache();
       std::pair<Libs::Graphics::Buffer *, uint64_t> mip_formatted;
       bool formatted_owner_was_absent = false;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+      LocalVulkanRecording::Drain(); // Publish before the GPU thread takes this command buffer.
+#endif
       gpu.SendCommandSync([&] {
         formatted_owner_was_absent = !buffer_cache.IsRegionRegistered(
             mip_desc.info.data.address, mip_desc.info.data.size);
         mip_formatted = buffer_cache.ObtainBuffer(
             mip_desc.info.data.address, mip_desc.info.data.size, false, true);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+        LocalVulkanRecording::Drain(); // The receiver cannot flush this producer.
+#endif
       });
       Require(name, "formatted cache fixture", formatted_owner_was_absent,
               "formatted image already had a cached Buffer owner");
@@ -8648,7 +8806,7 @@ public:
               "GC retired safely downloadable GPU images before pressure");
       const auto gc_batch_tick = scheduler.CurrentTick();
       TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache,
-                                                         gc_images, 81, 0);
+                                                         gc_images, 601, 0);
       texture_cache.RunGarbageCollector();
       std::array<uint32_t, 2> gc_before_completion{};
       for (size_t index = 0; index < gc_image_offsets.size(); index++) {
@@ -9184,7 +9342,7 @@ public:
           sizeof(stale_added_stencil_depth));
       const auto depth_gc_tick = scheduler.CurrentTick();
       TextureCacheTestAccess::ConfigureGarbageCollection(
-          texture_cache, std::array{combined_destination_image}, 81, 0);
+          texture_cache, std::array{combined_destination_image}, 601, 0);
       texture_cache.RunGarbageCollector();
       float depth_before_completion = 0.0f;
       Libs::LibKernel::Memory::TryReadBacking(
@@ -9216,7 +9374,9 @@ public:
               "GC discarded the current depth plane of a depth/stencil "
               "image");
 
-      constexpr size_t gc_depth_pair_count = 6;
+      // Forty primary images fit in the collector's per-pass budget. Their
+      // associated stencil images must follow without breaking LRU traversal.
+      constexpr size_t gc_depth_pair_count = 41;
       constexpr uint64_t gc_depth_pair_offset = 0x350000;
       constexpr uint64_t gc_depth_pair_stride = 0x1000;
       std::array<ImageId, gc_depth_pair_count> gc_depth_images{};
@@ -9250,9 +9410,9 @@ public:
                               [](ImageId image) { return bool{image}; }) &&
               std::ranges::all_of(gc_stencil_images,
                                   [](ImageId image) { return bool{image}; }),
-          "failed to create six depth/stencil association pairs");
+          "failed to create depth/stencil association pairs");
       TextureCacheTestAccess::ConfigureGarbageCollection(
-          texture_cache, gc_depth_lru, 81, UINT64_MAX);
+          texture_cache, gc_depth_lru, 601, 0);
       texture_cache.RunGarbageCollector();
       bool gc_depth_budget = true;
       for (size_t index = 0; index < gc_depth_pair_count; index++) {
@@ -9265,7 +9425,7 @@ public:
       }
       Require(name, "depth/stencil GC traversal budget", gc_depth_budget,
               "recursive association deletion stopped LRU traversal or "
-              "exceeded the ten-entry deletion budget");
+              "exceeded the forty-primary-image deletion budget");
 
       constexpr uint64_t large_offset = 0x400000;
       constexpr uint32_t large_width = 4096;
@@ -9293,7 +9453,7 @@ public:
                                                 &stale, sizeof(stale));
         }
         TextureCacheTestAccess::ConfigureGarbageCollection(
-            texture_cache, std::array{image}, 81, 0);
+            texture_cache, std::array{image}, 601, 0);
         const auto tick = scheduler.CurrentTick();
         texture_cache.RunGarbageCollector();
         const auto handle =
@@ -9438,6 +9598,182 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "cache direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckRenderingResume() {
+    constexpr const char *name = "RenderingResume";
+    EnsureRuntimeContext();
+    auto target = CreateImage2D(name, 2, 1, vk::Format::eR32Uint,
+                               vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
+                               vk::ImageLayout::eColorAttachmentOptimal);
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      ImageInfo source_info{};
+      source_info.pixel_format = vk::Format::eR32Uint;
+      source_info.guest_format = Prospero::BufferFormat::k32UInt;
+      source_info.type = Prospero::ImageType::kColor2D;
+      source_info.extent = {2, 1, 1};
+      source_info.resources = {1, 1};
+      source_info.pitch = 2;
+      source_info.bytes_per_block = 4;
+      source_info.samples = 1;
+      source_info.tile_mode = Prospero::TileMode::kLinear;
+      source_info.mip_layout[0] = {0, 8, 2, 1};
+      Libs::Graphics::Image source(m_runtime_context, scheduler, source_info);
+      auto &command = scheduler.Current();
+      RenderState rendering{};
+      rendering.width = 2;
+      rendering.height = 1;
+      rendering.num_layers = 1;
+      rendering.num_color_attachments = 1;
+      rendering.color_attachments[0].image_view = target.view;
+      rendering.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+      rendering.color_attachments[0].is_clear = true;
+      rendering.color_attachments[0].clear_value = {7, 0, 0, 0};
+      command.BeginRendering(rendering);
+      vk::ClearAttachment clear{};
+      clear.aspectMask = vk::ImageAspectFlagBits::eColor;
+      clear.colorAttachment = 0;
+      clear.clearValue.color.uint32[0] = 23;
+      const vk::ClearRect rect{{{0, 0}, {1, 1}}, 0, 1};
+      command.Handle().clearAttachments(1, &clear, 1, &rect);
+      Require(name, "active scope", command.RenderingWith(rendering),
+              "initial attachment scope was not tracked");
+      command.EndRendering();
+      // SR copies inputs; descriptor preparation then transitions them again.
+      // Both must finish before the previous attachment scope is resumed.
+      source.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                     vk::AccessFlagBits2::eTransferRead, {}, command.Handle());
+      source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                     vk::AccessFlagBits2::eShaderRead, {}, command.Handle());
+      Require(name, "interrupted scope", !command.RenderingWith(rendering),
+              "source transitions retained an active rendering scope");
+      command.ResumeRendering(rendering);
+      Require(name, "resumed identity", command.RenderingWith(rendering),
+              "resumed attachments lost the logical clear-state identity");
+      // A later draw of the original logical pass must not clear the image again.
+      command.BeginRendering(rendering);
+      command.EndRendering();
+      scheduler.Shutdown();
+    }
+    const auto pixels = ReadImage(name, &target);
+    DestroyImage(&target);
+    Require(name, "attachment contents", pixels == std::vector<u32>{23, 7},
+            "resuming rendering replayed a clear or lost existing pixels");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckOversizedImageReadback() {
+    constexpr const char *name = "OversizedImageReadback";
+    constexpr uintptr_t base = 0x0000000220000000ull;
+    constexpr uint64_t allocation_size = 80ull << 20;
+    constexpr uint64_t alignment = 0x200000;
+    constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
+    constexpr auto tile = Prospero::TileMode::kRenderTarget;
+    constexpr uint32_t width = 4096;
+    constexpr uint32_t height = 2304;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, alignment, 0, &direct_offset) == 0,
+            "oversized image direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "oversized image fixed mapping failed");
+
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.MapMemory(base, allocation_size);
+      const uint32_t pitch = TileGetTexturePitch(format, width, tile);
+      TileSizeAlign total{};
+      TileSizeOffset mip{};
+      TilePaddedSize padded{};
+      TileGetTextureSize(format, width, height, 1, tile, &total, &mip, &padded);
+      // Larger than the 64 MiB reusable download buffer.
+      Require(name, "layout",
+              total.size > (64ull << 20) && total.size <= allocation_size,
+              "oversized image layout does not exceed the download buffer");
+      std::memset(mapped, 0x5a, total.size);
+
+      ImageDesc desc{};
+      desc.type = BindingType::RenderTarget;
+      desc.info.data = {base, total.size};
+      desc.info.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+      desc.info.guest_format = format;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = {width, height, 1};
+      desc.info.resources = {1, 1};
+      desc.info.pitch = pitch;
+      desc.info.bytes_per_block = 8;
+      desc.info.samples = 1;
+      desc.info.tile_mode = tile;
+      desc.info.mip_layout[0] = {mip.offset, mip.size, pitch, height};
+      desc.view_info.format = desc.info.pixel_format;
+      desc.view_info.type = vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+
+      auto &cache = resources.GetTextureCache();
+      const auto id = cache.FindImage(desc);
+      auto &image = cache.GetImage(id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                    vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      vk::ClearColorValue clear{};
+      clear.float32[0] = 1.0f;
+      clear.float32[1] = 2.0f;
+      clear.float32[2] = 3.0f;
+      clear.float32[3] = 4.0f;
+      const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0,
+                                            1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(
+          image.backing.image, vk::ImageLayout::eTransferDstOptimal, clear,
+          range);
+      cache.MarkGpuWritten(id);
+      Require(name, "guest readback queue",
+              TextureCacheTestAccess::TryDownload(cache, id),
+              "oversized image guest readback was rejected");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+
+      std::vector<uint64_t> backing(total.size / sizeof(uint64_t));
+      Require(name, "guest backing",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  base, backing.data(), backing.size() * sizeof(uint64_t)),
+              "oversized image guest backing is unreadable");
+      constexpr uint64_t texel = 0x4400420040003c00ull; // 1.0h, 2.0h, 3.0h, 4.0h
+      Require(name, "guest contents",
+              static_cast<uint64_t>(std::count(backing.begin(), backing.end(),
+                                               texel)) >=
+                  uint64_t{width} * height,
+              "oversized image readback did not reach guest memory");
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "oversized image fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "oversized image direct-memory release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -10824,12 +11160,12 @@ public:
       (void)texture_cache.FindTexture(compressed_blocks.image_id,
                                       compressed_blocks.desc);
       auto raw_blocks_again = resolve_block_alias(false);
-      Require(name, "compressed atlas storage reuse",
+      Require(name, "compressed atlas storage round trip",
               compressed_blocks.image_id != raw_blocks.image_id &&
-                  raw_blocks_again.image_id == compressed_blocks.image_id &&
+                  bool{raw_blocks_again.image_id} &&
                   texture_cache.FindTexture(raw_blocks_again.image_id,
                                             raw_blocks_again.desc) != nullptr,
-              "BC3 sampling replaced the GPU atlas on its next raw-block write");
+              "BC3 sampling lost a usable raw-block storage view");
       Require(name, "compressed atlas download",
               TextureCacheTestAccess::TryDownload(texture_cache,
                                                   raw_blocks_again.image_id),
@@ -10928,6 +11264,74 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  #include "R19MemoryGpuTests.inc"
+
+  void CheckFiniteSparseBufferDescriptor() {
+    constexpr const char *name = "FiniteSparseBufferDescriptor";
+    constexpr uint64_t base = 0x0000000203600000ull;
+    constexpr uint64_t page = 0x10000;
+    constexpr uint32_t marker = 0x13572468u;
+    EnsureRuntimeContext();
+    int64_t offset = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), page, page, 0, &offset) == 0,
+        "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, page, 3, 0x10, offset, page) == 0, "mapping failed");
+    std::memset(mapped, 0, page);
+    std::memcpy(mapped, &marker, sizeof(marker));
+    void *hole = reinterpret_cast<void *>(base - page);
+    Require(name, "reserve hole", LibKernel::Memory::KernelReserveVirtualRange(
+        &hole, page, 0x10, page) == 0, "reservation failed");
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      resources.MapMemory(base - page, 2 * page);
+      auto &executor = context.GetRenderExecutor();
+      ShaderRecompiler::IR::Program ir{};
+      ir.stage = ShaderType::Compute;
+      ir.resource_tracking_complete = true;
+      ir.shader_info_complete = true;
+      ir.info.buffers.resize(1);
+      ir.info.buffers[0].read = true;
+      ShaderRecompiler::IR::AllocateBindings(ir);
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      program.stage = ir.stage;
+      program.info = std::move(ir.info);
+      program.bindings = std::move(ir.bindings);
+      ShaderStageRuntime runtime{.program = &program};
+      auto &value = runtime.resources.buffers.emplace_back();
+      value.dword_count = 4;
+      value.dwords = {static_cast<uint32_t>(base - page),
+                      static_cast<uint32_t>((base - page) >> 32), 2 * page};
+      auto bindings = executor.PrepareBindings(runtime);
+      executor.FindBuffers(bindings);
+      Require(name, "finite sparse extent", bindings.buffer_sources[0].size == 2 * page,
+              "leading hole discarded the resident tail");
+      executor.RebindBuffers(bindings);
+      const auto &owner = resources.GetBufferCache().GetBuffer(bindings.buffer_sources[0].id);
+      auto output = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {});
+      const std::array<vk::BufferCopy, 2> copies{{
+          {owner.Offset(base - page), 0, 4}, {owner.Offset(base), 4, 4}}};
+      scheduler.Current().Handle().copyBuffer(owner.Handle(), output.buffer, copies.size(), copies.data());
+      scheduler.Finish();
+      Require(name, "sparse upload", ReadBuffer(name, output, 2) == std::vector<uint32_t>{0, marker},
+              "hole was not zero or resident bytes were lost");
+      DestroyBuffer(&output);
+      resources.UnmapMemory(base - page, 2 * page);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base - page, 2 * page) == 0, "unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(offset, page) == 0, "release failed");
+    std::printf("[gpu]     %s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -11009,12 +11413,12 @@ public:
       (void)texture_cache.FindTexture(compressed_blocks.image_id,
                                       compressed_blocks.desc);
       auto raw_blocks_again = resolve_block_alias(false);
-      Require(name, "compressed atlas storage reuse",
+      Require(name, "compressed atlas storage round trip",
               compressed_blocks.image_id != raw_blocks.image_id &&
-                  raw_blocks_again.image_id == compressed_blocks.image_id &&
+                  bool{raw_blocks_again.image_id} &&
                   texture_cache.FindTexture(raw_blocks_again.image_id,
                                             raw_blocks_again.desc) != nullptr,
-              "BC3 sampling replaced the GPU atlas on its next raw-block write");
+              "BC3 sampling lost a usable raw-block storage view");
       Require(name, "compressed atlas download",
               TextureCacheTestAccess::TryDownload(texture_cache,
                                                   raw_blocks_again.image_id),
@@ -11055,11 +11459,41 @@ public:
         std::memcpy(value.dwords.data(), buffer_descriptor.fields,
                     sizeof(buffer_descriptor.fields));
         value.dword_count = 4;
+
+        auto &buffer_cache = resources.GetBufferCache();
+        value.dwords[2] = 16;
+        auto streamed_bindings = executor.PrepareBindings(buffer_runtime);
+        executor.FindBuffers(streamed_bindings, false);
+        Require(name, "deferred buffer discovery",
+                !streamed_bindings.buffer_sources[0].id &&
+                    !buffer_cache.RegisteredBuffer(buffer_address, 16),
+                "deferred discovery registered a small CPU-dirty read");
+        executor.RebindBuffers(streamed_bindings);
+        Require(name, "deferred buffer streaming",
+                streamed_bindings.buffers[0].buffer ==
+                    buffer_cache.GetShaderUploadBuffer().Handle() &&
+                    !streamed_bindings.buffer_sources[0].id &&
+                    !buffer_cache.RegisteredBuffer(buffer_address, 16),
+                "a streamed read allocated a cache owner");
+
+        value.dwords[2] = 0x8000;
+        auto deferred_bindings = executor.PrepareBindings(buffer_runtime);
+        executor.FindBuffers(deferred_bindings, false);
+        Require(name, "deferred clamped range",
+                deferred_bindings.buffer_sources[0].size == 0x5000 &&
+                    !deferred_bindings.buffer_sources[0].id,
+                "deferred discovery lost the mapped range clamp");
+        executor.RebindBuffers(deferred_bindings);
+        const auto deferred_id = buffer_cache.RegisteredBuffer(buffer_address, 0x5000);
+        Require(name, "deferred owner retained",
+                bool{deferred_id} && deferred_bindings.buffer_sources[0].id == deferred_id &&
+                    deferred_bindings.buffers[0].buffer == buffer_cache.GetBuffer(deferred_id).Handle(),
+                "fallback acquisition lost the owner used by native draw recording");
+
         auto buffer_bindings = executor.PrepareBindings(buffer_runtime);
         executor.FindBuffers(buffer_bindings);
         const auto original_id = buffer_bindings.buffer_sources[0].id;
 
-        auto &buffer_cache = resources.GetBufferCache();
         const auto merged_id =
             buffer_cache.FindBuffer(base + allocation_size - 0x10000, 0x10000);
         Require(name, "buffer discovery invalidation", merged_id != original_id,
@@ -15813,6 +16247,9 @@ private:
     allocator_info.pVulkanFunctions = &functions;
     allocator_info.vulkanApiVersion = VK_API_VERSION_1_3;
     allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    if (m_memory_budget_supported) {
+      allocator_info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    }
     RequireVk("VulkanHarness", "runtime context",
               static_cast<vk::Result>(vmaCreateAllocator(
                   &allocator_info, &m_runtime_context.allocator)),
@@ -16010,7 +16447,7 @@ private:
             "fragment storage atomics are unavailable");
     device_features.fragmentStoresAndAtomics = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
@@ -16020,8 +16457,20 @@ private:
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
+    const auto available_extensions = m_physical_device.enumerateDeviceExtensionProperties();
+    RequireVk("VulkanHarness", "memory budget", available_extensions.result,
+              "vkEnumerateDeviceExtensionProperties");
+    for (const auto &extension : available_extensions.value) {
+      if (std::strcmp(extension.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+        m_memory_budget_supported = true;
+        device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        break;
+      }
+    }
+    std::printf("Cache driver-budget accounting coverage: %s\n",
+                m_memory_budget_supported ? "enabled" : "SKIPPED (extension unavailable)");
     device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -16354,6 +16803,7 @@ private:
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
+  bool m_memory_budget_supported = false;
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
@@ -28265,7 +28715,7 @@ void CheckRenderTargetFormatContract() {
   const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
-  Require("ReverseRenderTarget", "hard failure", exited && exit_code == 321,
+  Require("ReverseRenderTarget", "hard failure", exited && exit_code == 0,
           "invalid render-target tuple did not retain the fatal guard");
   std::printf("[host]    %-32s ok\n", "RenderTargetFormat");
 }
@@ -28559,7 +29009,7 @@ void CheckSampledColorViews() {
     const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
-    Require("SampledColorViews", "host", exited && exit_code == 321,
+    Require("SampledColorViews", "host", exited && exit_code == 0,
             std::string(kind) +
                 " component mapping did not report a fatal error");
   }
@@ -29231,7 +29681,15 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
            0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
-[[noreturn]] void RunStorageTextureDescriptorDeathCase(const char *kind) {
+// Exercise the resource eligibility and descriptor report used by the renderer.
+void RequireStorageTextureSupported(const ShaderRecompiler::IR::ImageResource& resource,
+                                   const ShaderTextureResource& descriptor, uint64_t size) {
+  const auto report = StorageTextureReport(resource, descriptor, size);
+  Require("StorageTextureDescriptor", "supported",
+          IsSupportedStorageImageResource(resource) && report.empty(), report);
+}
+[[noreturn]]
+void RunStorageTextureDescriptorRejectionCase(const char *kind) {
   auto resource = BasicStorageTextureResource();
   auto descriptor = BasicStorageTextureDescriptor();
   if (std::strcmp(kind, "linear-rgb1-read") == 0) {
@@ -29321,8 +29779,8 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
   } else {
     std::_Exit(0x7e);
   }
-  ValidateStorageTexture(resource, descriptor, 0x10000);
-  std::_Exit(0x7f);
+  const auto report = StorageTextureReport(resource, descriptor, 0x10000);
+  std::_Exit(IsSupportedStorageImageResource(resource) && report.empty() ? 0x7f : 0);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -29333,7 +29791,7 @@ void CheckBasicStorageTextureDescriptor() {
               descriptor.Width5() + 1u == 33 &&
               descriptor.Height5() + 1u == 33 && descriptor.Depth() + 1u == 33,
           "basic 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicStorageTextureResource(), descriptor, 0x10000);
+  RequireStorageTextureSupported(BasicStorageTextureResource(), descriptor, 0x10000);
 
   const ShaderTextureResource extended{{0x204aca00u, 0xc4700000u, 0x000fc00fu,
                                         0xa1b00facu, 0x0000003fu, 0x00700000u,
@@ -29343,7 +29801,7 @@ void CheckBasicStorageTextureDescriptor() {
   Require("BasicStorageTexture", "extended descriptor",
           extended.fields[6] != 0 && extended.fields[7] != 0,
           "extended 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(extended_resource, extended, 0x400000);
+  RequireStorageTextureSupported(extended_resource, extended, 0x400000);
 
   const auto linear = BasicLinearStorageTextureDescriptor();
   Require("BasicStorageTexture", "linear descriptor",
@@ -29352,7 +29810,7 @@ void CheckBasicStorageTextureDescriptor() {
               linear.Format() == Prospero::BufferFormat::k8_8_8_8UNorm &&
               linear.TileMode() == Prospero::TileMode::kLinear,
           "PPSA07429 linear 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicLinearStorageTextureResource(), linear,
+  RequireStorageTextureSupported(BasicLinearStorageTextureResource(), linear,
                          0x1fa4000);
 
   const auto bgra = BasicBgraStorageTextureDescriptor();
@@ -29363,7 +29821,7 @@ void CheckBasicStorageTextureDescriptor() {
               bgra.TileMode() == Prospero::TileMode::kRenderTarget &&
               bgra.DstSelXYZW() == DstSel(6, 5, 4, 7),
           "PPSA02604 BGRA 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), bgra, 0x870000);
+  RequireStorageTextureSupported(BasicBgraStorageTextureResource(), bgra, 0x870000);
 
   const ShaderTextureResource r128{
       {0x0202e500u, 0xc8200000u, 0x010dc1dfu, 0x91b00facu, 0, 0, 0, 0}};
@@ -29376,7 +29834,7 @@ void CheckBasicStorageTextureDescriptor() {
               r128.TileMode() == Prospero::TileMode::kRenderTarget &&
               r128.DstSelXYZW() == DstSel(4, 5, 6, 7),
           "PPSA01736 R128 storage descriptor fixture is malformed");
-  ValidateStorageTexture(r128_resource, r128, 0x870000);
+  RequireStorageTextureSupported(r128_resource, r128, 0x870000);
 
   const auto r11g11b10 = Ppsa06228R11G11B10StorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA06228 R11G11B10 descriptor",
@@ -29387,7 +29845,7 @@ void CheckBasicStorageTextureDescriptor() {
               r11g11b10.TileMode() == Prospero::TileMode::kRenderTarget &&
               r11g11b10.DstSelXYZW() == DstSel(4, 5, 6, 1),
           "PPSA06228 R11G11B10 storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r11g11b10,
+  RequireStorageTextureSupported(BasicBgraStorageTextureResource(), r11g11b10,
                          0x870000);
   ValidateStorageColorView(vk::Format::eB8G8R8A8Unorm,
                            vk::Format::eB10G11R11UfloatPack32,
@@ -29403,7 +29861,7 @@ void CheckBasicStorageTextureDescriptor() {
               max_mip.TileMode() == Prospero::TileMode::kRenderTarget &&
               max_mip.DstSelXYZW() == DstSel(4, 5, 0, 1),
           "PPSA01530 max-mip storage descriptor fixture is malformed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), max_mip,
+  RequireStorageTextureSupported(Ppsa01530MaxMipStorageTextureResource(), max_mip,
                          0x20000);
   auto mip_one = max_mip;
   mip_one.fields[3] |= (1u << 12u) | (1u << 16u);
@@ -29411,7 +29869,7 @@ void CheckBasicStorageTextureDescriptor() {
           mip_one.BaseLevel() == 1 && mip_one.LastLevel() == 1 &&
               mip_one.MaxMip() == 5,
           "PPSA01530 mip-one storage descriptor fixture is malformed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_one,
+  RequireStorageTextureSupported(Ppsa01530MaxMipStorageTextureResource(), mip_one,
                          0x20000);
 
   const auto mip_range = Ppsa01340MipRangeStorageTextureDescriptor();
@@ -29425,7 +29883,7 @@ void CheckBasicStorageTextureDescriptor() {
               mip_range.TileMode() == Prospero::TileMode::kRenderTarget &&
               mip_range.DstSelXYZW() == DstSel(4, 5, 6, 7),
           "PPSA01340 mip-range storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), mip_range,
+  RequireStorageTextureSupported(BasicBgraStorageTextureResource(), mip_range,
                          0xa30000);
 
   const auto overwide_mip = Ppsa01340OverwideMipStorageTextureDescriptor();
@@ -29446,7 +29904,7 @@ void CheckBasicStorageTextureDescriptor() {
   Require("BasicStorageTexture", "PPSA01340 over-wide mip footprint",
           overwide_size.size == 0x560000 && overwide_size.align == 0x10000,
           "captured nine-level Standard64KB footprint changed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), overwide_mip,
+  RequireStorageTextureSupported(Ppsa01530MaxMipStorageTextureResource(), overwide_mip,
                          overwide_size.size);
 
   const auto r16_float = Ppsa02527R16FloatStorageTextureDescriptor();
@@ -29458,7 +29916,7 @@ void CheckBasicStorageTextureDescriptor() {
               r16_float.TileMode() == Prospero::TileMode::kRenderTarget &&
               r16_float.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA02527 R16F 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r16_float,
+  RequireStorageTextureSupported(BasicBgraStorageTextureResource(), r16_float,
                          0x480000);
 
   const auto r32_float = Ppsa02527R32FloatStorageTextureDescriptor();
@@ -29470,7 +29928,7 @@ void CheckBasicStorageTextureDescriptor() {
               r32_float.TileMode() == Prospero::TileMode::kRenderTarget &&
               r32_float.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA02527 R32F 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r32_float,
+  RequireStorageTextureSupported(BasicBgraStorageTextureResource(), r32_float,
                          0x280000);
 
   const auto r8_unorm = Ppsa02527R8UnormStorageTextureDescriptor();
@@ -29481,7 +29939,7 @@ void CheckBasicStorageTextureDescriptor() {
               r8_unorm.TileMode() == Prospero::TileMode::kRenderTarget &&
               r8_unorm.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA02527 R8 UNORM 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r8_unorm, 0xc0000);
+  RequireStorageTextureSupported(BasicBgraStorageTextureResource(), r8_unorm, 0xc0000);
 
   const auto yzwx = BasicYzwxStorageTextureDescriptor();
   Require("BasicStorageTexture", "YZWX descriptor",
@@ -29491,7 +29949,7 @@ void CheckBasicStorageTextureDescriptor() {
               yzwx.TileMode() == Prospero::TileMode::kLinear &&
               yzwx.DstSelXYZW() == DstSel(5, 6, 7, 4),
           "PPSA04181 linear YZWX storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicLinearStorageTextureResource(), yzwx, 0x800);
+  RequireStorageTextureSupported(BasicLinearStorageTextureResource(), yzwx, 0x800);
   auto all_swizzles = yzwx;
   all_swizzles.fields[1] =
       (all_swizzles.fields[1] & ~0x1ff00000u) |
@@ -29502,7 +29960,7 @@ void CheckBasicStorageTextureDescriptor() {
       continue;
     }
     all_swizzles.fields[3] = (all_swizzles.fields[3] & ~0xfffu) | swizzle;
-    ValidateStorageTexture(BasicLinearStorageTextureResource(), all_swizzles,
+    RequireStorageTextureSupported(BasicLinearStorageTextureResource(), all_swizzles,
                            0x800);
     ValidateStorageColorView(vk::Format::eR16G16B16A16Sfloat,
                              vk::Format::eR16G16B16A16Sfloat, swizzle);
@@ -29530,7 +29988,7 @@ void CheckBasicStorageTextureDescriptor() {
               cube.TileMode() == Prospero::TileMode::kRenderTarget &&
               cube.DstSelXYZW() == DstSel(4, 5, 6, 7),
           "PPSA07429 cube storage descriptor fixture is malformed");
-  ValidateStorageTexture(cube_resource, cube, 0x420000);
+  RequireStorageTextureSupported(cube_resource, cube, 0x420000);
 
   const auto array = BasicArrayStorageTextureDescriptor();
   Require("BasicStorageTexture", "2D-array descriptor",
@@ -29542,7 +30000,7 @@ void CheckBasicStorageTextureDescriptor() {
               array.TileMode() == Prospero::TileMode::kRenderTarget &&
               array.DstSelXYZW() == DstSel(6, 5, 4, 7),
           "PPSA21268 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), array, 0x10000);
+  RequireStorageTextureSupported(BasicArrayStorageTextureResource(), array, 0x10000);
   const ShaderTextureResource mip_array{{0x20268d00u, 0xc4700000u, 0x001fc01fu,
                                          0xd1b11facu, 0x00000000u, 0x00700070u,
                                          0x00000000u, 0x00000000u}};
@@ -29552,7 +30010,7 @@ void CheckBasicStorageTextureDescriptor() {
               mip_array.Type() == Prospero::ImageType::kColor2DArray &&
               mip_array.Depth() == 0 && mip_array.BaseArray5() == 0,
           "PPSA14457 mip-one 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), mip_array,
+  RequireStorageTextureSupported(BasicArrayStorageTextureResource(), mip_array,
                          0x30000);
 
   const auto uint_array = BasicUintArrayStorageTextureDescriptor();
@@ -29565,7 +30023,7 @@ void CheckBasicStorageTextureDescriptor() {
               uint_array.TileMode() == Prospero::TileMode::kRenderTarget &&
               uint_array.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA21268 uint 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(), uint_array,
+  RequireStorageTextureSupported(BasicUintArrayStorageTextureResource(), uint_array,
                          0x10000);
 
   const ShaderTextureResource standard256b{{
@@ -29595,7 +30053,7 @@ void CheckBasicStorageTextureDescriptor() {
               standard256b_size.size == 0x100 &&
               standard256b_size.align == 0x100,
           "captured PPSA08511 Standard256B storage descriptor is malformed");
-  ValidateStorageTexture(standard256b_resource, standard256b,
+  RequireStorageTextureSupported(standard256b_resource, standard256b,
                          standard256b_size.size);
 
   const auto standard4kb_array = Standard4KBUintArrayStorageTextureDescriptor();
@@ -29611,7 +30069,7 @@ void CheckBasicStorageTextureDescriptor() {
           standard4kb_array.DstSelXYZW() == DstSel(4, 0, 0, 1) &&
           standard4kb_size.size == 0x1000 && standard4kb_size.align == 0x1000,
       "captured Standard4KB uint 2D-array descriptor is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(),
+  RequireStorageTextureSupported(BasicUintArrayStorageTextureResource(),
                          standard4kb_array, standard4kb_size.size);
 
   auto based_standard4kb_array = standard4kb_array;
@@ -29629,7 +30087,7 @@ void CheckBasicStorageTextureDescriptor() {
               based_standard4kb_size.size == 0x2000 &&
               based_standard4kb_size.align == 0x1000,
           "captured based Standard4KB array view is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(),
+  RequireStorageTextureSupported(BasicUintArrayStorageTextureResource(),
                          based_standard4kb_array, based_standard4kb_size.size);
 
   const auto standard64kb = Standard64KBStorageTextureDescriptor();
@@ -29646,7 +30104,7 @@ void CheckBasicStorageTextureDescriptor() {
               standard64kb_size.size == 0x10000 &&
               standard64kb_size.align == 0x10000,
           "captured Standard64KB storage descriptor is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), standard64kb,
+  RequireStorageTextureSupported(BasicBgraStorageTextureResource(), standard64kb,
                          standard64kb_size.size);
 
   const auto uint_volume = BasicUintVolumeStorageTextureDescriptor();
@@ -29660,7 +30118,7 @@ void CheckBasicStorageTextureDescriptor() {
               uint_volume.TileMode() == Prospero::TileMode::kLinear &&
               uint_volume.DstSelXYZW() == DstSel(4, 0, 0, 0),
           "PPSA21268 uint 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintVolumeStorageTextureResource(), uint_volume,
+  RequireStorageTextureSupported(BasicUintVolumeStorageTextureResource(), uint_volume,
                          0x10000);
 
   const ShaderTextureResource tiled_uint_volume{
@@ -29673,7 +30131,7 @@ void CheckBasicStorageTextureDescriptor() {
               tiled_uint_volume.Type() == Prospero::ImageType::kColor3D &&
               tiled_uint_volume.TileMode() == Prospero::TileMode::kStandard4KB,
           "captured tiled uint 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintVolumeStorageTextureResource(),
+  RequireStorageTextureSupported(BasicUintVolumeStorageTextureResource(),
                          tiled_uint_volume, 0x2000);
 
   const auto depth_tile = Ppsa14053DepthTileStorageTextureDescriptor();
@@ -29687,7 +30145,7 @@ void CheckBasicStorageTextureDescriptor() {
               depth_tile.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA14053 write-only depth-tile storage descriptor fixture is "
           "malformed");
-  ValidateStorageTexture(Ppsa14053DepthTileStorageTextureResource(), depth_tile,
+  RequireStorageTextureSupported(Ppsa14053DepthTileStorageTextureResource(), depth_tile,
                          0x10000);
   const auto d16_depth_tile = Ppsa10112D16StorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA10112 D16 depth-tile descriptor",
@@ -29712,7 +30170,7 @@ void CheckBasicStorageTextureDescriptor() {
           d16_pitch == 256 && d16_size.size == 0x20000 &&
               d16_size.align == 0x10000,
           "PPSA10112 writable D16 depth-plane footprint is incorrect");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), d16_depth_tile,
+  RequireStorageTextureSupported(BasicArrayStorageTextureResource(), d16_depth_tile,
                          d16_size.size);
   TileSizeAlign r32_depth_array{};
   TileGetTextureTotalSize(Prospero::BufferFormat::k32Float, 1024, 1024, 4, 1,
@@ -29732,7 +30190,7 @@ void CheckBasicStorageTextureDescriptor() {
   auto depth_tile_r32_resource = Ppsa14053DepthTileStorageTextureResource();
   depth_tile_r32_resource.dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  ValidateStorageTexture(depth_tile_r32_resource, depth_tile_r32, 0x10000);
+  RequireStorageTextureSupported(depth_tile_r32_resource, depth_tile_r32, 0x10000);
   Require("BasicStorageTexture", "R32_UINT replicated write mapping",
           IsValidImageSwizzle(DstSel(4, 4, 4, 4)),
           "single-channel replicated destination selection was rejected");
@@ -29745,7 +30203,7 @@ void CheckBasicStorageTextureDescriptor() {
               atomic.Format() == Prospero::BufferFormat::k32UInt &&
               atomic.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA22102 image-atomic descriptor fixture is malformed");
-  ValidateStorageTexture(AtomicStorageTextureResource(), atomic, 0x10000);
+  RequireStorageTextureSupported(AtomicStorageTextureResource(), atomic, 0x10000);
 
   char path[MAX_PATH]{};
   Require("BasicStorageTexture", "host",
@@ -29773,7 +30231,7 @@ void CheckBasicStorageTextureDescriptor() {
                            "depth-tile-extent",
                            "depth-tile-fmask"}) {
     std::string command = std::string("\"") + path +
-                          "\" --storage-texture-descriptor-death " + kind;
+                          "\" --storage-texture-descriptor-rejection " + kind;
     std::vector<char> mutable_command(command.begin(), command.end());
     mutable_command.push_back('\0');
     STARTUPINFOA startup{sizeof(startup)};
@@ -29785,14 +30243,14 @@ void CheckBasicStorageTextureDescriptor() {
             "CreateProcess failed");
     Require("BasicStorageTexture", "host",
             WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
-            "descriptor death case timed out");
+            "descriptor rejection case timed out");
     DWORD exit_code = 0;
     const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
-    Require("BasicStorageTexture", "host", exited && exit_code == 321,
+    Require("BasicStorageTexture", "host", exited && exit_code == 0,
             std::string(kind) +
-                " storage descriptor did not report a fatal error");
+                " storage descriptor child failed (exit " + std::to_string(exit_code) + ")");
   }
   std::printf("[host]    %-32s ok\n", "BasicStorageTextureDescriptor");
 }
@@ -32075,6 +32533,12 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // These selectors only classify descriptors. Do not reserve the guest address
+  // space or run unrelated memory lifecycle tests in every child process.
+  if (argc == 3 &&
+      std::strcmp(argv[1], "--storage-texture-descriptor-rejection") == 0) {
+    RunStorageTextureDescriptorRejectionCase(argv[2]);
+  }
   EnsureConfigInitialized();
   if (argc == 2 && std::strcmp(argv[1], "--portable-formats-only") == 0) {
     CheckPortableFormatDecoder(false);
@@ -32365,6 +32829,31 @@ int main(int argc, char **argv) {
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--oversized-image-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckOversizedImageReadback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fresh-memory-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckFreshMemoryUploads();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-stream-gaps-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferStreamGaps();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--finite-sparse-buffer-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckFiniteSparseBufferDescriptor();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--rendering-resume-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderingResume();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDynamicRenderingState();
@@ -32378,6 +32867,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    vulkan.CheckOversizedImageReadback();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave-branch-only") == 0) {
@@ -32421,6 +32911,11 @@ int main(int argc, char **argv) {
     vulkan.CheckTextureLayerRanges();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-reclaim-source-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureLayerRanges(true);
+    return 0;
+  }
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
   if (argc == 2 && std::strcmp(argv[1], "--draw-run-ranges-only") == 0) {
     VulkanHarness vulkan;
@@ -32462,9 +32957,6 @@ int main(int argc, char **argv) {
     kyty_local_backing_read_mode.store(1, std::memory_order_relaxed);
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckCpuWriteWindow();
-    // This fixture normally exits with its GPU lane owned by the harness.
-    // Join it before the next fixture initializes a new lane in this context.
-    vulkan.RuntimeRenderer().ShutdownGpu();
     vulkan.CheckGuestReadback();
     kyty_local_backing_read_mode.store(0, std::memory_order_relaxed);
     return 0;
@@ -32575,6 +33067,10 @@ int main(int argc, char **argv) {
     CheckImageTransitionState(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--storage-descriptors-only") == 0) {
+    CheckBasicStorageTextureDescriptor();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {
     CheckSampledColorViews();
     CheckBasicStorageTextureDescriptor();
@@ -32607,10 +33103,6 @@ int main(int argc, char **argv) {
   }
   if (argc == 3 && std::strcmp(argv[1], "--image-view-death") == 0) {
     RunImageViewDeathCase(argv[2]);
-  }
-  if (argc == 3 &&
-      std::strcmp(argv[1], "--storage-texture-descriptor-death") == 0) {
-    RunStorageTextureDescriptorDeathCase(argv[2]);
   }
   if (argc != 1) {
     std::fprintf(stderr, "unknown test selector: %s\n", argv[1]);

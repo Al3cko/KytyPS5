@@ -218,6 +218,7 @@ int Make(const fs::path& out, const fs::path& seeds, const std::vector<fs::path>
 	if (game_id.empty() || !ReadPrograms(seeds, seed_records, programs)) return 1;
 	Unique hints, pipelines;
 	size_t other_records = 0, other_pipelines = 0;
+	bool recordings_lost = false;
 	for (const auto& recording: recordings) {
 		Lists records, recipes;
 		if (!Cache::ReadInputs(recording, records, recipes)) {
@@ -225,6 +226,7 @@ int Make(const fs::path& out, const fs::path& seeds, const std::vector<fs::path>
 			// here made the precompile drop every recording, compile the seeds alone and prune the store to them.)
 			std::fprintf(stderr, "%s: not a warmup recording or a seed file (an older format?): left out\n",
 			             Utf8(recording).c_str());
+			recordings_lost = true;
 			continue;
 		}
 		std::vector<uint32_t> numbers(records.size(), NoShader);
@@ -273,7 +275,9 @@ int Make(const fs::path& out, const fs::path& seeds, const std::vector<fs::path>
 	            Utf8(out).c_str(), hints.entries.size(), ByStage(hints.entries).c_str(), pipelines.entries.size(),
 	            static_cast<double>(size) / (1024.0 * 1024.0), static_cast<double>(packed_size) / 1024.0, other_records,
 	            other_pipelines);
-	return 0;
+	// 2: the output is usable, but callers must retain pipelines from recordings
+	// this executable could not read instead of pruning the store to this subset.
+	return recordings_lost ? 2 : 0;
 }
 
 // A hint file of another region's Demon's Souls, the same version, for game_id (<title>_<version>): the regions' builds

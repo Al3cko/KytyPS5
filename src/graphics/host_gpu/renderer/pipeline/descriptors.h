@@ -36,6 +36,7 @@ struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
 		uint64_t size    = 0;
+		// Invalid until acquisition when registration is deferred; streamed ranges may stay invalid.
 		BufferId id;
 	};
 
